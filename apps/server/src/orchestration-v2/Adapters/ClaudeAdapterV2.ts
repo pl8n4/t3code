@@ -3370,6 +3370,7 @@ export interface ClaudeAdapterV2Options {
   readonly crypto: Crypto.Crypto;
   readonly idAllocator: IdAllocator.IdAllocatorV2["Service"];
   readonly queryRunner: ClaudeAgentSdkQueryRunnerShape;
+  readonly capabilities?: OrchestrationV2ProviderCapabilities;
   readonly scopedLimitNames?: Ref.Ref<ClaudeScopedLimitNames>;
   readonly onUsageLimits?: ManagedServerProvider["applyUsageLimits"];
   readonly continuationRequests?: {
@@ -3413,19 +3414,23 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
   return ProviderAdapter.ProviderAdapterV2.of({
     instanceId: adapterOptions.instanceId,
     driver: CLAUDE_PROVIDER,
-    getCapabilities: () => Effect.succeed(ClaudeProviderCapabilitiesV2),
+    getCapabilities: () =>
+      Effect.succeed(adapterOptions.capabilities ?? ClaudeProviderCapabilitiesV2),
     planSelectionTransition: () => Effect.succeed(turnScopedSelectionTransition()),
     openSession: Effect.fn("ClaudeAdapterV2.openSession")(
       function* (input: ProviderAdapter.ProviderAdapterV2OpenSessionInput) {
         const sessionScope = yield* Effect.scope;
         const now = yield* DateTime.now;
-        const session = providerSession({
-          providerSessionId: input.providerSessionId,
-          providerInstanceId: adapterOptions.instanceId,
-          cwd: input.runtimePolicy.cwd,
-          model: input.modelSelection.model,
-          now,
-        });
+        const session = {
+          ...providerSession({
+            providerSessionId: input.providerSessionId,
+            providerInstanceId: adapterOptions.instanceId,
+            cwd: input.runtimePolicy.cwd,
+            model: input.modelSelection.model,
+            now,
+          }),
+          capabilities: adapterOptions.capabilities ?? ClaudeProviderCapabilitiesV2,
+        };
         const events = yield* Queue.unbounded<ProviderAdapter.ProviderAdapterV2Event>();
         const activeTurn = yield* Ref.make<ActiveClaudeTurnContext | null>(null);
         // Foreground Bash calls whose output file is being tailed, by tool_use_id.
@@ -9398,7 +9403,7 @@ export type ClaudeAdapterV2DriverEnv =
 export const createClaudeAdapterV2 = Effect.fn("ClaudeAdapterV2Driver.create")(
   function* (
     input: ProviderAdapterDriverCreateInput<ClaudeSettings>,
-    hooks: Pick<ClaudeAdapterV2Options, "scopedLimitNames" | "onUsageLimits"> = {},
+    hooks: Pick<ClaudeAdapterV2Options, "scopedLimitNames" | "onUsageLimits" | "capabilities"> = {},
   ) {
     const { instanceId, environment, enabled, config } = input;
     const fileSystem = yield* FileSystem.FileSystem;

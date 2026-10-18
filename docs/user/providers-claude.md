@@ -65,6 +65,37 @@ Claude Code holds the turn until that window reopens, so it can keep showing as
 working. Wait for the reset, or stop the turn and continue later. The warning's
 timestamp shows when the displayed wait started.
 
+## Promotional cloud credits (prototype)
+
+Add a separate Claude instance in **Settings > Providers**, then turn on
+**Cloud sessions · free credits only (prototype)**. Sign in to the same Claude
+subscription in T3's browser using its Default profile. Select that instance,
+**Haiku 5.5**, and **Full access** in the composer.
+
+Also select the cloud instance for **Settings > General > Text generation model**
+if you want to prevent background titles and other generated text from using a
+different provider. Those helpers are disabled on the cloud instance.
+
+Cloud launches require unexpired promotional credit and disabled paid usage
+credits in Claude's usage settings. The prototype checks these before each
+message and during active work. Missing or unknown billing information blocks
+launches. API keys and paid API endpoints are unsupported.
+
+For coding, use a clean GitHub checkout whose current branch is pushed to
+`origin` and available to the Claude cloud environment. Cloud work starts on a
+separate branch. Local edits, attachments, local services, and T3 MCP tools are
+not transferred. Review the cloud branch in Claude Code before bringing changes
+back to your machine; T3's local checkpoint and revert controls do not apply.
+
+To continue a limited local thread, stop its current turn, select the cloud
+instance, and send a follow-up. T3 transfers conversation text when changing
+instances. Switching is manual; automatic quota fallback is not included.
+
+This experimental mode depends on Claude's internal browser interface and may
+break when that interface changes. If session creation cannot be confirmed,
+inspect Claude Code before retrying; the prototype avoids blindly repeating
+the creation request.
+
 ## Skills
 
 Claude skills come from the config directory's `skills` folder and the project's

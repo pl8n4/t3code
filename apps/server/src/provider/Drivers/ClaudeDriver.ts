@@ -1,4 +1,9 @@
-import { ClaudeSettings, ProviderDriverKind } from "@t3tools/contracts";
+import {
+  ClaudeSettings,
+  ProviderDriverKind,
+  TextGenerationError,
+  type ServerProvider,
+} from "@t3tools/contracts";
 import * as Cache from "effect/Cache";
 import * as Duration from "effect/Duration";
 import * as Crypto from "effect/Crypto";
@@ -17,6 +22,8 @@ import { expandHomePath } from "@t3tools/provider-core/server/pathExpansion";
 import * as ProviderEventLoggers from "@t3tools/provider-core/server/ProviderEventLoggers";
 import {
   createClaudeAdapterV2,
+  ClaudeAgentSdkQueryRunner,
+  ClaudeProviderCapabilitiesV2,
   type ClaudeAdapterV2DriverEnv,
 } from "../../orchestration-v2/Adapters/ClaudeAdapterV2.ts";
 import { ProviderDriverError } from "../Errors.ts";
@@ -58,6 +65,8 @@ import {
   resolveClaudeHomePath,
 } from "./ClaudeHome.ts";
 import * as HostProcess from "@t3tools/shared/HostProcess";
+import { makeClaudeCloudQueryRunner } from "../ClaudeCloudQueryRunner.ts";
+import type { ServerProviderDraft } from "@t3tools/provider-core/server/snapshotProbe";
 const decodeClaudeSettings = Schema.decodeSync(ClaudeSettings);
 
 const DRIVER_KIND = ProviderDriverKind.make("claudeAgent");
@@ -139,26 +148,79 @@ export const ClaudeDriver: ProviderDriver<ClaudeSettings, ClaudeDriverEnv, Path.
           Effect.provideService(Path.Path, path),
         ),
       );
-      const continuationGroupKey = yield* makeClaudeContinuationGroupKey(
+      const localContinuationGroupKey = yield* makeClaudeContinuationGroupKey(
         effectiveConfig,
         processEnv,
       );
+      const continuationGroupKey = config.cloudFreeCreditsOnly
+        ? `${localContinuationGroupKey}:cloud:${instanceId}`
+        : localContinuationGroupKey;
       const configDir = yield* resolveClaudeHomePath(effectiveConfig, processEnv);
       const accountConfigPath = yield* ClaudeResetCredits.claudeAccountConfigPath(
         effectiveConfig.homePath.trim() || processEnv.CLAUDE_CONFIG_DIR?.trim()
           ? configDir
           : undefined,
       );
-      const stampIdentity = withInstanceIdentity({
+      const stampBaseIdentity = withInstanceIdentity({
         instanceId,
         driverKind: DRIVER_KIND,
         displayName,
         accentColor,
         continuationGroupKey,
       });
+      const stampIdentity = (value: ServerProviderDraft): ServerProvider => {
+        const stamped = stampBaseIdentity(value);
+        return config.cloudFreeCreditsOnly
+          ? {
+              ...stamped,
+              models: stamped.models.filter((model) => model.slug === "claude-haiku-5-5"),
+            }
+          : stamped;
+      };
 
       const scopedLimitNames = yield* makeClaudeScopedLimitNames;
-      const orchestrationAdapter = yield* createClaudeAdapterV2(
+      const cloudRunner = config.cloudFreeCreditsOnly
+        ? yield* makeClaudeCloudQueryRunner(config, processEnv, instanceId).pipe(
+            Effect.mapError(
+              (cause) =>
+                new ProviderDriverError({
+                  driver: DRIVER_KIND,
+                  instanceId,
+                  detail: "Could not initialize the free-credit cloud prototype.",
+                  cause,
+                }),
+            ),
+          )
+        : undefined;
+      const capabilities = config.cloudFreeCreditsOnly
+        ? {
+            ...ClaudeProviderCapabilitiesV2,
+            threads: {
+              ...ClaudeProviderCapabilitiesV2.threads,
+              canRollbackThread: false,
+              canForkThread: false,
+              canForkFromTurn: false,
+            },
+            tools: {
+              ...ClaudeProviderCapabilitiesV2.tools,
+              supportsMcpTools: false,
+              supportsDynamicToolCallbacks: false,
+            },
+            approvals: {
+              ...ClaudeProviderCapabilitiesV2.approvals,
+              supportsCommandApproval: false,
+              supportsFileReadApproval: false,
+              supportsFileChangeApproval: false,
+            },
+            checkpointing: {
+              ...ClaudeProviderCapabilitiesV2.checkpointing,
+              appCanCheckpointFilesystem: false,
+              providerCanRollbackConversation: false,
+              providerRollbackReturnsSnapshot: false,
+            },
+          }
+        : undefined;
+      const adapterEffect = createClaudeAdapterV2(
         {
           instanceId,
           displayName,
@@ -167,7 +229,16 @@ export const ClaudeDriver: ProviderDriver<ClaudeSettings, ClaudeDriverEnv, Path.
           enabled,
           config,
         },
-        { scopedLimitNames, onUsageLimits: (update) => snapshot.applyUsageLimits(update) },
+        {
+          scopedLimitNames,
+          onUsageLimits: (update) => snapshot.applyUsageLimits(update),
+          ...(capabilities ? { capabilities } : {}),
+        },
+      );
+      const orchestrationAdapter = yield* (
+        cloudRunner
+          ? adapterEffect.pipe(Effect.provideService(ClaudeAgentSdkQueryRunner, cloudRunner))
+          : adapterEffect
       ).pipe(
         Effect.mapError(
           (cause) =>
@@ -179,11 +250,28 @@ export const ClaudeDriver: ProviderDriver<ClaudeSettings, ClaudeDriverEnv, Path.
             }),
         ),
       );
-      const textGeneration = yield* makeClaudeTextGeneration(
+      const localTextGeneration = yield* makeClaudeTextGeneration(
         effectiveConfig,
         processEnv,
         modelCatalog,
       );
+      const noImplicitGeneration = () =>
+        Effect.fail(
+          new TextGenerationError({
+            operation: "cloud-prototype",
+            detail:
+              "Cloud instances only run explicit cloud tasks; implicit local model requests are disabled.",
+          }),
+        );
+      const textGeneration = config.cloudFreeCreditsOnly
+        ? {
+            generateCommitMessage: noImplicitGeneration,
+            generatePrContent: noImplicitGeneration,
+            generateBranchName: noImplicitGeneration,
+            generateThreadTitle: noImplicitGeneration,
+            generateReviewGuide: noImplicitGeneration,
+          }
+        : localTextGeneration;
 
       // Per-instance capabilities cache: keyed on binary + resolved HOME so
       // account-specific probes never share auth metadata across instances.
