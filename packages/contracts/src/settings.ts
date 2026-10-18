@@ -614,12 +614,21 @@ const CLAUDE_AUTO_COMPACT_WINDOW_PATTERN = /^(?:|[1-9]\d{5}|1000000)$/;
 
 export const ClaudeSettings = makeProviderSettingsSchema(
   {
+    cloudFallbackOnLimit: Schema.Boolean.pipe(
+      Schema.withDecodingDefault(Effect.succeed(false)),
+      Schema.annotateKey({
+        title: "Continue in free cloud credit when limited",
+        description:
+          "For local Claude: stop a blocked turn and continue with the matching cloud instance using Haiku. Requires one enabled free-credit cloud instance for the same account and Full access.",
+        providerSettingsForm: { control: "switch" },
+      }),
+    ),
     cloudFreeCreditsOnly: Schema.Boolean.pipe(
       Schema.withDecodingDefault(Effect.succeed(false)),
       Schema.annotateKey({
         title: "Cloud sessions · free credits only (prototype)",
         description:
-          "Run Haiku in Anthropic's cloud using your signed-in T3 browser. Requires promotional credit and disabled paid usage. Changes stay on the cloud branch.",
+          "Run Haiku in Anthropic's cloud using your signed-in T3 browser. Requires promotional credit and disabled paid usage. T3 tools read, edit, and test your local project.",
         providerSettingsForm: { control: "switch" },
       }),
     ),
@@ -674,7 +683,14 @@ export const ClaudeSettings = makeProviderSettingsSchema(
     ),
   },
   {
-    order: ["cloudFreeCreditsOnly", "binaryPath", "homePath", "autoCompactWindow", "launchArgs"],
+    order: [
+      "cloudFreeCreditsOnly",
+      "cloudFallbackOnLimit",
+      "binaryPath",
+      "homePath",
+      "autoCompactWindow",
+      "launchArgs",
+    ],
   },
 );
 export type ClaudeSettings = typeof ClaudeSettings.Type;

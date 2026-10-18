@@ -3371,6 +3371,7 @@ export interface ClaudeAdapterV2Options {
   readonly idAllocator: IdAllocator.IdAllocatorV2["Service"];
   readonly queryRunner: ClaudeAgentSdkQueryRunnerShape;
   readonly capabilities?: OrchestrationV2ProviderCapabilities;
+  readonly stopOnUsageLimit?: boolean;
   readonly scopedLimitNames?: Ref.Ref<ClaudeScopedLimitNames>;
   readonly onUsageLimits?: ManagedServerProvider["applyUsageLimits"];
   readonly continuationRequests?: {
@@ -6845,6 +6846,25 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                   },
                 });
               }
+              if (adapterOptions.stopOnUsageLimit) {
+                const resetAt = context.rateLimitResetTimes.get(limitType);
+                yield* finalizeActiveTurn({
+                  context,
+                  status: "failed",
+                  completedAt: now,
+                  failure: makeProviderFailure({
+                    class: "usage_limit",
+                    message: describeClaudeUsageLimit(
+                      rateLimitInfo,
+                      DateTime.toEpochMillis(now),
+                      names,
+                    ),
+                    ...(resetAt ? { resetAt } : {}),
+                  }),
+                });
+                liveQuery.stopping = true;
+                yield* liveQuery.query.close.pipe(Effect.ignore);
+              }
             }
             return;
           }
@@ -9403,7 +9423,10 @@ export type ClaudeAdapterV2DriverEnv =
 export const createClaudeAdapterV2 = Effect.fn("ClaudeAdapterV2Driver.create")(
   function* (
     input: ProviderAdapterDriverCreateInput<ClaudeSettings>,
-    hooks: Pick<ClaudeAdapterV2Options, "scopedLimitNames" | "onUsageLimits" | "capabilities"> = {},
+    hooks: Pick<
+      ClaudeAdapterV2Options,
+      "scopedLimitNames" | "onUsageLimits" | "capabilities" | "stopOnUsageLimit"
+    > = {},
   ) {
     const { instanceId, environment, enabled, config } = input;
     const fileSystem = yield* FileSystem.FileSystem;

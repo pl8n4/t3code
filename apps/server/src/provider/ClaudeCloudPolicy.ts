@@ -26,8 +26,8 @@ export class ClaudeCloudGuardError extends Schema.TaggedError<ClaudeCloudGuardEr
       "unsupported_policy",
       "api_configuration",
       "account_mismatch",
-      "repository_not_ready",
       "remote_failed",
+      "tools_unavailable",
     ]),
   },
 ) {
@@ -46,10 +46,10 @@ export class ClaudeCloudGuardError extends Schema.TaggedError<ClaudeCloudGuardEr
         "Cloud launch blocked: API keys, custom API endpoints, and third-party billing configurations are not supported.",
       account_mismatch:
         "Cloud launch blocked: sign in to the matching Claude subscription in the T3 browser.",
-      repository_not_ready:
-        "Cloud launch blocked: use a clean, pushed GitHub branch. Local edits and local services are not transferred by this prototype.",
       remote_failed:
         "Claude's cloud interface returned an unsupported response. No automatic retry was made; inspect the cloud session before trying again.",
+      tools_unavailable:
+        "The cloud session could not connect to T3's local tools. No coding prompt was sent. Reconnect T3 and retry.",
     };
     return messages[this.reason];
   }

@@ -238,6 +238,7 @@ const PersistedComposerThreadDraftState = Schema.Struct({
   modelSelectionByProvider: Schema.optionalKey(Schema.Record(ProviderInstanceId, ModelSelection)),
   activeProvider: Schema.optionalKey(Schema.NullOr(ProviderInstanceId)),
   modelSelectionExplicit: Schema.optionalKey(Schema.Boolean),
+  automaticModelSelectionId: Schema.optionalKey(Schema.String),
   runtimeMode: Schema.optionalKey(RuntimeMode),
   interactionMode: Schema.optionalKey(ProviderInteractionMode),
 });
@@ -361,6 +362,7 @@ export interface ComposerThreadDraftState {
   modelSelectionByProvider: Partial<Record<ProviderInstanceId, ModelSelection>>;
   activeProvider: ProviderInstanceId | null;
   modelSelectionExplicit?: boolean;
+  automaticModelSelectionId?: string;
   runtimeMode: RuntimeMode | null;
   interactionMode: ProviderInteractionMode | null;
 }
@@ -501,6 +503,12 @@ interface ComposerDraftStoreState {
        */
       replaceOptions?: boolean;
     },
+  ) => void;
+  applyAutomaticModelSelection: (
+    threadRef: ComposerThreadTarget,
+    id: string,
+    source: ModelSelection,
+    target: ModelSelection,
   ) => void;
   setModelOptions: (
     threadRef: ComposerThreadTarget,
@@ -866,6 +874,7 @@ function shouldRemoveDraft(draft: ComposerThreadDraftState): boolean {
     draft.threadContexts.length === 0 &&
     Object.keys(draft.modelSelectionByProvider).length === 0 &&
     draft.activeProvider === null &&
+    draft.automaticModelSelectionId === undefined &&
     draft.runtimeMode === null &&
     draft.interactionMode === null
   );
@@ -1890,6 +1899,7 @@ function normalizePersistedDraftsByThreadId(
       reviewComments.length === 0 &&
       threadContexts.length === 0 &&
       !hasModelData &&
+      typeof draftCandidate.automaticModelSelectionId !== "string" &&
       !runtimeMode &&
       !interactionMode
     ) {
@@ -1921,6 +1931,9 @@ function normalizePersistedDraftsByThreadId(
             activeProvider,
             ...(modelSelectionExplicit ? { modelSelectionExplicit: true } : {}),
           }
+        : {}),
+      ...(typeof draftCandidate.automaticModelSelectionId === "string"
+        ? { automaticModelSelectionId: draftCandidate.automaticModelSelectionId }
         : {}),
       ...(runtimeMode ? { runtimeMode } : {}),
       ...(interactionMode ? { interactionMode } : {}),
@@ -2018,6 +2031,7 @@ export function partializeComposerDraftStoreState(
       draft.reviewComments.length === 0 &&
       draft.threadContexts.length === 0 &&
       !hasModelData &&
+      draft.automaticModelSelectionId === undefined &&
       draft.runtimeMode === null &&
       draft.interactionMode === null
     ) {
@@ -2080,6 +2094,9 @@ export function partializeComposerDraftStoreState(
             activeProvider: draft.activeProvider,
             ...(draft.modelSelectionExplicit ? { modelSelectionExplicit: true } : {}),
           }
+        : {}),
+      ...(draft.automaticModelSelectionId
+        ? { automaticModelSelectionId: draft.automaticModelSelectionId }
         : {}),
       ...(draft.runtimeMode ? { runtimeMode: draft.runtimeMode } : {}),
       ...(draft.interactionMode ? { interactionMode: draft.interactionMode } : {}),
@@ -2349,6 +2366,9 @@ function toHydratedThreadDraft(
     modelSelectionByProvider,
     activeProvider,
     ...(persistedDraft.modelSelectionExplicit ? { modelSelectionExplicit: true } : {}),
+    ...(persistedDraft.automaticModelSelectionId
+      ? { automaticModelSelectionId: persistedDraft.automaticModelSelectionId }
+      : {}),
     runtimeMode: persistedDraft.runtimeMode ?? null,
     interactionMode: persistedDraft.interactionMode ?? null,
   };
@@ -2959,6 +2979,42 @@ const composerDraftStore = create<ComposerDraftStoreState>()(
               nextDraftsByThreadKey[threadKey] = nextDraft;
             }
             return { draftsByThreadKey: nextDraftsByThreadKey };
+          });
+        },
+        applyAutomaticModelSelection: (threadRef, id, source, target) => {
+          const threadKey = resolveComposerDraftKey(get(), threadRef);
+          if (!threadKey) return;
+          set((state) => {
+            const base = state.draftsByThreadKey[threadKey] ?? createEmptyThreadDraft();
+            if (base.automaticModelSelectionId === id) return state;
+            const current = base.activeProvider
+              ? base.modelSelectionByProvider[base.activeProvider]
+              : undefined;
+            // A handoff consumes the old picker choice once. Remember its ID so
+            // a later deliberate selection survives reconnects and reloads.
+            const followsSource =
+              current?.instanceId === source.instanceId && current.model === source.model;
+            const { modelSelectionExplicit: explicit, ...retained } = base;
+            return {
+              draftsByThreadKey: {
+                ...state.draftsByThreadKey,
+                [threadKey]: {
+                  ...retained,
+                  automaticModelSelectionId: id,
+                  ...(followsSource
+                    ? {
+                        activeProvider: target.instanceId,
+                        modelSelectionByProvider: {
+                          ...base.modelSelectionByProvider,
+                          [target.instanceId]: target,
+                        },
+                      }
+                    : explicit
+                      ? { modelSelectionExplicit: true as const }
+                      : {}),
+                },
+              },
+            };
           });
         },
         setModelOptions: (threadRef, modelOptions) => {

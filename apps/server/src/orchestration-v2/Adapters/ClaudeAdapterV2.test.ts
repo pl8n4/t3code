@@ -2331,6 +2331,7 @@ describe("ClaudeAdapterV2 background wake turns", () => {
     });
 
   const makeWakeHarnessWithOptions = (options?: {
+    readonly stopOnUsageLimit?: boolean;
     readonly close?: (sdkMessages: Queue.Queue<SDKMessage>) => Effect.Effect<void>;
     readonly interrupt?: Effect.Effect<void>;
     readonly stopTask?: (
@@ -2385,6 +2386,9 @@ describe("ClaudeAdapterV2 background wake turns", () => {
         >();
       let openedOptions: ClaudeAdapterV2.ClaudeAgentSdkQueryOptions | undefined;
       const adapter = yield* ClaudeAdapterV2.makeClaudeAdapterV2({
+        ...(options?.stopOnUsageLimit === undefined
+          ? {}
+          : { stopOnUsageLimit: options.stopOnUsageLimit }),
         instanceId: ClaudeAdapterV2.CLAUDE_DEFAULT_INSTANCE_ID,
         settings: options?.settings ?? DEFAULT_CLAUDE_SETTINGS,
         environment: options?.environment ?? {},
@@ -3175,6 +3179,49 @@ describe("ClaudeAdapterV2 background wake turns", () => {
       yield* Queue.take(harness.terminalReceipts);
       assert.lengthOf(notices(), 3);
       assert.notEqual(notices()[0]?.id, notices()[2]?.id);
+    }).pipe(
+      Effect.provide(
+        Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+      ),
+    ),
+  );
+
+  it.effect("ends an opted-in local quota pause so the cloud worker can take over", () =>
+    Effect.gen(function* () {
+      const closed = yield* Deferred.make<void>();
+      const harness = yield* makeWakeHarnessWithOptions({
+        stopOnUsageLimit: true,
+        close: () => Deferred.succeed(closed, undefined).pipe(Effect.asVoid),
+      });
+      const now = yield* DateTime.now;
+      yield* harness.runtime.startTurn(
+        makeClaudeTestTurnInput({
+          threadId: harness.threadId,
+          providerThread: harness.providerThread,
+          now,
+          attemptId: RunAttemptId.make("cloud-fallback-limit"),
+          text: "Continue the task",
+          attachments: [],
+        }),
+      );
+      yield* Queue.offer(
+        harness.sdkMessages,
+        claudeSdkFrame({
+          type: "rate_limit_event",
+          rate_limit_info: {
+            status: "rejected",
+            rateLimitType: "five_hour",
+            resetsAt: Math.floor(DateTime.toEpochMillis(now) / 1000) + 3600,
+          },
+          uuid: "limit-for-cloud-fallback",
+          session_id: WAKE_NATIVE_SESSION,
+        }),
+      );
+      const terminal = yield* Queue.take(harness.terminalReceipts);
+      assert.equal(terminal.status, "failed");
+      if (terminal.status !== "failed") return;
+      assert.equal(terminal.failure.class, "usage_limit");
+      yield* Deferred.await(closed);
     }).pipe(
       Effect.provide(
         Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),

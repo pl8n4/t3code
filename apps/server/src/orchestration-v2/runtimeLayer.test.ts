@@ -5188,6 +5188,161 @@ it.layer(layerSharedApplicationDataPlaneTest)("shared application data plane", (
 });
 
 it.layer(layerTest)("usage-limit recovery", (it) => {
+  it.effect.each([
+    "ready",
+    "stale-run",
+    "snoozed",
+    "settled",
+    "provider-changed",
+    "queued",
+  ] as const)(
+    "guards an automatic cloud handoff against %s and keeps follow-ups on its provider",
+    (scenario) =>
+      Effect.gen(function* () {
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        const events = yield* EventSink.EventSinkV2;
+        const threadId = ThreadId.make(`cloud-recovery:${scenario}`);
+        const projectId = ProjectId.make(`cloud-recovery:project:${scenario}`);
+        const now = yield* DateTime.now;
+        yield* seedProject({
+          projectId,
+          title: "Cloud recovery",
+          workspaceRoot: process.cwd(),
+          defaultModelSelection: modelSelection,
+          createdAt: DateTime.formatIso(now),
+        });
+        yield* orchestrator.dispatch({
+          type: "thread.create",
+          commandId: CommandId.make(`cloud:create:${scenario}`),
+          threadId,
+          projectId,
+          title: "Limited thread",
+          modelSelection,
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          branch: null,
+          worktreePath: null,
+          createdBy: "user",
+          creationSource: "web",
+        });
+        yield* orchestrator.dispatch({
+          type: "message.dispatch",
+          commandId: CommandId.make(`cloud:start:${scenario}`),
+          messageId: MessageId.make(`cloud:start:${scenario}`),
+          threadId,
+          text: "Work on this.",
+          attachments: [],
+          dispatchMode: { type: "defer_start" },
+          createdBy: "user",
+          creationSource: "web",
+        });
+        const source = (yield* orchestrator.getThreadProjection(threadId)).runs[0]!;
+        yield* events.write({
+          events: [
+            {
+              id: EventId.make(`cloud:failed:${scenario}`),
+              type: "run.updated",
+              threadId,
+              occurredAt: now,
+              payload: { ...source, status: "failed", completedAt: now },
+            },
+            {
+              id: EventId.make(`cloud:limited:${scenario}`),
+              type: "turn-item.updated",
+              threadId,
+              occurredAt: now,
+              payload: {
+                id: TurnItemId.make(`cloud:limited:${scenario}`),
+                type: "error",
+                threadId,
+                runId: source.id,
+                nodeId: source.rootNodeId,
+                providerThreadId: null,
+                providerTurnId: null,
+                nativeItemRef: null,
+                parentItemId: null,
+                ordinal: 2,
+                status: "failed",
+                title: "Usage limit",
+                startedAt: now,
+                completedAt: now,
+                updatedAt: now,
+                failure: {
+                  class: "usage_limit",
+                  message: "Plan limit reached.",
+                  code: "usageLimitExceeded",
+                  retryable: null,
+                },
+              },
+            },
+          ],
+        });
+        if (scenario === "snoozed")
+          yield* orchestrator.dispatch({
+            type: "thread.snooze",
+            commandId: CommandId.make("cloud:snooze"),
+            threadId,
+            snoozedUntil: DateTime.formatIso(DateTime.add(now, { hours: 1 })),
+          });
+        if (scenario === "settled")
+          yield* orchestrator.dispatch({
+            type: "thread.settle",
+            commandId: CommandId.make("cloud:settle"),
+            threadId,
+          });
+        if (scenario === "provider-changed")
+          yield* orchestrator.dispatch({
+            type: "thread.model-selection.set",
+            commandId: CommandId.make("cloud:manual-switch"),
+            threadId,
+            modelSelection: { ...modelSelection, instanceId: alternateInstanceId },
+          });
+        if (scenario === "queued")
+          yield* orchestrator.dispatch({
+            type: "message.dispatch",
+            commandId: CommandId.make("cloud:user-queued"),
+            messageId: MessageId.make("cloud:user-queued"),
+            threadId,
+            text: "New user work",
+            attachments: [],
+            dispatchMode: { type: "defer_start" },
+            createdBy: "user",
+            creationSource: "web",
+          });
+        const before = yield* orchestrator.getThreadProjection(threadId);
+        const command = {
+          type: "message.dispatch" as const,
+          commandId: CommandId.make(`cloud:fallback:${scenario}`),
+          messageId: MessageId.make(`cloud:fallback:${scenario}`),
+          threadId,
+          cloudFallbackOfRunId: scenario === "stale-run" ? RunId.make("old-run") : source.id,
+          modelSelection: { ...modelSelection, instanceId: alternateInstanceId },
+          text: "Continue unfinished work.",
+          attachments: [],
+          dispatchMode: { type: "start_immediately" as const },
+          createdBy: "user" as const,
+          creationSource: "server" as const,
+        };
+        yield* orchestrator.dispatch(command);
+        yield* orchestrator.dispatch(command);
+        const after = yield* orchestrator.getThreadProjection(threadId);
+        assert.lengthOf(after.runs, before.runs.length + (scenario === "ready" ? 1 : 0));
+        if (scenario === "ready") {
+          assert.equal(after.thread.modelSelection.instanceId, alternateInstanceId);
+          assert.equal(after.runs.at(-1)?.providerInstanceId, alternateInstanceId);
+          yield* orchestrator.dispatch({
+            ...command,
+            commandId: CommandId.make("cloud:stale-delivery"),
+            messageId: MessageId.make("cloud:stale-delivery"),
+          });
+          assert.lengthOf(
+            (yield* orchestrator.getThreadProjection(threadId)).runs,
+            after.runs.length,
+          );
+        } else assert.deepEqual(after.thread.modelSelection, before.thread.modelSelection);
+      }),
+  );
+
   it.effect.each(["interrupted", "usage_limit"] as const)(
     "manually resumes an %s run ahead of its queued message only once",
     (reason) =>

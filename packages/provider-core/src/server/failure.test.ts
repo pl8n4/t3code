@@ -101,6 +101,22 @@ it("preserves actionable handoff errors wrapped by turn startup", () => {
   );
 });
 
+it("preserves actionable free-credit guard failures through provider wrappers", () => {
+  const message = "Cloud launch blocked: no promotional cloud credit remains.";
+  assert.equal(
+    makeProviderFailure({
+      cause: Cause.fail({
+        _tag: "ProviderAdapterOpenSessionError",
+        cause: {
+          _tag: "ClaudeAgentSdkQueryRunnerError",
+          cause: { _tag: "ClaudeCloudGuardError", message },
+        },
+      }),
+    }).message,
+    message,
+  );
+});
+
 it("does not expose defect text nested inside a known error category", () => {
   const failure = makeProviderFailure({
     cause: {

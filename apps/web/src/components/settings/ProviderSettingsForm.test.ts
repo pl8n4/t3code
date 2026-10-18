@@ -114,6 +114,7 @@ describe("ProviderSettingsForm helpers", () => {
 
     expect(deriveProviderSettingsFields(claude!).map((field) => field.key)).toEqual([
       "cloudFreeCreditsOnly",
+      "cloudFallbackOnLimit",
       "binaryPath",
       "homePath",
       "autoCompactWindow",

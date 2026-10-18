@@ -96,6 +96,7 @@ const makeCodexConfig = (overrides: Partial<CodexSettings>): CodexSettings => ({
 
 const makeClaudeConfig = (overrides: Partial<ClaudeSettings>): ClaudeSettings => ({
   cloudFreeCreditsOnly: false,
+  cloudFallbackOnLimit: false,
   enabled: false,
   binaryPath: "claude",
   homePath: "",

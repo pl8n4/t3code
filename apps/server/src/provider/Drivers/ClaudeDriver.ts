@@ -153,7 +153,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeSettings, ClaudeDriverEnv, Path.
         processEnv,
       );
       const continuationGroupKey = config.cloudFreeCreditsOnly
-        ? `${localContinuationGroupKey}:cloud:${instanceId}`
+        ? `${localContinuationGroupKey}:cloud-local-v2:${instanceId}`
         : localContinuationGroupKey;
       const configDir = yield* resolveClaudeHomePath(effectiveConfig, processEnv);
       const accountConfigPath = yield* ClaudeResetCredits.claudeAccountConfigPath(
@@ -203,7 +203,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeSettings, ClaudeDriverEnv, Path.
             },
             tools: {
               ...ClaudeProviderCapabilitiesV2.tools,
-              supportsMcpTools: false,
+              supportsMcpTools: true,
               supportsDynamicToolCallbacks: false,
             },
             approvals: {
@@ -214,7 +214,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeSettings, ClaudeDriverEnv, Path.
             },
             checkpointing: {
               ...ClaudeProviderCapabilitiesV2.checkpointing,
-              appCanCheckpointFilesystem: false,
+              appCanCheckpointFilesystem: true,
               providerCanRollbackConversation: false,
               providerRollbackReturnsSnapshot: false,
             },
@@ -231,6 +231,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeSettings, ClaudeDriverEnv, Path.
         },
         {
           scopedLimitNames,
+          stopOnUsageLimit: !config.cloudFreeCreditsOnly && config.cloudFallbackOnLimit,
           onUsageLimits: (update) => snapshot.applyUsageLimits(update),
           ...(capabilities ? { capabilities } : {}),
         },

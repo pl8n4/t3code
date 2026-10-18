@@ -80,6 +80,13 @@ function fixture(input?: {
       response_shape: { id: "cse_test", config: { model: "claude-haiku-5-5" } },
     });
   };
+  const context = NodeVM.createContext({
+    fetch,
+    location: { origin: "https://claude.ai", pathname: "/code" },
+    AbortSignal,
+    TextEncoder,
+    btoa,
+  });
   const broker = PreviewAutomationBroker.PreviewAutomationBroker.of({
     connect: () => Effect.succeed(Stream.empty),
     focusHost: () => Effect.void,
@@ -90,12 +97,15 @@ function fixture(input?: {
       if (request.operation === "navigate") return Effect.succeed({} as A);
       const expression = (request.input as { expression: string }).expression;
       return Effect.tryPromise({
-        try: async () =>
-          (await NodeVM.runInNewContext(expression, {
-            fetch,
-            location: { origin: "https://claude.ai", pathname: "/code" },
-            AbortSignal,
-          })) as A,
+        try: async () => {
+          const value = await NodeVM.runInContext(expression, context);
+          if (
+            expression.length > 64000 ||
+            Buffer.byteLength(JSON.stringify(value) ?? "null") > 64000
+          )
+            throw new Error("Browser evaluation exceeds its real limit");
+          return value as A;
+        },
         catch: (cause) =>
           new PreviewAutomationNoAvailableHostError({
             operation: request.operation,
@@ -291,6 +301,38 @@ describe("Claude cloud guarded transport", () => {
         expect(posts.at(-1)?.body).toMatchObject({
           events: [{ payload: { request: { subtype: "interrupt" } } }],
         });
+      }),
+    ),
+  );
+  it.effect("transfers event payloads above the browser result limit without losing Unicode", () =>
+    run(
+      Effect.gen(function* () {
+        const text = "漢字🙂".repeat(24000);
+        const f = yield* fixture({
+          events: [
+            {
+              event_id: "large",
+              sequence_num: "1",
+              payload: {
+                type: "assistant",
+                session_id: "remote",
+                message: { content: [{ type: "text", text }] },
+              },
+            },
+          ],
+        });
+        const session = yield* f.open();
+        yield* session.offer({
+          type: "user",
+          session_id: "",
+          parent_tool_use_id: null,
+          message: { role: "user", content: "Read large output" },
+        });
+        const reply = yield* session.messages.pipe(Stream.runHead);
+        expect(reply._tag).toBe("Some");
+        if (reply._tag === "Some" && reply.value.type === "assistant")
+          expect(reply.value.message.content).toEqual([{ type: "text", text }]);
+        yield* session.close;
       }),
     ),
   );

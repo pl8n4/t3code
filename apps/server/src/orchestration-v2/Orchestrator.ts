@@ -4581,6 +4581,39 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         }
       }
 
+      if (command.cloudFallbackOfRunId !== undefined) {
+        const source = usageLimitBlockedRun(projection.runs, projection.turnItems, null);
+        const failure = latestRootProviderFailure(source, projection.turnItems);
+        if (
+          source?.id !== command.cloudFallbackOfRunId ||
+          failure?.class !== "usage_limit" ||
+          projection.thread.providerInstanceId !== source.providerInstanceId ||
+          projection.thread.runtimeMode !== "full-access" ||
+          projection.thread.interactionMode !== "default" ||
+          !command.modelSelection ||
+          command.modelSelection.instanceId === source.providerInstanceId ||
+          projection.thread.archivedAt !== null ||
+          projection.thread.deletedAt !== null ||
+          projection.thread.settledOverride === "settled" ||
+          projection.thread.snoozedUntil != null ||
+          projection.runtimeRequests.some((r) => r.status === "pending") ||
+          projection.runs.some(
+            (r) => r.status === "running" || r.status === "starting" || r.status === "queued",
+          )
+        ) {
+          yield* emit(
+            events,
+            command,
+          )({
+            type: "thread.metadata-updated",
+            threadId: command.threadId,
+            occurredAt: yield* DateTime.now,
+            payload: projection.thread,
+          });
+          return;
+        }
+      }
+
       if (command.restartContinuationOfRunId !== undefined) {
         const source = projection.runs.find((run) => run.id === command.restartContinuationOfRunId);
         if (

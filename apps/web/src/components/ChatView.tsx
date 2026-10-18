@@ -1237,6 +1237,24 @@ export default function ChatView(props: ChatViewProps) {
   const setComposerDraftReviewComments = useComposerDraftStore((store) => store.setReviewComments);
   const setComposerDraftThreadContexts = useComposerDraftStore((store) => store.setThreadContexts);
   const setComposerDraftModelSelection = useComposerDraftStore((store) => store.setModelSelection);
+  const applyAutomaticModelSelection = useComposerDraftStore(
+    (store) => store.applyAutomaticModelSelection,
+  );
+  const cloudFallbackRun = serverProjection?.runs.findLast((run) =>
+    run.userMessageId?.startsWith(`cloud-fallback:${threadId}:`),
+  );
+  const cloudFallbackSource = serverProjection?.runs.find(
+    (run) => cloudFallbackRun?.userMessageId === `cloud-fallback:${threadId}:${run.id}`,
+  );
+  useEffect(() => {
+    if (!cloudFallbackRun || !cloudFallbackSource) return;
+    applyAutomaticModelSelection(
+      composerDraftTarget,
+      cloudFallbackRun.id,
+      cloudFallbackSource.modelSelection,
+      cloudFallbackRun.modelSelection,
+    );
+  }, [applyAutomaticModelSelection, composerDraftTarget, cloudFallbackRun, cloudFallbackSource]);
   const setComposerDraftRuntimeMode = useComposerDraftStore((store) => store.setRuntimeMode);
   const setComposerDraftInteractionMode = useComposerDraftStore(
     (store) => store.setInteractionMode,

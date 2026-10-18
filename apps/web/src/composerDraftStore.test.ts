@@ -1946,6 +1946,45 @@ describe("composerDraftStore modelSelection", () => {
     ).toEqual(modelSelection(CODEX_DRIVER, "gpt-5.4"));
   });
 
+  it("follows an automatic cloud handoff once and preserves the unsent prompt", async () => {
+    vi.useFakeTimers();
+    try {
+      const store = useComposerDraftStore.getState();
+      const source = createModelSelection(CLAUDE_AGENT_INSTANCE, "claude-haiku-5-5");
+      const target = createModelSelection(
+        ProviderInstanceId.make("claudeCloud"),
+        "claude-haiku-5-5",
+      );
+      store.setModelSelection(threadRef, source, { explicit: true });
+      store.setPrompt(threadRef, "Keep this follow-up draft");
+      store.applyAutomaticModelSelection(threadRef, "cloud-run-1", source, target);
+      expect(draftFor(threadId, TEST_ENVIRONMENT_ID)?.activeProvider).toBe(target.instanceId);
+      expect(draftFor(threadId, TEST_ENVIRONMENT_ID)?.prompt).toBe("Keep this follow-up draft");
+      // Choosing local again is deliberate, including after a storage round-trip.
+      store.setModelSelection(threadRef, source, { explicit: true });
+      await vi.advanceTimersByTimeAsync(300);
+      resetComposerDraftStore();
+      await useComposerDraftStore.persist.rehydrate();
+      useComposerDraftStore
+        .getState()
+        .applyAutomaticModelSelection(threadRef, "cloud-run-1", source, target);
+      expect(draftFor(threadId, TEST_ENVIRONMENT_ID)?.activeProvider).toBe(source.instanceId);
+      expect(draftFor(threadId, TEST_ENVIRONMENT_ID)?.modelSelectionExplicit).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps a newer picker choice when an automatic handoff arrives", () => {
+    const store = useComposerDraftStore.getState();
+    const source = createModelSelection(CLAUDE_AGENT_INSTANCE, "claude-haiku-5-5");
+    const target = createModelSelection(ProviderInstanceId.make("claudeCloud"), "claude-haiku-5-5");
+    store.setModelSelection(threadRef, modelSelection(CODEX_DRIVER, "gpt-5.4"), { explicit: true });
+    store.applyAutomaticModelSelection(threadRef, "cloud-run-2", source, target);
+    expect(draftFor(threadId, TEST_ENVIRONMENT_ID)?.activeProvider).toBe(CODEX_INSTANCE);
+    expect(draftFor(threadId, TEST_ENVIRONMENT_ID)?.modelSelectionExplicit).toBe(true);
+  });
+
   it("marks picker writes explicit and seeding writes non-explicit", () => {
     const store = useComposerDraftStore.getState();
     store.setModelSelection(threadRef, modelSelection(CODEX_DRIVER, "gpt-5.4"));

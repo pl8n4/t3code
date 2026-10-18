@@ -57,6 +57,9 @@ import {
   DeviceStandardToolkit,
 } from "./toolkits/device/tools.ts";
 import * as HtmlHandlers from "./toolkits/html/handlers.ts";
+import * as WorkspaceHandlers from "./toolkits/workspace/handlers.ts";
+import { WorkspaceToolkit } from "./toolkits/workspace/tools.ts";
+import * as AgentWorkspace from "./AgentWorkspaceService.ts";
 import { HtmlPreviewTool, HtmlPreviewToolkit, HtmlRenderToolkit } from "./toolkits/html/tools.ts";
 
 const mcpResourceMetadataUrl = (request: HttpServerRequest.HttpServerRequest) =>
@@ -833,6 +836,9 @@ export const layerMcpTransport = McpServer.layerHttp({
 }).pipe(Layer.provide(layerMcpAuthMiddleware));
 
 export const layer = Layer.mergeAll(
+  toolkitRegistration(WorkspaceToolkit, WorkspaceHandlers.layer).pipe(
+    Layer.provide(AgentWorkspace.layer),
+  ),
   layerPreviewToolkit,
   layerOrchestratorToolkit,
   layerThreadToolkit,

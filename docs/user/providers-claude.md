@@ -81,20 +81,42 @@ credits in Claude's usage settings. The prototype checks these before each
 message and during active work. Missing or unknown billing information blocks
 launches. API keys and paid API endpoints are unsupported.
 
-For coding, use a clean GitHub checkout whose current branch is pushed to
-`origin` and available to the Claude cloud environment. Cloud work starts on a
-separate branch. Local edits, attachments, local services, and T3 MCP tools are
-not transferred. Review the cloud branch in Claude Code before bringing changes
-back to your machine; T3's local checkpoint and revert controls do not apply.
+The model runs in Anthropic's cloud while T3 tools work in the thread's actual
+local project or worktree. Existing edits and untracked files are available;
+there is no clean-checkout, GitHub remote, push, or manual synchronization step.
+Edits appear in T3's normal local diffs and checkpoints. Browser and thread-history
+tools use the same T3 permissions as other providers. Tools that start other model
+work or change provider settings are disabled in free-credit mode. Keep T3 and the environment's
+machine running while a cloud task uses those tools.
 
-To continue a limited local thread, stop its current turn, select the cloud
-instance, and send a follow-up. T3 transfers conversation text when changing
-instances. Switching is manual; automatic quota fallback is not included.
+To switch automatically at a subscription limit, enable **Continue in free cloud
+credit when limited** on your ordinary local Claude instance. Keep exactly one
+free-credit cloud instance enabled for that same Claude config directory and
+account. In a **Full access**, default-mode thread, a rejected usage-limit turn
+stops and continues on cloud Haiku in the same conversation. T3 transfers the
+conversation context and keeps the current workspace; the composer follows the
+cloud instance for subsequent messages. You can select the local instance again
+later. Ambiguous accounts, pending approvals, queued work, snoozed threads, or
+unknown billing information block automatic continuation.
+
+For manual switching, stop the current turn, select the cloud instance, and send
+a follow-up. You can also start a new cloud thread in any local project.
+
+This prototype supports Haiku 5.5 and Full access. File tools use paths relative
+to the thread's workspace; commands currently require a Unix shell and have a
+60-second timeout. Local dependencies still run on the environment's machine.
+Cloud-native skills, binary/image attachments, and native conversation fork or
+rollback are not fully integrated. Text handoffs are summaries, so they cannot
+preserve a provider's hidden reasoning or every detail of a long conversation.
 
 This experimental mode depends on Claude's internal browser interface and may
-break when that interface changes. If session creation cannot be confirmed,
-inspect Claude Code before retrying; the prototype avoids blindly repeating
-the creation request.
+break when that interface changes. Leave its transport browser tabs alone and
+avoid opening the same cloud session in Claude's own interface while T3 is using
+it; competing clients can disconnect the tool bridge. Interrupted tool calls
+are not automatically replayed: inspect the workspace before retrying. Promotional
+credit can expire or become unavailable, at which point the bridge stops instead
+of falling back to a paid API. If session creation cannot be confirmed, inspect
+Claude Code before retrying; T3 avoids blindly repeating the creation request.
 
 ## Skills
 
