@@ -1,5 +1,36 @@
 # T3 Code
 
+## Claude cloud fork (experimental)
+
+This is [pl8n4's unofficial fork](https://github.com/pl8n4/t3code) of
+[T3 Code](https://github.com/pingdotgg/t3code), with an experimental Claude
+promotional-cloud-credit provider. The model runs in Claude's cloud; T3's tools
+read files, run commands, and edit the actual local project or worktree. The cloud
+provider checks promotional eligibility and refuses paid or unverified billing.
+
+The feature lives on `prototype/claude-cloud-free-only`. It uses Claude's browser
+cloud interface, so changes to that interface can break the integration. Read the
+[setup, supported features, and limitations](docs/user/providers-claude.md#promotional-cloud-credits-prototype)
+before using it. Your environment machine must stay running for local tools.
+
+This fork is currently distributed as source. With Node.js 24 and
+[Vite+](https://viteplus.dev/guide/) installed:
+
+```bash
+git clone --branch prototype/claude-cloud-free-only https://github.com/pl8n4/t3code.git
+cd t3code
+vp i
+vp run dev --home-dir "$PWD/.t3"
+```
+
+The explicit home directory keeps this fork's threads and settings separate from
+an existing T3 installation. Configure the cloud provider as described in the
+linked guide. Official downloads and installation commands below install upstream
+T3 Code; they do not include this fork's cloud provider. Upstream's MIT license and
+copyright notice remain in [LICENSE](LICENSE).
+
+---
+
 T3 Code is an "agent harness control surface". It enables control of the agents on your machine with a best-in-class mobile app ([iOS](https://apps.apple.com/us/app/t3-code-remote-claude-more/id6787819824), [Android](https://play.google.com/store/apps/details?id=com.t3tools.t3code)), [web app](https://app.t3.codes) and [Electron-based desktop app](https://t3.codes).
 
 Works with your subscriptions on Claude Code, Codex, Cursor, Grok Build, OpenCode, and Google Antigravity. If they're set up on your computer, T3 Code can control them.
