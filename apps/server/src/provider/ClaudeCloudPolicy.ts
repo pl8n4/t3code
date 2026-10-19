@@ -28,6 +28,8 @@ export class ClaudeCloudGuardError extends Schema.TaggedError<ClaudeCloudGuardEr
       "account_mismatch",
       "remote_failed",
       "tools_unavailable",
+      "session_missing",
+      "delivery_pending",
     ]),
   },
 ) {
@@ -50,6 +52,10 @@ export class ClaudeCloudGuardError extends Schema.TaggedError<ClaudeCloudGuardEr
         "Claude's cloud interface returned an unsupported response. No automatic retry was made; inspect the cloud session before trying again.",
       tools_unavailable:
         "The cloud session could not connect to T3's local tools. No coding prompt was sent. Reconnect T3 and retry.",
+      session_missing:
+        "The saved cloud session binding is missing. No replacement conversation was created. Restore the prototype's session data or start a new thread with the existing conversation as context.",
+      delivery_pending:
+        "Unconfirmed cloud output was preserved in the prototype's recovery journal. Resume is blocked to avoid losing history or repeating local actions. Open the cloud conversation in this thread's Browser panel to recover it, then start a new thread with that context. No new prompt was sent.",
     };
     return messages[this.reason];
   }
@@ -98,12 +104,12 @@ export function verifyClaudeCloudEnvironment(
   }
 }
 
-const Event = Schema.Struct({
+export const ClaudeCloudEvent = Schema.Struct({
   event_id: Schema.String,
   sequence_num: Schema.String,
   payload: Schema.Record(Schema.String, Schema.Unknown),
 });
-const ClaudeCloudEventPage = Schema.Struct({ data: Schema.Array(Event) });
+const ClaudeCloudEventPage = Schema.Struct({ data: Schema.Array(ClaudeCloudEvent) });
 
 const decodeEvents = Schema.decodeUnknownSync(ClaudeCloudEventPage);
 

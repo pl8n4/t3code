@@ -106,6 +106,8 @@ describe("cloud MCP protocol relay", () => {
                             { name: "preview_snapshot" },
                             { name: "delegate_task" },
                             { name: "t3_thread_configure" },
+                            { name: "write_pull_request_guides" },
+                            { name: "t3_worktree_handoff" },
                           ],
                         }
                       : {},
@@ -135,6 +137,8 @@ describe("cloud MCP protocol relay", () => {
         "t3_thread_configure",
         "t3_thread_update",
         "t3_environment_preferences_update",
+        "write_pull_request_guides",
+        "t3_worktree_handoff",
       ]) {
         expect(
           yield* relay({

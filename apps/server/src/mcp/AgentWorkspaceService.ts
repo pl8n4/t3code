@@ -25,6 +25,7 @@ import * as Processes from "../processRunner.ts";
 import * as PullRequests from "../pullRequest/PullRequestService.ts";
 import * as Files from "../workspace/WorkspaceFileSystem.ts";
 import * as Entries from "../workspace/WorkspaceEntries.ts";
+import * as Git from "../vcs/GitVcsDriver.ts";
 import * as Invocation from "./McpInvocationContext.ts";
 import { WorkspaceInfo } from "./AgentWorkspaceSchemas.ts";
 import { assertFullAccess, assertLiveCaller, readCaller, unavailable } from "./threadAccess.ts";
@@ -123,6 +124,7 @@ const make = Effect.gen(function* () {
   const crypto = yield* Crypto.Crypto;
   const processes = yield* Processes.ProcessRunner;
   const pullRequests = yield* PullRequests.PullRequestService;
+  const git = yield* Git.GitVcsDriver;
   const workspace = (scope: Invocation.McpInvocationScope, write = false) =>
     Effect.gen(function* () {
       const context = yield* readCaller().pipe(
@@ -148,11 +150,46 @@ const make = Effect.gen(function* () {
           code: "invalid_request",
           message: "The calling thread's project is unavailable.",
         });
+      const cwd = context.caller.worktreePath ?? project.value.workspaceRoot;
+      const directory = yield* fs.stat(cwd).pipe(Effect.mapError(unavailable));
+      if (directory.type !== "Directory")
+        return yield* new OrchestratorMcpFailure({
+          code: "invalid_request",
+          message: "The calling thread's workspace is not an available directory.",
+        });
+      if (context.caller.worktreePath) {
+        const realCwd = yield* fs.realPath(cwd).pipe(Effect.mapError(unavailable));
+        const worktrees = yield* git
+          .listWorktreePaths(project.value.workspaceRoot)
+          .pipe(Effect.mapError(unavailable));
+        const available = yield* Effect.forEach(worktrees, (worktree) =>
+          fs.realPath(worktree).pipe(Effect.option),
+        );
+        const commonDirectory = (root: string) =>
+          git
+            .execute({
+              operation: "AgentWorkspaceService.verifyWorktree",
+              cwd: root,
+              args: ["rev-parse", "--path-format=absolute", "--git-common-dir"],
+            })
+            .pipe(
+              Effect.flatMap((result) => fs.realPath(result.stdout.trim())),
+              Effect.mapError(unavailable),
+            );
+        if (
+          !available.some((entry) => Option.isSome(entry) && entry.value === realCwd) ||
+          (yield* commonDirectory(cwd)) !== (yield* commonDirectory(project.value.workspaceRoot))
+        )
+          return yield* new OrchestratorMcpFailure({
+            code: "invalid_request",
+            message: "The calling thread's worktree no longer belongs to its project repository.",
+          });
+      }
       return {
         projectId: project.value.id,
         projectName: project.value.title,
         workspaceRoot: project.value.workspaceRoot,
-        cwd: context.caller.worktreePath ?? project.value.workspaceRoot,
+        cwd,
         branch: context.caller.branch,
         repository: project.value.repositoryIdentity?.canonicalKey ?? null,
       };

@@ -14,6 +14,7 @@ import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
+import * as TestClock from "effect/testing/TestClock";
 import { HttpClient, HttpClientResponse } from "effect/http";
 import * as ServerConfig from "../config.ts";
 import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
@@ -45,6 +46,8 @@ function fixture(input?: {
   workspace?: boolean;
   workspaceUnavailable?: boolean;
   workspaceMalformed?: boolean;
+  workspaceCwd?: string;
+  setupFails?: boolean;
 }) {
   let usage: unknown = input?.paid ? { ...funded(), extra_usage: { is_enabled: true } } : funded();
   const calls: Array<{ path: string; method: string; body?: unknown }> = [];
@@ -53,6 +56,10 @@ function fixture(input?: {
   const evaluations: string[] = [];
   const controlReplies: unknown[] = [];
   let sequence = 0;
+  let setupFailures = input?.setupFails ? 1 : 0;
+  let eventPolls = 0;
+  const toolReply = Promise.withResolvers<void>();
+  const toolResponses: unknown[] = [];
   const fetch = async (url: string, init?: RequestInit) => {
     const method = init?.method ?? "GET";
     const body = typeof init?.body === "string" ? decodeJson(init.body) : undefined;
@@ -66,6 +73,7 @@ function fixture(input?: {
       });
     if (url.endsWith("/events")) {
       if (method === "GET") {
+        eventPolls++;
         if (input?.events) await sent.promise;
         return Response.json({ data: [...controlReplies, ...(input?.events ?? [])] });
       }
@@ -87,21 +95,27 @@ function fixture(input?: {
                 subtype: "success",
                 request_id: payload.request_id,
                 response:
-                  payload.request.subtype === "mcp_status"
-                    ? {
-                        mcpServers: [
-                          {
-                            name: "t3-code",
-                            status: "connected",
-                            source: "sdk",
-                            config: { type: "sdk", name: "t3-code" },
-                          },
-                        ],
-                      }
-                    : {},
+                  payload.request.subtype === "mcp_set_servers" && setupFailures-- > 0
+                    ? { errors: { "t3-code": "injected failure" } }
+                    : payload.request.subtype === "mcp_status"
+                      ? {
+                          mcpServers: [
+                            {
+                              name: "t3-code",
+                              status: "connected",
+                              source: "sdk",
+                              config: { type: "sdk", name: "t3-code" },
+                            },
+                          ],
+                        }
+                      : {},
               },
             },
           });
+        if (payload?.type === "control_response") {
+          toolResponses.push(payload);
+          toolReply.resolve();
+        }
       }
       if (
         (body as { events?: { payload: { type: string } }[] })?.events?.some(
@@ -188,7 +202,7 @@ function fixture(input?: {
                             : json({
                                 projectId: "project-football",
                                 projectName: "football-data",
-                                cwd: "/projects/football-data/worktree",
+                                cwd: input?.workspaceCwd ?? "/projects/football-data/worktree",
                                 workspaceRoot: "/projects/football-data",
                                 branch: "test-branch",
                                 repository: "github.com/pl8n4/football-data",
@@ -231,13 +245,17 @@ function fixture(input?: {
       Effect.provide(ServerConfig.ServerConfig.layerTest(dir, `${dir}/state`)),
     );
     const sessionId = yield* runner.allocateSessionId;
-    const open = () =>
+    const bindingPath = `${dir}/state/userdata/claude-cloud-sessions/${sessionId}.json`;
+    const open = (options?: { resume?: boolean; durableCloudSequence?: string }) =>
       runner
         .open({
           threadId,
           providerSessionId: ProviderSessionId.make("cloud-test-session"),
+          ...(options?.durableCloudSequence === undefined
+            ? {}
+            : { durableCloudSequence: options.durableCloudSequence }),
           options: {
-            sessionId,
+            ...(options?.resume ? { resume: sessionId } : { sessionId }),
             model: input?.model ?? "claude-haiku-5-5",
             tools: [],
             permissionMode: "bypassPermissions",
@@ -262,6 +280,30 @@ function fixture(input?: {
       calls,
       rpcCalls,
       evaluations,
+      readBinding: fs.readFileString(bindingPath).pipe(Effect.map(decodeJson)),
+      toolResponses,
+      waitForToolReply: Effect.promise(() => toolReply.promise),
+      eventPolls: () => eventPolls,
+      pushEvent: (payload: unknown) =>
+        controlReplies.push({
+          event_id: `injected:${++sequence}`,
+          sequence_num: String(sequence),
+          payload,
+        }),
+      forgetToolOutcome: (requestId: string) =>
+        fs.readFileString(bindingPath).pipe(
+          Effect.map(
+            Schema.decodeUnknownSync(
+              Schema.fromJsonString(Schema.Record(Schema.String, Schema.Unknown)),
+            ),
+          ),
+          Effect.flatMap((saved) =>
+            fs.writeFileString(
+              bindingPath,
+              json({ ...saved, toolRequests: { [requestId]: { state: "started" } } }),
+            ),
+          ),
+        ),
       setPaid: () => {
         usage = { ...funded(), spend: { enabled: true } };
       },
@@ -282,6 +324,147 @@ const run = <A, E>(
 ) => effect.pipe(Effect.scoped, Effect.provide(NodeServices.layer));
 
 describe("Claude cloud guarded transport", () => {
+  it.effect("refuses a missing explicit resume without creating a replacement session", () =>
+    run(
+      Effect.gen(function* () {
+        const f = yield* fixture();
+        const result = yield* f.open({ resume: true }).pipe(Effect.result);
+        expect(result._tag).toBe("Failure");
+        expect(JSON.stringify(result)).toContain("session_missing");
+        expect(f.calls.some((call) => call.method === "POST")).toBe(false);
+      }),
+    ),
+  );
+  it.effect("closes a failed setup's poller and does not repeat a cached tool on retry", () =>
+    run(
+      Effect.gen(function* () {
+        const f = yield* fixture({ workspace: true, setupFails: true });
+        expect((yield* f.open().pipe(Effect.result))._tag).toBe("Failure");
+        const polls = f.eventPolls();
+        yield* TestClock.adjust("10 seconds");
+        expect(f.eventPolls()).toBe(polls);
+        const session = yield* f.open();
+        f.pushEvent({
+          type: "control_request",
+          request_id: "write-once",
+          request: {
+            subtype: "mcp_message",
+            server_name: "t3-code",
+            message: {
+              jsonrpc: "2.0",
+              id: 100,
+              method: "tools/call",
+              params: { name: "t3_workspace_write", arguments: {} },
+            },
+          },
+        });
+        yield* session.offer({
+          type: "user",
+          session_id: "",
+          parent_tool_use_id: null,
+          message: { role: "user", content: "Continue" },
+        });
+        yield* f.waitForToolReply;
+        expect(
+          f.rpcCalls.filter((rpc) => JSON.stringify(rpc).includes("t3_workspace_write")),
+        ).toHaveLength(1);
+        yield* session.close;
+        const resumed = yield* f.open({ resume: true });
+        yield* resumed.close;
+        expect(
+          f.rpcCalls.filter((rpc) => JSON.stringify(rpc).includes("t3_workspace_write")),
+        ).toHaveLength(1);
+        expect(f.toolResponses.length).toBeGreaterThanOrEqual(2);
+      }),
+    ),
+  );
+  it.effect("does not re-execute a tool whose persisted outcome is uncertain", () =>
+    run(
+      Effect.gen(function* () {
+        const f = yield* fixture({ workspace: true });
+        const session = yield* f.open();
+        f.pushEvent({
+          type: "control_request",
+          request_id: "uncertain-write",
+          request: {
+            subtype: "mcp_message",
+            server_name: "t3-code",
+            message: {
+              jsonrpc: "2.0",
+              id: 101,
+              method: "tools/call",
+              params: { name: "t3_workspace_write", arguments: {} },
+            },
+          },
+        });
+        yield* session.offer({
+          type: "user",
+          session_id: "",
+          parent_tool_use_id: null,
+          message: { role: "user", content: "Continue" },
+        });
+        yield* f.waitForToolReply;
+        yield* session.close;
+        yield* f.forgetToolOutcome("uncertain-write");
+        const resumed = yield* f.open({ resume: true });
+        yield* resumed.close;
+        expect(
+          f.rpcCalls.filter((rpc) => JSON.stringify(rpc).includes("t3_workspace_write")),
+        ).toHaveLength(1);
+        expect(JSON.stringify(f.toolResponses)).toContain("It was not repeated");
+      }),
+    ),
+  );
+  it.effect(
+    "preserves unread replies and blocks unconfirmed delivery instead of skipping it on resume",
+    () =>
+      run(
+        Effect.gen(function* () {
+          const f = yield* fixture({
+            events: [
+              {
+                event_id: "first",
+                sequence_num: "1",
+                payload: {
+                  type: "assistant",
+                  message: { content: [{ type: "text", text: "first reply" }] },
+                },
+              },
+              {
+                event_id: "unread",
+                sequence_num: "2",
+                payload: {
+                  type: "assistant",
+                  message: { content: [{ type: "text", text: "unread reply" }] },
+                },
+              },
+            ],
+          });
+          const session = yield* f.open();
+          yield* session.offer({
+            type: "user",
+            session_id: "",
+            parent_tool_use_id: null,
+            message: { role: "user", content: "Read" },
+          });
+          yield* session.messages.pipe(Stream.take(1), Stream.runDrain);
+          yield* session.close;
+          const resumed = yield* f
+            .open({ resume: true, durableCloudSequence: "1" })
+            .pipe(Effect.result);
+          expect(resumed._tag).toBe("Failure");
+          expect(JSON.stringify(resumed)).toContain("delivery_pending");
+          expect(yield* f.readBinding).toMatchObject({
+            inbox: expect.arrayContaining([
+              { event_id: "unread", sequence_num: "2", payload: expect.anything() },
+            ]),
+          });
+          expect(
+            f.calls.filter((call) => call.path === "/v1/code/sessions" && call.method === "POST"),
+          ).toHaveLength(1);
+        }),
+      ),
+  );
   it.effect(
     "supplies project and PR tools for an ordinary question without special user prompting",
     () =>
@@ -327,7 +510,7 @@ describe("Claude cloud guarded transport", () => {
         }),
       ),
   );
-  it.effect.each(["error", "malformed"] as const)(
+  it.effect.each(["error", "malformed", "different"] as const)(
     "does not send the task if workspace verification returns %s",
     (kind) =>
       run(
@@ -336,6 +519,7 @@ describe("Claude cloud guarded transport", () => {
             workspace: true,
             workspaceUnavailable: kind === "error",
             workspaceMalformed: kind === "malformed",
+            ...(kind === "different" ? { workspaceCwd: "/projects/unrelated" } : {}),
           });
           const session = yield* f.open();
           const result = yield* session
@@ -445,7 +629,12 @@ describe("Claude cloud guarded transport", () => {
         expect(replies.map((m) => m.type)).toEqual(["assistant", "result"]);
         expect(replies.every((m) => m.session_id !== "remote")).toBe(true);
         yield* session.close;
-        const resumed = yield* f.open();
+        const checkpoint = session.cloudEventSequence?.(replies.at(-1)!);
+        if (checkpoint === undefined) throw new Error("Missing cloud delivery checkpoint");
+        const resumed = yield* f.open({
+          resume: true,
+          durableCloudSequence: checkpoint,
+        });
         expect(
           f.calls.filter((c) => c.path === "/v1/code/sessions" && c.method === "POST"),
         ).toHaveLength(1);

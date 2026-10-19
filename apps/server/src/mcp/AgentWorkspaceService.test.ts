@@ -17,6 +17,7 @@ import * as Entries from "../workspace/WorkspaceEntries.ts";
 import * as Paths from "../workspace/WorkspacePaths.ts";
 import * as Vcs from "../vcs/VcsDriverRegistry.ts";
 import * as VcsProcess from "../vcs/VcsProcess.ts";
+import * as Git from "../vcs/GitVcsDriver.ts";
 import * as Workspace from "./AgentWorkspaceService.ts";
 import { liveThreadShell } from "./McpToolAccess.testkit.ts";
 import type { McpInvocationScope } from "./McpInvocationContext.ts";
@@ -24,6 +25,29 @@ import type { McpInvocationScope } from "./McpInvocationContext.ts";
 const fixture = Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem;
   const dir = yield* fs.makeTempDirectoryScoped();
+  const git = yield* Git.GitVcsDriver.pipe(
+    Effect.provide(
+      Git.layer.pipe(
+        Layer.provide(VcsProcess.layer),
+        Layer.provide(Config.ServerConfig.layerTest(dir, `${dir}/state`)),
+      ),
+    ),
+  );
+  yield* git.execute({ operation: "test", cwd: dir, args: ["init", "-q"] });
+  yield* git.execute({
+    operation: "test",
+    cwd: dir,
+    args: [
+      "-c",
+      "user.name=Test",
+      "-c",
+      "user.email=test@example.invalid",
+      "commit",
+      "--allow-empty",
+      "-qm",
+      "initial",
+    ],
+  });
   let shell = liveThreadShell(ThreadId.make("workspace-tools-test"));
   const date = IsoDateTime.make("2026-10-18T00:00:00Z");
   const project = {
@@ -108,6 +132,7 @@ const fixture = Effect.gen(function* () {
       }),
     ),
     Layer.provide(Vcs.layer.pipe(Layer.provide(VcsProcess.layer))),
+    Layer.provide(Git.layer.pipe(Layer.provide(VcsProcess.layer))),
     Layer.provide(Config.ServerConfig.layerTest(dir, `${dir}/state`)),
   );
   const service = yield* Workspace.AgentWorkspaceService.pipe(Effect.provide(layer));
@@ -118,6 +143,7 @@ const fixture = Effect.gen(function* () {
     dir,
     commands,
     prCalls,
+    git,
     setShell: (patch: Partial<typeof shell>) => {
       shell = { ...shell, ...patch };
     },
@@ -127,11 +153,45 @@ const withServices = <A, E, R>(program: Effect.Effect<A, E, R>) =>
   program.pipe(Effect.provide(NodeServices.layer), Effect.scoped);
 
 describe("agent local workspace", () => {
+  it.effect.each(["missing", "unrelated", "replaced"] as const)(
+    "refuses a %s worktree before exposing workspace tools",
+    (kind) =>
+      withServices(
+        Effect.gen(function* () {
+          const f = yield* fixture;
+          const worktree = `${f.dir}/worktree`;
+          if (kind === "replaced") {
+            yield* f.git.execute({
+              operation: "test",
+              cwd: f.dir,
+              args: ["worktree", "add", "-qb", "original", worktree],
+            });
+            yield* f.fs.remove(worktree, { recursive: true });
+          }
+          if (kind !== "missing") {
+            yield* f.fs.makeDirectory(worktree);
+            yield* f.git.execute({ operation: "test", cwd: worktree, args: ["init", "-q"] });
+          }
+          f.setShell({ worktreePath: worktree });
+          expect((yield* f.service.info(f.scope).pipe(Effect.result))._tag).toBe("Failure");
+          expect(
+            (yield* f.service.exec(f.scope, { command: "must not execute" }).pipe(Effect.result))
+              ._tag,
+          ).toBe("Failure");
+          expect(f.commands).toEqual([]);
+        }),
+      ),
+  );
   it.effect("identifies the bound worktree and lists PRs with the existing project account", () =>
     withServices(
       Effect.gen(function* () {
         const f = yield* fixture;
         const worktree = `${f.dir}/worktree`;
+        yield* f.git.execute({
+          operation: "test",
+          cwd: f.dir,
+          args: ["worktree", "add", "-qb", "test/pr-question", worktree],
+        });
         f.setShell({ worktreePath: worktree, branch: "test/pr-question" });
         expect(yield* f.service.info(f.scope)).toMatchObject({
           projectName: "Fixture",

@@ -5,6 +5,7 @@ import * as Crypto from "effect/Crypto";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
@@ -12,6 +13,8 @@ import * as Option from "effect/Option";
 import * as Queue from "effect/Queue";
 import * as Schema from "effect/Schema";
 import * as Schedule from "effect/Schedule";
+import * as Scope from "effect/Scope";
+import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
 
 import * as ServerConfig from "../config.ts";
@@ -33,6 +36,7 @@ import { resolveClaudeHomePath } from "./Drivers/ClaudeHome.ts";
 import {
   CLAUDE_CLOUD_MODEL,
   ClaudeCloudGuardError,
+  ClaudeCloudEvent,
   orderedClaudeCloudEvents,
   verifyClaudeCloudCredit,
   verifyClaudeCloudEnvironment,
@@ -43,6 +47,16 @@ const Binding = Schema.Struct({
   organizationId: Schema.String,
   cloudId: Schema.String,
   sequence: Schema.String,
+  inbox: Schema.optionalKey(Schema.Array(ClaudeCloudEvent)),
+  toolRequests: Schema.optionalKey(
+    Schema.Record(
+      Schema.String,
+      Schema.Struct({
+        state: Schema.Literals(["started", "completed"]),
+        response: Schema.optionalKey(Schema.Record(Schema.String, Schema.Unknown)),
+      }),
+    ),
+  ),
 });
 const Account = Schema.Struct({ oauthAccount: Schema.Struct({ organizationUuid: Schema.String }) });
 const SessionInfo = Schema.Struct({
@@ -126,61 +140,64 @@ export const makeClaudeCloudQueryRunner = Effect.fn("makeClaudeCloudQueryRunner"
     subagentLaunchToolUseId: () => Effect.succeed(null),
     open: (input: ClaudeAgentSdkQueryOpenInput) =>
       Effect.gen(function* () {
-        yield* Effect.try(() => {
-          verifyClaudeCloudEnvironment(environment);
-          verifyClaudeCloudModel(input.options.model);
-          if (input.options.permissionMode !== "bypassPermissions") {
-            throw new ClaudeCloudGuardError({ reason: "unsupported_policy" });
-          }
-          if (config.launchArgs.trim())
-            throw new ClaudeCloudGuardError({ reason: "api_configuration" });
-        });
-        const account = yield* fs
-          .readFileString(accountPath)
-          .pipe(Effect.flatMap(Schema.decodeEffect(Schema.fromJsonString(Account))));
-        const organizationId = account.oauthAccount.organizationUuid;
-        const scope: McpThreadInvocationScope = {
-          environmentId: yield* identity.getEnvironmentId,
-          capabilities: new Set(["preview"]),
-          issuedAt: DateTime.toEpochMillis(yield* DateTime.now),
-          requestNamespace: `claude-cloud:${input.providerSessionId}`,
-          thread: {
-            threadId: input.threadId,
-            providerSessionId: `cloud:${input.providerSessionId}`,
-            providerInstanceId: instanceId,
-          },
-          client: undefined,
-        };
-        const opened = yield* broker.invoke<{ tabId: PreviewTabId | null }>({
-          scope,
-          operation: "open",
-          input: { url: "https://claude.ai/new", open: false, reuseExistingTab: false },
-        });
-        if (!opened.tabId) return yield* new ClaudeCloudGuardError({ reason: "account_mismatch" });
-        const tabId = opened.tabId;
-
-        const browser = (expression: string) =>
-          broker.invoke<unknown>({
-            scope,
-            tabId,
-            operation: "evaluate",
-            input: { expression, awaitPromise: true },
-            timeoutMs: 20_000,
-          });
-
-        const requestOnce = (endpoint: string, body?: unknown, afterSequence = 0n) =>
-          Effect.gen(function* () {
-            const key = yield* crypto.randomUUIDv4();
-            const encoded = body === undefined ? undefined : json(body);
-            const inlineBody = encoded !== undefined && Buffer.byteLength(encoded) <= 10000;
-            if (encoded !== undefined && !inlineBody) {
-              for (let offset = 0; offset < encoded.length; offset += 24000) {
-                yield* browser(
-                  `(() => {const b=globalThis.__t3CloudBuffers??=Object.create(null);(b[${json(key)}]??=[]).push(${json(encoded.slice(offset, offset + 24000))});return null})()`,
-                );
-              }
+        const queryScope = yield* Scope.fork(ownerScope);
+        return yield* Effect.gen(function* () {
+          yield* Effect.try(() => {
+            verifyClaudeCloudEnvironment(environment);
+            verifyClaudeCloudModel(input.options.model);
+            if (input.options.permissionMode !== "bypassPermissions") {
+              throw new ClaudeCloudGuardError({ reason: "unsupported_policy" });
             }
-            const result = yield* browser(`(async () => {
+            if (config.launchArgs.trim())
+              throw new ClaudeCloudGuardError({ reason: "api_configuration" });
+          });
+          const account = yield* fs
+            .readFileString(accountPath)
+            .pipe(Effect.flatMap(Schema.decodeEffect(Schema.fromJsonString(Account))));
+          const organizationId = account.oauthAccount.organizationUuid;
+          const scope: McpThreadInvocationScope = {
+            environmentId: yield* identity.getEnvironmentId,
+            capabilities: new Set(["preview"]),
+            issuedAt: DateTime.toEpochMillis(yield* DateTime.now),
+            requestNamespace: `claude-cloud:${input.providerSessionId}`,
+            thread: {
+              threadId: input.threadId,
+              providerSessionId: `cloud:${input.providerSessionId}`,
+              providerInstanceId: instanceId,
+            },
+            client: undefined,
+          };
+          const opened = yield* broker.invoke<{ tabId: PreviewTabId | null }>({
+            scope,
+            operation: "open",
+            input: { url: "https://claude.ai/new", open: false, reuseExistingTab: false },
+          });
+          if (!opened.tabId)
+            return yield* new ClaudeCloudGuardError({ reason: "account_mismatch" });
+          const tabId = opened.tabId;
+
+          const browser = (expression: string) =>
+            broker.invoke<unknown>({
+              scope,
+              tabId,
+              operation: "evaluate",
+              input: { expression, awaitPromise: true },
+              timeoutMs: 20_000,
+            });
+
+          const requestOnce = (endpoint: string, body?: unknown, afterSequence = 0n) =>
+            Effect.gen(function* () {
+              const key = yield* crypto.randomUUIDv4();
+              const encoded = body === undefined ? undefined : json(body);
+              const inlineBody = encoded !== undefined && Buffer.byteLength(encoded) <= 10000;
+              if (encoded !== undefined && !inlineBody) {
+                for (let offset = 0; offset < encoded.length; offset += 24000) {
+                  yield* browser(
+                    `(() => {const b=globalThis.__t3CloudBuffers??=Object.create(null);(b[${json(key)}]??=[]).push(${json(encoded.slice(offset, offset + 24000))});return null})()`,
+                  );
+                }
+              }
+              const result = yield* browser(`(async () => {
             if (location.origin !== 'https://claude.ai' || location.pathname.includes('login')) throw new Error('Claude sign-in required');
             const buffers=globalThis.__t3CloudBuffers??=Object.create(null);
             let r;
@@ -210,132 +227,144 @@ export const makeClaudeCloudQueryRunner = Effect.fn("makeClaudeCloudQueryRunner"
               return {response_shape:{id:session.id,config:{model:session.config?.model}}};
             return data;
           })()`);
-            if (
-              typeof result === "object" &&
-              result !== null &&
-              "cloudBuffer" in result &&
-              "length" in result &&
-              typeof result.length === "number"
-            ) {
-              const chunks: Buffer[] = [];
-              for (let offset = 0; offset < result.length; offset += 24000) {
-                const chunk = yield* browser(
-                  `btoa(String.fromCharCode(...globalThis.__t3CloudBuffers[${json(key)}].slice(${offset},${offset + 24000})))`,
-                );
-                if (typeof chunk !== "string")
-                  return yield* new ClaudeCloudGuardError({ reason: "remote_failed" });
-                chunks.push(Buffer.from(chunk, "base64"));
+              if (
+                typeof result === "object" &&
+                result !== null &&
+                "cloudBuffer" in result &&
+                "length" in result &&
+                typeof result.length === "number"
+              ) {
+                const chunks: Buffer[] = [];
+                for (let offset = 0; offset < result.length; offset += 24000) {
+                  const chunk = yield* browser(
+                    `btoa(String.fromCharCode(...globalThis.__t3CloudBuffers[${json(key)}].slice(${offset},${offset + 24000})))`,
+                  );
+                  if (typeof chunk !== "string")
+                    return yield* new ClaudeCloudGuardError({ reason: "remote_failed" });
+                  chunks.push(Buffer.from(chunk, "base64"));
+                }
+                yield* browser(`delete globalThis.__t3CloudBuffers[${json(key)}]`);
+                return yield* decodeUnknownJson(Buffer.concat(chunks).toString("utf8"));
               }
-              yield* browser(`delete globalThis.__t3CloudBuffers[${json(key)}]`);
-              return yield* decodeUnknownJson(Buffer.concat(chunks).toString("utf8"));
-            }
-            return result;
-          });
-        const request = (endpoint: string, body?: unknown, afterSequence = 0n) => {
-          const call = requestOnce(endpoint, body, afterSequence);
-          return body === undefined
-            ? call.pipe(Effect.retry({ times: 2, schedule: Schedule.exponential("250 millis") }))
-            : call;
-        };
-        const relay = yield* makeClaudeCloudMcpRelay(input.options.mcpServers);
-        if (input.options.cwd && !relay)
-          return yield* new ClaudeCloudGuardError({ reason: "tools_unavailable" });
-
-        const guard = Effect.gen(function* () {
-          const now = DateTime.toEpochMillis(yield* DateTime.now);
-          const usage = yield* request(
-            `/api/organizations/${encodeURIComponent(organizationId)}/usage`,
-          );
-          return yield* Effect.try(() => verifyClaudeCloudCredit(usage, now));
-        });
-        yield* guard;
-        const nativeId = input.options.resume ?? input.options.sessionId;
-        if (!nativeId || !/^[a-f0-9-]{36}$/i.test(nativeId)) {
-          return yield* new ClaudeCloudGuardError({ reason: "remote_failed" });
-        }
-        const bindingPath = path.join(bindingDir, `${nativeId}.json`);
-        const writeBinding = (value: typeof Binding.Type) =>
-          fs
-            .writeFileString(`${bindingPath}.tmp`, json(value))
-            .pipe(
-              Effect.andThen(fs.rename(`${bindingPath}.tmp`, bindingPath)),
-              Effect.uninterruptible,
-            );
-        const exists = yield* fs.exists(bindingPath);
-        let binding: typeof Binding.Type;
-        if (exists) {
-          binding = yield* fs
-            .readFileString(bindingPath)
-            .pipe(Effect.flatMap(Schema.decodeEffect(Schema.fromJsonString(Binding))));
-          if (
-            binding.organizationId !== organizationId ||
-            !binding.cloudId.startsWith("session_")
-          ) {
-            return yield* new ClaudeCloudGuardError({ reason: "account_mismatch" });
-          }
-        } else {
-          const environments = yield* request(
-            `/v1/environment_providers/private/organizations/${encodeURIComponent(organizationId)}/environments`,
-          ).pipe(Effect.flatMap(Schema.decodeUnknownEffect(EnvironmentList)));
-          const available = environments.environments.filter(
-            (e) => e.kind === "anthropic_cloud" && e.state === "active",
-          );
-          const chosen =
-            available.find((e) => e.name === "Default") ??
-            (available.length === 1 ? available[0] : undefined);
-          if (!chosen) return yield* new ClaudeCloudGuardError({ reason: "remote_failed" });
-          // An uncertain creation is never retried automatically: the first POST may have landed.
-          yield* writeBinding({ organizationId, cloudId: "creation-uncertain", sequence: "0" });
-          const created = yield* request("/v1/code/sessions", {
-            title: "T3 cloud prototype",
-            environment_id: chosen.environment_id,
-            config: {
-              sources: [],
-              outcomes: [],
-              append_system_prompt: CLAUDE_CLOUD_WORKSPACE_INSTRUCTIONS,
-              model: CLAUDE_CLOUD_MODEL,
-              effort_level: "low",
-              permission_mode: "bypassPermissions",
-            },
-            events: [],
-          }).pipe(Effect.flatMap(Schema.decodeUnknownEffect(SessionInfo)));
-          binding = {
-            organizationId,
-            cloudId: created.response_shape.id.replace(/^cse_/, "session_"),
-            sequence: "0",
+              return result;
+            });
+          const request = (endpoint: string, body?: unknown, afterSequence = 0n) => {
+            const call = requestOnce(endpoint, body, afterSequence);
+            return body === undefined
+              ? call.pipe(Effect.retry({ times: 2, schedule: Schedule.exponential("250 millis") }))
+              : call;
           };
-          yield* writeBinding(binding);
-        }
+          const relay = yield* makeClaudeCloudMcpRelay(input.options.mcpServers);
+          if (input.options.cwd && !relay)
+            return yield* new ClaudeCloudGuardError({ reason: "tools_unavailable" });
 
-        const sessionPath = `/v1/code/sessions/${encodeURIComponent(binding.cloudId)}`;
-        const checkModel = request(sessionPath).pipe(
-          Effect.flatMap(Schema.decodeUnknownEffect(SessionInfo)),
-          Effect.flatMap((info) =>
-            Effect.try(() => verifyClaudeCloudModel(info.response_shape.config.model)),
-          ),
-        );
-        yield* checkModel;
-        const queue = yield* Queue.unbounded<
-          SDKMessage,
-          ClaudeAgentSdkQueryRunnerError | Cause.Done
-        >();
-        let active = false;
-        let connecting = relay !== undefined;
-        let lastBillingCheck = 0;
-        let sequence = BigInt(binding.sequence);
-        const pendingControls = new Map<
-          string,
-          Deferred.Deferred<unknown, ClaudeCloudGuardError>
-        >();
-        const toolJobs = new Map<string, Fiber.Fiber<void, never>>();
-        const completedControls = new Set<string>();
-        const pollWake = yield* Queue.unbounded<void>();
-        const mcpReady = yield* Deferred.make<void, ClaudeCloudGuardError>();
-        const control = (subtype: string, fields: Record<string, unknown> = {}, wait = false) =>
-          Effect.gen(function* () {
+          const guard = Effect.gen(function* () {
+            const now = DateTime.toEpochMillis(yield* DateTime.now);
+            const usage = yield* request(
+              `/api/organizations/${encodeURIComponent(organizationId)}/usage`,
+            );
+            return yield* Effect.try(() => verifyClaudeCloudCredit(usage, now));
+          });
+          yield* guard;
+          const nativeId = input.options.resume ?? input.options.sessionId;
+          if (!nativeId || !/^[a-f0-9-]{36}$/i.test(nativeId)) {
+            return yield* new ClaudeCloudGuardError({ reason: "remote_failed" });
+          }
+          const bindingPath = path.join(bindingDir, `${nativeId}.json`);
+          const writeBinding = (value: typeof Binding.Type) =>
+            fs
+              .writeFileString(`${bindingPath}.tmp`, json(value))
+              .pipe(
+                Effect.andThen(fs.rename(`${bindingPath}.tmp`, bindingPath)),
+                Effect.uninterruptible,
+              );
+          const exists = yield* fs.exists(bindingPath);
+          let binding: typeof Binding.Type;
+          if (exists) {
+            binding = yield* fs
+              .readFileString(bindingPath)
+              .pipe(Effect.flatMap(Schema.decodeEffect(Schema.fromJsonString(Binding))));
+            if (
+              binding.organizationId !== organizationId ||
+              !binding.cloudId.startsWith("session_")
+            ) {
+              return yield* new ClaudeCloudGuardError({ reason: "account_mismatch" });
+            }
+          } else {
+            if (input.options.resume)
+              return yield* new ClaudeCloudGuardError({ reason: "session_missing" });
+            const environments = yield* request(
+              `/v1/environment_providers/private/organizations/${encodeURIComponent(organizationId)}/environments`,
+            ).pipe(Effect.flatMap(Schema.decodeUnknownEffect(EnvironmentList)));
+            const available = environments.environments.filter(
+              (e) => e.kind === "anthropic_cloud" && e.state === "active",
+            );
+            const chosen =
+              available.find((e) => e.name === "Default") ??
+              (available.length === 1 ? available[0] : undefined);
+            if (!chosen) return yield* new ClaudeCloudGuardError({ reason: "remote_failed" });
+            // An uncertain creation is never retried automatically: the first POST may have landed.
+            yield* writeBinding({ organizationId, cloudId: "creation-uncertain", sequence: "0" });
+            const created = yield* request("/v1/code/sessions", {
+              title: "T3 cloud prototype",
+              environment_id: chosen.environment_id,
+              config: {
+                sources: [],
+                outcomes: [],
+                append_system_prompt: CLAUDE_CLOUD_WORKSPACE_INSTRUCTIONS,
+                model: CLAUDE_CLOUD_MODEL,
+                effort_level: "low",
+                permission_mode: "bypassPermissions",
+              },
+              events: [],
+            }).pipe(Effect.flatMap(Schema.decodeUnknownEffect(SessionInfo)));
+            binding = {
+              organizationId,
+              cloudId: created.response_shape.id.replace(/^cse_/, "session_"),
+              sequence: "0",
+              inbox: [],
+              toolRequests: {},
+            };
+            yield* writeBinding(binding);
+          }
+
+          const bindingLock = yield* Semaphore.make(1);
+          const updateBinding = (update: (current: typeof Binding.Type) => typeof Binding.Type) =>
+            bindingLock.withPermits(1)(
+              Effect.gen(function* () {
+                const next = update(binding);
+                yield* writeBinding(next);
+                binding = next;
+              }).pipe(Effect.uninterruptible),
+            );
+          const acknowledge = (checkpoint: string | undefined) => {
+            if (checkpoint === undefined) return Effect.void;
+            return Effect.gen(function* () {
+              const cursor = BigInt(checkpoint);
+              if (cursor > BigInt(binding.sequence))
+                return yield* new ClaudeCloudGuardError({ reason: "remote_failed" });
+              yield* updateBinding((current) => ({
+                ...current,
+                inbox: (current.inbox ?? []).filter((event) => BigInt(event.sequence_num) > cursor),
+              }));
+            });
+          };
+          yield* acknowledge(input.durableCloudSequence);
+
+          const sessionPath = `/v1/code/sessions/${encodeURIComponent(binding.cloudId)}`;
+          const checkModel = request(sessionPath).pipe(
+            Effect.flatMap(Schema.decodeUnknownEffect(SessionInfo)),
+            Effect.flatMap((info) =>
+              Effect.try(() => verifyClaudeCloudModel(info.response_shape.config.model)),
+            ),
+          );
+          yield* checkModel;
+          if (
+            (binding.inbox ?? []).some((event) =>
+              ["assistant", "user", "result", "stream_event"].includes(String(event.payload.type)),
+            )
+          ) {
             const requestId = yield* crypto.randomUUIDv4();
-            const reply = yield* Deferred.make<unknown, ClaudeCloudGuardError>();
-            if (wait) pendingControls.set(requestId, reply);
             yield* request(`${sessionPath}/events`, {
               events: [
                 {
@@ -343,297 +372,408 @@ export const makeClaudeCloudQueryRunner = Effect.fn("makeClaudeCloudQueryRunner"
                     type: "control_request",
                     request_id: requestId,
                     uuid: requestId,
-                    request: { subtype, ...fields },
+                    request: { subtype: "interrupt" },
                   },
                 },
               ],
-            });
-            yield* Queue.offer(pollWake, undefined);
-            if (!wait) return;
-            return yield* Deferred.await(reply).pipe(
-              Effect.timeout("90 seconds"),
-              Effect.ensuring(Effect.sync(() => pendingControls.delete(requestId))),
-            );
-          });
-        const replyToTool = (payload: Record<string, unknown>) =>
-          Effect.gen(function* () {
-            const requestId = payload.request_id;
-            const decoded = yield* decodeUnknownRecord(payload.request);
-            if (
-              typeof requestId !== "string" ||
-              decoded.subtype !== "mcp_message" ||
-              decoded.server_name !== "t3-code" ||
-              !relay ||
-              completedControls.has(requestId) ||
-              toolJobs.has(requestId)
-            )
-              return;
-            const job = yield* relay(decoded.message).pipe(
-              Effect.match({
-                onSuccess: (mcp_response) => ({
-                  subtype: "success",
-                  request_id: requestId,
-                  response: { mcp_response },
-                }),
-                onFailure: () => ({
-                  subtype: "error",
-                  request_id: requestId,
-                  error:
-                    "T3 tool connection failed. The request was not retried; inspect the local workspace before retrying.",
-                }),
-              }),
-              Effect.flatMap((response) =>
-                request(`${sessionPath}/events`, {
-                  events: [{ payload: { type: "control_response", uuid: requestId, response } }],
-                }).pipe(
-                  Effect.retry({ times: 2, schedule: Schedule.exponential("250 millis") }),
-                  Effect.as(response),
-                ),
-              ),
-              Effect.tap(() => Effect.sync(() => completedControls.add(requestId))),
-              Effect.tap(() => Queue.offer(pollWake, undefined)),
-              Effect.tap((response) =>
-                typeof decoded.message === "object" &&
-                decoded.message !== null &&
-                "method" in decoded.message &&
-                decoded.message.method === "tools/list"
-                  ? response.subtype === "success"
-                    ? Deferred.succeed(mcpReady, undefined)
-                    : Deferred.fail(
-                        mcpReady,
-                        new ClaudeCloudGuardError({ reason: "tools_unavailable" }),
-                      )
-                  : Effect.void,
-              ),
-              Effect.asVoid,
-              Effect.catch(() => Effect.void),
-              Effect.ensuring(Effect.sync(() => toolJobs.delete(requestId))),
-              Effect.forkIn(ownerScope),
-            );
-            toolJobs.set(requestId, job);
-          });
-        const poll = Effect.gen(function* () {
-          const now = DateTime.toEpochMillis(yield* DateTime.now);
-          if (active && now - lastBillingCheck >= 10_000) {
-            yield* guard.pipe(Effect.tapError(() => control("interrupt").pipe(Effect.ignore)));
-            lastBillingCheck = now;
+            }).pipe(Effect.ignore);
+            yield* broker
+              .invoke({
+                scope,
+                tabId,
+                operation: "navigate",
+                input: { url: `https://claude.ai/code/${binding.cloudId}` },
+              })
+              .pipe(Effect.ignore);
+            return yield* new ClaudeCloudGuardError({ reason: "delivery_pending" });
           }
-          const raw = yield* request(`${sessionPath}/events`, undefined, sequence);
-          const events = yield* Effect.try(() => orderedClaudeCloudEvents(raw, sequence));
-          const nextSequence = events.at(-1)?.sequence;
-          if (nextSequence !== undefined)
-            yield* writeBinding({ ...binding, sequence: nextSequence.toString() });
-          for (const event of events) {
-            const payload = event.payload;
-            sequence = event.sequence;
-            if (payload.type === "control_request") {
-              yield* replyToTool(payload);
-              continue;
-            }
-            if (
-              payload.type === "control_cancel_request" &&
-              typeof payload.request_id === "string"
-            ) {
-              const job = toolJobs.get(payload.request_id);
-              if (job) yield* Fiber.interrupt(job);
-              continue;
-            }
-            if (payload.type === "control_response") {
-              const response = payload.response;
-              if (
-                typeof response === "object" &&
-                response !== null &&
-                "request_id" in response &&
-                typeof response.request_id === "string"
-              ) {
-                const deferred = pendingControls.get(response.request_id);
-                if (deferred) {
-                  if ("subtype" in response && response.subtype === "success")
-                    yield* Deferred.succeed(
-                      deferred,
-                      "response" in response ? response.response : {},
-                    );
-                  else
-                    yield* Deferred.fail(
-                      deferred,
-                      new ClaudeCloudGuardError({ reason: "tools_unavailable" }),
-                    );
-                }
-              }
-              continue;
-            }
-            if (typeof payload.type !== "string" || !relayedTypes.has(payload.type)) continue;
-            if (payload.type === "result") active = false;
-            // The adapter owns a local UUID; the persisted binding owns the remote session ID.
-            yield* Queue.offer(queue, { ...payload, session_id: nativeId } as SDKMessage);
-          }
-        });
-        const fiber = yield* Effect.gen(function* () {
-          yield* poll;
-          yield* Queue.take(pollWake).pipe(
-            Effect.timeoutOption(
-              active || connecting || pendingControls.size > 0 ? "200 millis" : "2 seconds",
-            ),
-          );
-        }).pipe(
-          Effect.forever,
-          Effect.catch((cause) =>
+          const queue = yield* Queue.unbounded<
+            SDKMessage,
+            ClaudeAgentSdkQueryRunnerError | Cause.Done
+          >();
+          let active = false;
+          let connecting = relay !== undefined;
+          let lastBillingCheck = 0;
+          let sequence = BigInt(binding.sequence);
+          const sdkSequences = new WeakMap<SDKMessage, string>();
+          let replay = binding.inbox ?? [];
+          const pendingControls = new Map<
+            string,
+            Deferred.Deferred<unknown, ClaudeCloudGuardError>
+          >();
+          const toolJobs = new Map<string, Fiber.Fiber<void, never>>();
+          const completedControls = new Set<string>();
+          const pollWake = yield* Queue.unbounded<void>();
+          const mcpReady = yield* Deferred.make<void, ClaudeCloudGuardError>();
+          const control = (subtype: string, fields: Record<string, unknown> = {}, wait = false) =>
             Effect.gen(function* () {
-              if (active) yield* control("interrupt").pipe(Effect.ignore);
-              yield* Deferred.fail(
-                mcpReady,
-                new ClaudeCloudGuardError({ reason: "remote_failed" }),
-              );
-              for (const deferred of pendingControls.values())
-                yield* Deferred.fail(
-                  deferred,
-                  new ClaudeCloudGuardError({ reason: "remote_failed" }),
-                );
-              yield* Queue.fail(queue, wrap("events")(cause));
-            }),
-          ),
-          Effect.forkIn(ownerScope),
-        );
-        const close = Effect.gen(function* () {
-          yield* Fiber.interrupt(fiber);
-          yield* Effect.forEach(toolJobs.values(), Fiber.interrupt, { discard: true });
-          if (active) yield* control("interrupt").pipe(Effect.ignore);
-          yield* Queue.end(queue);
-        });
-        if (relay) {
-          const status = yield* control("mcp_status", {}, true);
-          const servers: Record<string, unknown> = {};
-          if (
-            typeof status === "object" &&
-            status !== null &&
-            "mcpServers" in status &&
-            Array.isArray(status.mcpServers)
-          ) {
-            for (const entry of status.mcpServers) {
-              if (
-                typeof entry?.name === "string" &&
-                entry.config &&
-                (entry.scope === "dynamic" || entry.source === "sdk")
-              )
-                servers[entry.name] = entry.config;
-            }
-          }
-          servers["t3-code"] = { type: "sdk", name: "t3-code", timeout: 90000 };
-          const registered = yield* control("mcp_set_servers", { servers }, true);
-          if (
-            typeof registered === "object" &&
-            registered !== null &&
-            "errors" in registered &&
-            typeof registered.errors === "object" &&
-            registered.errors !== null &&
-            "t3-code" in registered.errors
-          )
-            return yield* new ClaudeCloudGuardError({ reason: "tools_unavailable" });
-          const liveStatus = yield* control("mcp_status", {}, true);
-          const connected =
-            typeof liveStatus === "object" &&
-            liveStatus !== null &&
-            "mcpServers" in liveStatus &&
-            Array.isArray(liveStatus.mcpServers) &&
-            liveStatus.mcpServers.some((s) => s.name === "t3-code" && s.status === "connected");
-          if (!connected) yield* Deferred.await(mcpReady).pipe(Effect.timeout("90 seconds"));
-        }
-        connecting = false;
-        const runtime: ClaudeAgentSdkQuerySession = {
-          messages: Stream.fromQueue(queue),
-          offer: (message) =>
-            Effect.gen(function* () {
-              yield* Effect.all([guard, checkModel], { concurrency: "unbounded" });
-              if (relay) {
-                yield* control(
-                  "apply_flag_settings",
+              const requestId = yield* crypto.randomUUIDv4();
+              const reply = yield* Deferred.make<unknown, ClaudeCloudGuardError>();
+              if (wait) pendingControls.set(requestId, reply);
+              yield* request(`${sessionPath}/events`, {
+                events: [
                   {
-                    settings: {
-                      permissions: {
-                        allow: ["mcp__t3-code__*"],
-                        deny: [
-                          "Read",
-                          "Write",
-                          "Edit",
-                          "MultiEdit",
-                          "Glob",
-                          "Grep",
-                          "Bash",
-                          "Agent",
-                          "Task",
-                        ],
-                      },
+                    payload: {
+                      type: "control_request",
+                      request_id: requestId,
+                      uuid: requestId,
+                      request: { subtype, ...fields },
                     },
                   },
-                  true,
-                );
-                yield* control("set_permission_mode", { mode: "dontAsk" }, true);
-              } else yield* control("set_permission_mode", { mode: "bypassPermissions" });
-              let forwarded = message;
-              if (relay) {
-                const workspace = yield* relay({
-                  jsonrpc: "2.0",
-                  id: yield* crypto.randomUUIDv4(),
-                  method: "tools/call",
-                  params: { name: "t3_workspace_info", arguments: {} },
-                });
-                if (
-                  typeof workspace !== "object" ||
-                  workspace === null ||
-                  !("result" in workspace) ||
-                  typeof workspace.result !== "object" ||
-                  workspace.result === null ||
-                  ("isError" in workspace.result && workspace.result.isError === true)
-                )
-                  return yield* new ClaudeCloudGuardError({ reason: "tools_unavailable" });
-                const toolResult = workspace.result;
-                const info = yield* Effect.gen(function* () {
-                  if ("structuredContent" in toolResult)
-                    return yield* decodeWorkspaceInfo(toolResult.structuredContent);
-                  const contents =
-                    "content" in toolResult && Array.isArray(toolResult.content)
-                      ? toolResult.content
-                      : [];
-                  const text = contents.find((c) => c?.type === "text")?.text;
-                  return yield* decodeWorkspaceInfo(yield* decodeUnknownJson(text));
-                }).pipe(
-                  Effect.mapError(() => new ClaudeCloudGuardError({ reason: "tools_unavailable" })),
-                );
-                const context = `<t3_workspace_context>\n${CLAUDE_CLOUD_WORKSPACE_INSTRUCTIONS}\nCurrent T3 workspace: ${json(info)}\nFor repository and PR questions, use mcp__t3-code__t3_workspace_pull_requests and t3_workspace_pull_request_read. For git, gh, files and tests, use mcp__t3-code__t3_workspace_exec. These tools already have the local repository and source-control login. Do not try cloud Bash or conclude the project is missing because /home/user is empty. Read the workspace's AGENTS.md or CLAUDE.md before changing source files.\n</t3_workspace_context>`;
-                const content = message.message.content;
-                forwarded = {
-                  ...message,
-                  message: {
-                    ...message.message,
-                    content: [
-                      { type: "text", text: context },
-                      ...(typeof content === "string"
-                        ? [{ type: "text" as const, text: content }]
-                        : content),
-                    ],
-                  },
-                };
-              }
-              lastBillingCheck = DateTime.toEpochMillis(yield* DateTime.now);
-              active = true;
-              yield* request(`${sessionPath}/events`, {
-                events: [{ payload: { ...forwarded, session_id: binding.cloudId } }],
-              }).pipe(Effect.tapError(() => control("interrupt").pipe(Effect.ignore)));
+                ],
+              });
               yield* Queue.offer(pollWake, undefined);
-            }).pipe(Effect.mapError(wrap("offer"))),
-          setModel: (model) =>
-            Effect.try(() => verifyClaudeCloudModel(model)).pipe(Effect.mapError(wrap("setModel"))),
-          applyFlagSettings: (settings) =>
-            settings.fastMode ? unsupported("fastMode") : Effect.void,
-          setPermissionMode: (mode) =>
-            mode === "bypassPermissions" ? Effect.void : unsupported("setPermissionMode"),
-          stopTask: () =>
-            control("interrupt").pipe(Effect.asVoid, Effect.mapError(wrap("stopTask"))),
-          backgroundTasks: () => Effect.succeed(false),
-          interrupt: control("interrupt").pipe(Effect.asVoid, Effect.mapError(wrap("interrupt"))),
-          close,
-        };
-        return runtime;
+              if (!wait) return;
+              return yield* Deferred.await(reply).pipe(
+                Effect.timeout("90 seconds"),
+                Effect.ensuring(Effect.sync(() => pendingControls.delete(requestId))),
+              );
+            });
+          const replyToTool = (payload: Record<string, unknown>) =>
+            Effect.gen(function* () {
+              const requestId = payload.request_id;
+              const decoded = yield* decodeUnknownRecord(payload.request);
+              if (
+                typeof requestId !== "string" ||
+                decoded.subtype !== "mcp_message" ||
+                decoded.server_name !== "t3-code" ||
+                !relay ||
+                completedControls.has(requestId) ||
+                toolJobs.has(requestId)
+              )
+                return;
+              const job = yield* Effect.gen(function* () {
+                const saved = binding.toolRequests?.[requestId];
+                if (saved?.state === "completed" && saved.response) return saved.response;
+                if (saved)
+                  return {
+                    subtype: "error",
+                    request_id: requestId,
+                    error:
+                      "A previous attempt may have executed this tool. It was not repeated. Inspect the local workspace before retrying.",
+                  };
+                yield* updateBinding((current) => ({
+                  ...current,
+                  toolRequests: {
+                    ...current.toolRequests,
+                    [requestId]: { state: "started" },
+                  },
+                }));
+                const response = yield* relay(decoded.message).pipe(
+                  Effect.match({
+                    onSuccess: (mcp_response) => ({
+                      subtype: "success",
+                      request_id: requestId,
+                      response: { mcp_response },
+                    }),
+                    onFailure: () => ({
+                      subtype: "error",
+                      request_id: requestId,
+                      error:
+                        "T3 tool connection failed. The request was not retried; inspect the local workspace before retrying.",
+                    }),
+                  }),
+                );
+                yield* updateBinding((current) => ({
+                  ...current,
+                  toolRequests: {
+                    ...current.toolRequests,
+                    [requestId]: { state: "completed", response },
+                  },
+                }));
+                return response;
+              }).pipe(
+                Effect.flatMap((response) =>
+                  request(`${sessionPath}/events`, {
+                    events: [{ payload: { type: "control_response", uuid: requestId, response } }],
+                  }).pipe(
+                    Effect.retry({ times: 2, schedule: Schedule.exponential("250 millis") }),
+                    Effect.as(response),
+                  ),
+                ),
+                Effect.tap(() => Effect.sync(() => completedControls.add(requestId))),
+                Effect.tap(() => Queue.offer(pollWake, undefined)),
+                Effect.tap((response) =>
+                  typeof decoded.message === "object" &&
+                  decoded.message !== null &&
+                  "method" in decoded.message &&
+                  decoded.message.method === "tools/list"
+                    ? response.subtype === "success"
+                      ? Deferred.succeed(mcpReady, undefined)
+                      : Deferred.fail(
+                          mcpReady,
+                          new ClaudeCloudGuardError({ reason: "tools_unavailable" }),
+                        )
+                    : Effect.void,
+                ),
+                Effect.asVoid,
+                Effect.catch((cause) =>
+                  Effect.gen(function* () {
+                    yield* Deferred.fail(
+                      mcpReady,
+                      new ClaudeCloudGuardError({ reason: "tools_unavailable" }),
+                    );
+                    yield* Queue.fail(queue, wrap("tool-response")(cause));
+                  }),
+                ),
+                Effect.ensuring(Effect.sync(() => toolJobs.delete(requestId))),
+                Effect.forkIn(queryScope),
+              );
+              toolJobs.set(requestId, job);
+            });
+          const poll = Effect.gen(function* () {
+            const now = DateTime.toEpochMillis(yield* DateTime.now);
+            if (active && now - lastBillingCheck >= 10_000) {
+              yield* guard.pipe(Effect.tapError(() => control("interrupt").pipe(Effect.ignore)));
+              lastBillingCheck = now;
+            }
+            const raw = yield* request(`${sessionPath}/events`, undefined, sequence);
+            const fetched = yield* Effect.try(() => orderedClaudeCloudEvents(raw, sequence));
+            const nextSequence = fetched.at(-1)?.sequence;
+            if (nextSequence !== undefined)
+              yield* updateBinding((current) => ({
+                ...current,
+                sequence: nextSequence.toString(),
+                inbox: [
+                  ...(current.inbox ?? []),
+                  ...fetched.map(({ event_id, sequence_num, payload }) => ({
+                    event_id,
+                    sequence_num,
+                    payload,
+                  })),
+                ],
+              }));
+            const events = [...replay, ...fetched];
+            replay = [];
+            if (nextSequence !== undefined) sequence = nextSequence;
+            for (const event of events) {
+              const payload = event.payload;
+              if (payload.type === "control_request") {
+                yield* replyToTool(payload);
+                continue;
+              }
+              if (
+                payload.type === "control_cancel_request" &&
+                typeof payload.request_id === "string"
+              ) {
+                const job = toolJobs.get(payload.request_id);
+                if (job) yield* Fiber.interrupt(job);
+                continue;
+              }
+              if (payload.type === "control_response") {
+                const response = payload.response;
+                if (
+                  typeof response === "object" &&
+                  response !== null &&
+                  "request_id" in response &&
+                  typeof response.request_id === "string"
+                ) {
+                  const deferred = pendingControls.get(response.request_id);
+                  if (deferred) {
+                    if ("subtype" in response && response.subtype === "success")
+                      yield* Deferred.succeed(
+                        deferred,
+                        "response" in response ? response.response : {},
+                      );
+                    else
+                      yield* Deferred.fail(
+                        deferred,
+                        new ClaudeCloudGuardError({ reason: "tools_unavailable" }),
+                      );
+                  }
+                }
+                continue;
+              }
+              if (typeof payload.type !== "string" || !relayedTypes.has(payload.type)) continue;
+              if (payload.type === "result") active = false;
+              // The adapter owns a local UUID; the persisted binding owns the remote session ID.
+              const message = { ...payload, session_id: nativeId } as SDKMessage;
+              sdkSequences.set(message, event.sequence_num);
+              yield* Queue.offer(queue, message);
+            }
+          });
+          const fiber = yield* Effect.gen(function* () {
+            yield* poll;
+            yield* Queue.take(pollWake).pipe(
+              Effect.timeoutOption(
+                active || connecting || pendingControls.size > 0 ? "200 millis" : "2 seconds",
+              ),
+            );
+          }).pipe(
+            Effect.forever,
+            Effect.catch((cause) =>
+              Effect.gen(function* () {
+                if (active) yield* control("interrupt").pipe(Effect.ignore);
+                yield* Deferred.fail(
+                  mcpReady,
+                  new ClaudeCloudGuardError({ reason: "remote_failed" }),
+                );
+                for (const deferred of pendingControls.values())
+                  yield* Deferred.fail(
+                    deferred,
+                    new ClaudeCloudGuardError({ reason: "remote_failed" }),
+                  );
+                yield* Queue.fail(queue, wrap("events")(cause));
+              }),
+            ),
+            Effect.forkIn(queryScope),
+          );
+          yield* Scope.addFinalizer(
+            queryScope,
+            Effect.gen(function* () {
+              yield* Fiber.interrupt(fiber);
+              yield* Effect.forEach(toolJobs.values(), Fiber.interrupt, { discard: true });
+              if (active) yield* control("interrupt").pipe(Effect.ignore);
+              yield* Queue.end(queue);
+            }),
+          );
+          const close = Scope.close(queryScope, Exit.void);
+          if (relay) {
+            const status = yield* control("mcp_status", {}, true);
+            const servers: Record<string, unknown> = {};
+            if (
+              typeof status === "object" &&
+              status !== null &&
+              "mcpServers" in status &&
+              Array.isArray(status.mcpServers)
+            ) {
+              for (const entry of status.mcpServers) {
+                if (
+                  typeof entry?.name === "string" &&
+                  entry.config &&
+                  (entry.scope === "dynamic" || entry.source === "sdk")
+                )
+                  servers[entry.name] = entry.config;
+              }
+            }
+            servers["t3-code"] = { type: "sdk", name: "t3-code", timeout: 90000 };
+            const registered = yield* control("mcp_set_servers", { servers }, true);
+            if (
+              typeof registered === "object" &&
+              registered !== null &&
+              "errors" in registered &&
+              typeof registered.errors === "object" &&
+              registered.errors !== null &&
+              "t3-code" in registered.errors
+            )
+              return yield* new ClaudeCloudGuardError({ reason: "tools_unavailable" });
+            const liveStatus = yield* control("mcp_status", {}, true);
+            const connected =
+              typeof liveStatus === "object" &&
+              liveStatus !== null &&
+              "mcpServers" in liveStatus &&
+              Array.isArray(liveStatus.mcpServers) &&
+              liveStatus.mcpServers.some((s) => s.name === "t3-code" && s.status === "connected");
+            if (!connected) yield* Deferred.await(mcpReady).pipe(Effect.timeout("90 seconds"));
+          }
+          connecting = false;
+          const runtime: ClaudeAgentSdkQuerySession = {
+            messages: Stream.fromQueue(queue),
+            cloudEventSequence: (message) => sdkSequences.get(message),
+            offer: (message, durableCloudSequence) =>
+              Effect.gen(function* () {
+                yield* acknowledge(durableCloudSequence);
+                yield* Effect.all([guard, checkModel], { concurrency: "unbounded" });
+                if (relay) {
+                  yield* control(
+                    "apply_flag_settings",
+                    {
+                      settings: {
+                        permissions: {
+                          allow: ["mcp__t3-code__*"],
+                          deny: [
+                            "Read",
+                            "Write",
+                            "Edit",
+                            "MultiEdit",
+                            "Glob",
+                            "Grep",
+                            "Bash",
+                            "Agent",
+                            "Task",
+                          ],
+                        },
+                      },
+                    },
+                    true,
+                  );
+                  yield* control("set_permission_mode", { mode: "dontAsk" }, true);
+                } else yield* control("set_permission_mode", { mode: "bypassPermissions" });
+                let forwarded = message;
+                if (relay) {
+                  const workspace = yield* relay({
+                    jsonrpc: "2.0",
+                    id: yield* crypto.randomUUIDv4(),
+                    method: "tools/call",
+                    params: { name: "t3_workspace_info", arguments: {} },
+                  });
+                  if (
+                    typeof workspace !== "object" ||
+                    workspace === null ||
+                    !("result" in workspace) ||
+                    typeof workspace.result !== "object" ||
+                    workspace.result === null ||
+                    ("isError" in workspace.result && workspace.result.isError === true)
+                  )
+                    return yield* new ClaudeCloudGuardError({ reason: "tools_unavailable" });
+                  const toolResult = workspace.result;
+                  const info = yield* Effect.gen(function* () {
+                    if ("structuredContent" in toolResult)
+                      return yield* decodeWorkspaceInfo(toolResult.structuredContent);
+                    const contents =
+                      "content" in toolResult && Array.isArray(toolResult.content)
+                        ? toolResult.content
+                        : [];
+                    const text = contents.find((c) => c?.type === "text")?.text;
+                    return yield* decodeWorkspaceInfo(yield* decodeUnknownJson(text));
+                  }).pipe(
+                    Effect.mapError(
+                      () => new ClaudeCloudGuardError({ reason: "tools_unavailable" }),
+                    ),
+                  );
+                  if (
+                    input.options.cwd &&
+                    path.resolve(info.cwd) !== path.resolve(input.options.cwd)
+                  )
+                    return yield* new ClaudeCloudGuardError({ reason: "tools_unavailable" });
+                  const context = `<t3_workspace_context>\n${CLAUDE_CLOUD_WORKSPACE_INSTRUCTIONS}\nCurrent T3 workspace: ${json(info)}\nFor repository and PR questions, use mcp__t3-code__t3_workspace_pull_requests and t3_workspace_pull_request_read. For git, gh, files and tests, use mcp__t3-code__t3_workspace_exec. These tools already have the local repository and source-control login. Do not try cloud Bash or conclude the project is missing because /home/user is empty. Read the workspace's AGENTS.md or CLAUDE.md before changing source files.\n</t3_workspace_context>`;
+                  const content = message.message.content;
+                  forwarded = {
+                    ...message,
+                    message: {
+                      ...message.message,
+                      content: [
+                        { type: "text", text: context },
+                        ...(typeof content === "string"
+                          ? [{ type: "text" as const, text: content }]
+                          : content),
+                      ],
+                    },
+                  };
+                }
+                lastBillingCheck = DateTime.toEpochMillis(yield* DateTime.now);
+                active = true;
+                yield* request(`${sessionPath}/events`, {
+                  events: [{ payload: { ...forwarded, session_id: binding.cloudId } }],
+                }).pipe(Effect.tapError(() => control("interrupt").pipe(Effect.ignore)));
+                yield* Queue.offer(pollWake, undefined);
+              }).pipe(Effect.mapError(wrap("offer"))),
+            setModel: (model) =>
+              Effect.try(() => verifyClaudeCloudModel(model)).pipe(
+                Effect.mapError(wrap("setModel")),
+              ),
+            applyFlagSettings: (settings) =>
+              settings.fastMode ? unsupported("fastMode") : Effect.void,
+            setPermissionMode: (mode) =>
+              mode === "bypassPermissions" ? Effect.void : unsupported("setPermissionMode"),
+            stopTask: () =>
+              control("interrupt").pipe(Effect.asVoid, Effect.mapError(wrap("stopTask"))),
+            backgroundTasks: () => Effect.succeed(false),
+            interrupt: control("interrupt").pipe(Effect.asVoid, Effect.mapError(wrap("interrupt"))),
+            close,
+          };
+          return runtime;
+        }).pipe(Effect.onError(() => Scope.close(queryScope, Exit.void)));
       }).pipe(Effect.mapError(wrap("open"))),
   } satisfies ClaudeAgentSdkQueryRunnerShape;
 });

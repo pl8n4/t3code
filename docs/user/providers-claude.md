@@ -122,8 +122,16 @@ This experimental mode depends on Claude's internal browser interface and may
 break when that interface changes. Leave its transport browser tabs alone and
 avoid opening the same cloud session in Claude's own interface while T3 is using
 it; competing clients can disconnect the tool bridge. Interrupted tool calls
-are not automatically replayed: inspect the workspace before retrying. Promotional
-credit can expire or become unavailable, at which point the bridge stops instead
+are not automatically replayed: inspect the workspace before retrying.
+
+Replies and tool outcomes are saved in a local recovery journal before T3 advances
+its cloud cursor. Completed turns record a delivery checkpoint with the thread's
+saved history. If an interruption leaves output whose delivery T3 cannot confirm,
+resume is blocked and the cloud conversation opens in the Browser panel for
+recovery. Copy the needed context into a new thread; starting another turn does
+not discard that saved output or repeat an uncertain local command.
+
+Promotional credit can expire or become unavailable, at which point the bridge stops instead
 of falling back to a paid API. If session creation cannot be confirmed, inspect
 Claude Code before retrying; T3 avoids blindly repeating the creation request.
 

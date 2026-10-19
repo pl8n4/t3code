@@ -33,6 +33,8 @@ const modelLaunchingTools = new Set([
   "t3_thread_configure",
   "t3_thread_update",
   "t3_environment_preferences_update",
+  "write_pull_request_guides",
+  "t3_worktree_handoff",
 ]);
 
 // The local credential never crosses the cloud/browser boundary. The remote CLI sees an SDK

@@ -409,11 +409,16 @@ export interface ClaudeAgentSdkQueryOpenInput {
   readonly options: ClaudeAgentSdkQueryOptions;
   readonly threadId: ThreadId;
   readonly providerSessionId: OrchestrationV2ProviderSession["id"];
+  readonly durableCloudSequence?: string;
 }
 
 export interface ClaudeAgentSdkQuerySession {
   readonly messages: Stream.Stream<SDKMessage, ClaudeAgentSdkQueryRunnerError>;
-  readonly offer: (message: SDKUserMessage) => Effect.Effect<void, ClaudeAgentSdkQueryRunnerError>;
+  readonly offer: (
+    message: SDKUserMessage,
+    durableCloudSequence?: string,
+  ) => Effect.Effect<void, ClaudeAgentSdkQueryRunnerError>;
+  readonly cloudEventSequence?: (message: SDKMessage) => string | undefined;
   readonly setModel: (model: string) => Effect.Effect<void, ClaudeAgentSdkQueryRunnerError>;
   readonly applyFlagSettings: (
     settings: ClaudeFlagSettings,
@@ -6180,8 +6185,20 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                     ...(goal.checks === undefined ? {} : { checks: goal.checks }),
                   });
                 }
+                const cloudEventSequence =
+                  input.result === undefined
+                    ? undefined
+                    : (yield* Ref.get(queryContext))?.query.cloudEventSequence?.(input.result);
                 const providerThread: OrchestrationV2ProviderThread = {
                   ...input.context.input.providerThread,
+                  ...(cloudEventSequence === undefined
+                    ? {}
+                    : {
+                        nativeMetadata: {
+                          ...input.context.input.providerThread.nativeMetadata,
+                          cloudEventSequence,
+                        },
+                      }),
                   providerSessionId: session.id,
                   ...(clearConversationHead ? { nativeConversationHeadRef: null } : {}),
                   ...(nativeThreadId !== null && goalsByNativeThread.has(nativeThreadId)
@@ -8442,6 +8459,12 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
               threadId: turnInput.threadId,
               providerSessionId: input.providerSessionId,
               options: queryOptions,
+              ...(turnInput.providerThread.nativeMetadata?.cloudEventSequence === undefined
+                ? {}
+                : {
+                    durableCloudSequence:
+                      turnInput.providerThread.nativeMetadata.cloudEventSequence,
+                  }),
             })
             .pipe(
               Effect.onError(() =>
@@ -8652,7 +8675,10 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
             if (userMessage !== null) {
               yield* attachTurn;
               yield* startUserTurnForWakeReports(nativeThreadId);
-              yield* querySession.query.offer(userMessage);
+              yield* querySession.query.offer(
+                userMessage,
+                turnInput.providerThread.nativeMetadata?.cloudEventSequence,
+              );
               return;
             }
             // Transcript reads suspend replay. Hold live SDK frames until the whole

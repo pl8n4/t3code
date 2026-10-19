@@ -2345,6 +2345,7 @@ describe("ClaudeAdapterV2 background wake turns", () => {
     readonly nativeSessionId?: string;
     readonly settings?: ClaudeSettings;
     readonly freshQueueOnReopen?: boolean;
+    readonly cloudEventSequence?: (message: SDKMessage) => string | undefined;
   }) =>
     Effect.gen(function* () {
       const fileSystem = yield* FileSystem.FileSystem;
@@ -2366,6 +2367,8 @@ describe("ClaudeAdapterV2 background wake turns", () => {
         yield* Deferred.await(processed);
       });
       const offeredMessages: Array<SDKUserMessage> = [];
+      const openedCloudCheckpoints: Array<string | undefined> = [];
+      const offeredCloudCheckpoints: Array<string | undefined> = [];
       const permissionModeChanges: Array<string> = [];
       const liveSelectionChanges: Array<unknown> = [];
       const continuationRequests: Array<ProviderContinuationRequests.ProviderContinuationRequest> =
@@ -2408,6 +2411,7 @@ describe("ClaudeAdapterV2 background wake turns", () => {
           open: (input) =>
             Effect.gen(function* () {
               openedOptions = input.options;
+              openedCloudCheckpoints.push(input.durableCloudSequence);
               if (options?.freshQueueOnReopen === true && processQueues.length > 0) {
                 const processMessages = yield* Queue.unbounded<SDKMessage>();
                 processQueues.push(processMessages);
@@ -2428,6 +2432,9 @@ describe("ClaudeAdapterV2 background wake turns", () => {
               }
               processQueues.push(sdkMessages);
               return {
+                ...(options?.cloudEventSequence === undefined
+                  ? {}
+                  : { cloudEventSequence: options.cloudEventSequence }),
                 messages: Stream.fromQueue(sdkMessages).pipe(
                   Stream.flatMap((message) =>
                     Stream.make(message).pipe(
@@ -2444,9 +2451,10 @@ describe("ClaudeAdapterV2 background wake turns", () => {
                     ),
                   ),
                 ),
-                offer: (message) =>
+                offer: (message, durableCloudSequence) =>
                   Effect.sync(() => {
                     offeredMessages.push(message);
+                    offeredCloudCheckpoints.push(durableCloudSequence);
                   }),
                 setModel: (model) =>
                   Effect.sync(() => {
@@ -2520,6 +2528,8 @@ describe("ClaudeAdapterV2 background wake turns", () => {
         processQueues,
         offerAndWait,
         offeredMessages,
+        openedCloudCheckpoints,
+        offeredCloudCheckpoints,
         promptUuid: (index: number) => {
           const uuid = offeredMessages[index]?.uuid;
           if (uuid === undefined) throw new Error(`No prompt offered at index ${index}.`);
@@ -2539,6 +2549,72 @@ describe("ClaudeAdapterV2 background wake turns", () => {
       };
     });
   const makeWakeHarness = makeWakeHarnessWithOptions();
+
+  it.effect(
+    "emits the cloud delivery checkpoint after reply artifacts and restores it from persisted thread state",
+    () =>
+      Effect.gen(function* () {
+        const f = yield* makeWakeHarnessWithOptions({
+          cloudEventSequence: (message) => (message.type === "result" ? "42" : undefined),
+        });
+        const initialThread = { ...f.providerThread, nativeMetadata: { cloudEventSequence: "7" } };
+        yield* f.runtime.startTurn(
+          makeClaudeTestTurnInput({
+            threadId: f.threadId,
+            providerThread: initialThread,
+            now: yield* DateTime.now,
+            attemptId: RunAttemptId.make("cloud-checkpoint-1"),
+            text: "First task",
+            attachments: [],
+          }),
+        );
+        yield* f.offerAndWait(makeAssistantTextFrame({ uuid: "cloud-reply", text: "Saved reply" }));
+        assert.isFalse(
+          f.events.some(
+            (event) =>
+              event.type === "provider_thread.updated" &&
+              event.providerThread.nativeMetadata?.cloudEventSequence === "42",
+          ),
+        );
+        yield* Queue.offer(
+          f.sdkMessages,
+          makeResultFrame({ uuid: "cloud-result", result: "Saved reply" }),
+        );
+        yield* Queue.take(f.terminalReceipts);
+        const checkpointIndex = f.events.findIndex(
+          (event) =>
+            event.type === "provider_thread.updated" &&
+            event.providerThread.nativeMetadata?.cloudEventSequence === "42",
+        );
+        const replyIndex = f.events.findIndex(
+          (event) =>
+            event.type === "turn_item.updated" && event.turnItem.type === "assistant_message",
+        );
+        assert.isAtLeast(replyIndex, 0);
+        assert.isAbove(checkpointIndex, replyIndex);
+        const stored = f.events[checkpointIndex];
+        if (stored?.type !== "provider_thread.updated")
+          throw new Error("Missing durable checkpoint event");
+        yield* f.runtime.startTurn(
+          makeClaudeTestTurnInput({
+            threadId: f.threadId,
+            providerThread: stored.providerThread,
+            providerTurnOrdinal: 2,
+            now: yield* DateTime.now,
+            attemptId: RunAttemptId.make("cloud-checkpoint-2"),
+            text: "Next task",
+            attachments: [],
+          }),
+        );
+        assert.deepEqual(f.openedCloudCheckpoints, ["7"]);
+        assert.deepEqual(f.offeredCloudCheckpoints, ["7", "42"]);
+      }).pipe(
+        Effect.scoped,
+        Effect.provide(
+          Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+        ),
+      ),
+  );
 
   it.effect.each([
     { isError: false, title: "Check weather" },
