@@ -15,8 +15,10 @@ import {
   resolveClaudeUpdateRequiredModels,
   scopeClaudeModelCatalog,
   scopeClaudeCloudModels,
+  scopeClaudeCloudProviderAuth,
   BUNDLED_CLAUDE_MODEL_CATALOG,
 } from "./ClaudeModelCatalog.ts";
+import type { ServerProviderDraft } from "@t3tools/provider-core/server/snapshotProbe";
 
 const manifest = (): ModelManifestData => ({
   version: 1,
@@ -72,6 +74,36 @@ const catalogFromManifest = (data: ModelManifestData) =>
   resolveClaudeModelCatalog(resolveProviderCatalog(data, CLAUDE) ?? undefined);
 
 describe("Claude model catalog", () => {
+  it("offers cloud models for per-turn browser verification after local CLI logout", () => {
+    const local: ServerProviderDraft = {
+      enabled: true,
+      installed: true,
+      version: "3.0.0",
+      status: "error",
+      auth: { status: "unauthenticated" },
+      checkedAt: "2026-10-19T20:00:00.000Z",
+      message: "Claude Code is not authenticated.",
+      models: BUNDLED_CLAUDE_MODEL_CATALOG.models.map((entry) => entry.model),
+      slashCommands: [],
+      skills: [],
+    };
+    const cloud = scopeClaudeCloudProviderAuth(local);
+    assert.equal(cloud.status, "ready");
+    assert.equal(cloud.auth.status, "unknown");
+    assert.isTrue(
+      scopeClaudeCloudModels(cloud.models).some((model) => model.slug === "claude-haiku-5-5"),
+    );
+    assert.equal(local.status, "error");
+    assert.equal(local.auth.status, "unauthenticated");
+    for (const unavailable of [
+      { ...local, installed: false },
+      { ...local, enabled: false },
+      { ...local, auth: { status: "unknown" as const }, message: "CLI failed to run." },
+    ]) {
+      assert.strictEqual(scopeClaudeCloudProviderAuth(unavailable), unavailable);
+    }
+  });
+
   it("offers supported cloud models and effort controls without unsupported fast or native workflow modes", () => {
     const original = BUNDLED_CLAUDE_MODEL_CATALOG.models.map((entry) => entry.model);
     const scoped = scopeClaudeCloudModels(original);

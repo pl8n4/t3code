@@ -39,7 +39,11 @@ import {
 } from "../ClaudeProvider.ts";
 import { makeManagedServerProvider } from "@t3tools/provider-core/server/managedProvider";
 import * as ModelCatalog from "@t3tools/provider-core/server/ModelCatalog";
-import { resolveClaudeModelCatalog, scopeClaudeCloudModels } from "../ClaudeModelCatalog.ts";
+import {
+  resolveClaudeModelCatalog,
+  scopeClaudeCloudModels,
+  scopeClaudeCloudProviderAuth,
+} from "../ClaudeModelCatalog.ts";
 import {
   defaultProviderContinuationIdentity,
   type ProviderDriver,
@@ -169,7 +173,9 @@ export const ClaudeDriver: ProviderDriver<ClaudeSettings, ClaudeDriverEnv, Path.
         continuationGroupKey,
       });
       const stampIdentity = (value: ServerProviderDraft): ServerProvider => {
-        const stamped = stampBaseIdentity(value);
+        const stamped = stampBaseIdentity(
+          config.cloudFreeCreditsOnly ? scopeClaudeCloudProviderAuth(value) : value,
+        );
         return config.cloudFreeCreditsOnly
           ? {
               ...stamped,

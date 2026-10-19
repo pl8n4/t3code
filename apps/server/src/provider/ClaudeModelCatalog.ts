@@ -24,6 +24,7 @@ import {
 import * as ModelCatalog from "@t3tools/provider-core/server/ModelCatalog";
 import { BUNDLED_MODEL_MANIFEST, resolveProviderCatalog } from "./ModelManifest.ts";
 import { CLAUDE_CLOUD_MODELS } from "./ClaudeCloudPolicy.ts";
+import type { ServerProviderDraft } from "@t3tools/provider-core/server/snapshotProbe";
 
 const CLAUDE = ProviderDriverKind.make("claudeAgent");
 const EMPTY_CAPABILITIES: ModelCapabilities = { optionDescriptors: [] };
@@ -77,6 +78,25 @@ export function resolveClaudeModelCatalog(
 export const BUNDLED_CLAUDE_MODEL_CATALOG = resolveClaudeModelCatalog(
   BUNDLED_CLAUDE_PROVIDER_CATALOG,
 );
+
+export function scopeClaudeCloudProviderAuth(provider: ServerProviderDraft): ServerProviderDraft {
+  if (
+    !provider.enabled ||
+    !provider.installed ||
+    provider.status !== "error" ||
+    provider.auth.status !== "unauthenticated"
+  ) {
+    return provider;
+  }
+  // Cloud turns authenticate in the browser, independently of the local CLI login.
+  // The query runner still verifies the account and promotional billing before sending a prompt.
+  return {
+    ...provider,
+    status: "ready",
+    auth: { status: "unknown" },
+    message: "Cloud browser sign-in and free-credit eligibility are checked before each turn.",
+  };
+}
 
 export function scopeClaudeCloudModels(models: ReadonlyArray<ServerProviderModel>) {
   return models
