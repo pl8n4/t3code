@@ -372,7 +372,12 @@ export const makeClaudeCloudQueryRunner = Effect.fn("makeClaudeCloudQueryRunner"
             ),
           );
           yield* checkModel;
+          let usable = true;
+          let recoveryPending = false;
           const requireRecovery = Effect.gen(function* () {
+            // Admission must stop before recovery waits on the remote interrupt or browser.
+            recoveryPending = true;
+            usable = false;
             const requestId = yield* crypto.randomUUIDv4();
             yield* request(`${sessionPath}/events`, {
               events: [
@@ -409,8 +414,6 @@ export const makeClaudeCloudQueryRunner = Effect.fn("makeClaudeCloudQueryRunner"
           >();
           let active = false;
           let closed = false;
-          let usable = true;
-          let recoveryPending = false;
           let connecting = relay !== undefined;
           let lastBillingCheck = 0;
           let sequence = BigInt(binding.sequence);
@@ -475,7 +478,6 @@ export const makeClaudeCloudQueryRunner = Effect.fn("makeClaudeCloudQueryRunner"
                 !saved &&
                 !["initialize", "notifications/initialized", "tools/list"].includes(String(method))
               ) {
-                recoveryPending = true;
                 return yield* requireRecovery;
               }
               const job = yield* Effect.gen(function* () {
@@ -588,7 +590,6 @@ export const makeClaudeCloudQueryRunner = Effect.fn("makeClaudeCloudQueryRunner"
                 !active &&
                 ["assistant", "user", "result", "stream_event"].includes(String(payload.type))
               ) {
-                recoveryPending = true;
                 return yield* requireRecovery;
               }
               if (payload.type === "control_request") {
@@ -718,7 +719,7 @@ export const makeClaudeCloudQueryRunner = Effect.fn("makeClaudeCloudQueryRunner"
             if (!connected) yield* Deferred.await(mcpReady).pipe(Effect.timeout("90 seconds"));
           }
           connecting = false;
-          if (!usable)
+          if (!usable || recoveryPending)
             return yield* new ClaudeCloudGuardError({
               reason: recoveryPending ? "delivery_pending" : "remote_failed",
             });
@@ -727,7 +728,7 @@ export const makeClaudeCloudQueryRunner = Effect.fn("makeClaudeCloudQueryRunner"
             cloudEventSequence: (message) => sdkSequences.get(message),
             offer: (message, durableCloudSequence) =>
               Effect.gen(function* () {
-                if (closed || !usable)
+                if (closed || !usable || recoveryPending)
                   return yield* new ClaudeCloudGuardError({
                     reason: recoveryPending ? "delivery_pending" : "remote_failed",
                   });
@@ -815,7 +816,7 @@ export const makeClaudeCloudQueryRunner = Effect.fn("makeClaudeCloudQueryRunner"
                 lastBillingCheck = DateTime.toEpochMillis(yield* DateTime.now);
                 // Persist admission before the POST: a disconnect can precede the first event poll.
                 yield* updateBinding((current) => ({ ...current, pendingTurn: {} }));
-                if (closed || !usable)
+                if (closed || !usable || recoveryPending)
                   return yield* new ClaudeCloudGuardError({
                     reason: recoveryPending ? "delivery_pending" : "remote_failed",
                   });

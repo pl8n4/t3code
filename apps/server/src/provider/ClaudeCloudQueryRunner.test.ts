@@ -11,6 +11,7 @@ import {
   PreviewAutomationNoAvailableHostError,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
@@ -50,6 +51,12 @@ function fixture(input?: {
   setupFails?: boolean;
   initializationEvents?: unknown[];
 }) {
+  const workspaceEntered = Promise.withResolvers<void>();
+  const workspaceRelease = Promise.withResolvers<void>();
+  const recoveryEntered = Promise.withResolvers<void>();
+  const recoveryRelease = Promise.withResolvers<void>();
+  let holdWorkspace = false;
+  let holdRecovery = false;
   let usage: unknown = input?.paid ? { ...funded(), extra_usage: { is_enabled: true } } : funded();
   const calls: Array<{ path: string; method: string; body?: unknown }> = [];
   let sent = false;
@@ -157,7 +164,12 @@ function fixture(input?: {
     invoke: <A>(request: PreviewAutomationBroker.PreviewAutomationInvokeInput) => {
       if (request.operation === "open")
         return Effect.succeed({ tabId: PreviewTabId.make("cloud-test-tab") } as A);
-      if (request.operation === "navigate") return Effect.succeed({} as A);
+      if (request.operation === "navigate") {
+        recoveryEntered.resolve();
+        return holdRecovery
+          ? Effect.promise(() => recoveryRelease.promise).pipe(Effect.as({} as A))
+          : Effect.succeed({} as A);
+      }
       const expression = (request.input as { expression: string }).expression;
       evaluations.push(expression);
       return Effect.tryPromise({
@@ -183,13 +195,21 @@ function fixture(input?: {
     },
   });
   const localClient = HttpClient.make((request) =>
-    Effect.sync(() => {
+    Effect.gen(function* () {
       if (request.body._tag !== "Uint8Array") throw new Error("Expected JSON");
       const rpc = decodeJson(new TextDecoder().decode(request.body.body)) as Record<
         string,
         unknown
       >;
       rpcCalls.push(rpc);
+      if (
+        holdWorkspace &&
+        rpc.method === "tools/call" &&
+        (rpc.params as { name?: string })?.name === "t3_workspace_info"
+      ) {
+        workspaceEntered.resolve();
+        yield* Effect.promise(() => workspaceRelease.promise);
+      }
       return HttpClientResponse.fromWeb(
         request,
         rpc.method === "notifications/initialized"
@@ -282,6 +302,16 @@ function fixture(input?: {
         })
         .pipe(Effect.provideService(HttpClient.HttpClient, localClient));
     return {
+      holdWorkspace: () => {
+        holdWorkspace = true;
+      },
+      waitWorkspace: Effect.promise(() => workspaceEntered.promise),
+      releaseWorkspace: () => workspaceRelease.resolve(),
+      holdRecovery: () => {
+        holdRecovery = true;
+      },
+      waitRecovery: Effect.promise(() => recoveryEntered.promise),
+      releaseRecovery: () => recoveryRelease.resolve(),
       runner,
       open,
       calls,
@@ -347,6 +377,94 @@ const run = <A, E>(
 ) => effect.pipe(Effect.scoped, Effect.provide(NodeServices.layer));
 
 describe("Claude cloud guarded transport", () => {
+  it.effect.each(["tool", "reply"] as const)(
+    "blocks a new prompt while late %s recovery is awaiting browser navigation",
+    (kind) =>
+      run(
+        Effect.gen(function* () {
+          const f = yield* fixture({ workspace: true });
+          const session = yield* f.open();
+          yield* session.offer({
+            type: "user",
+            session_id: "",
+            parent_tool_use_id: null,
+            message: { role: "user", content: "Completed task" },
+          });
+          f.pushEvent({ type: "result", subtype: "success", result: "Done" });
+          yield* TestClock.adjust("200 millis");
+          const result = yield* session.messages.pipe(
+            Stream.filter((m) => m.type === "result"),
+            Stream.runHead,
+          );
+          if (result._tag !== "Some") throw new Error("Missing result");
+          const checkpoint = session.cloudEventSequence?.(result.value);
+          if (checkpoint === undefined) throw new Error("Missing checkpoint");
+          f.holdWorkspace();
+          f.holdRecovery();
+          const offer = yield* session
+            .offer(
+              {
+                type: "user",
+                session_id: "",
+                parent_tool_use_id: null,
+                message: { role: "user", content: "Must not send during recovery" },
+              },
+              checkpoint,
+            )
+            .pipe(Effect.result, Effect.forkChild);
+          yield* f.waitWorkspace;
+          f.pushEvent(
+            kind === "tool"
+              ? {
+                  type: "control_request",
+                  request_id: "recovery-write",
+                  request: {
+                    subtype: "mcp_message",
+                    server_name: "t3-code",
+                    message: {
+                      jsonrpc: "2.0",
+                      id: 204,
+                      method: "tools/call",
+                      params: { name: "t3_workspace_write", arguments: {} },
+                    },
+                  },
+                }
+              : {
+                  type: "assistant",
+                  message: { content: [{ type: "text", text: "Late output" }] },
+                },
+          );
+          yield* TestClock.adjust("2 seconds");
+          yield* f.waitRecovery;
+          f.releaseWorkspace();
+          const offered = yield* Fiber.join(offer);
+          const subsequent = yield* session
+            .offer({
+              type: "user",
+              session_id: "",
+              parent_tool_use_id: null,
+              message: { role: "user", content: "Must also refuse" },
+            })
+            .pipe(Effect.result);
+          f.releaseRecovery();
+          yield* session.close;
+          expect(offered._tag).toBe("Failure");
+          expect(JSON.stringify(offered)).toContain("delivery_pending");
+          expect(subsequent._tag).toBe("Failure");
+          expect(JSON.stringify(subsequent)).toContain("delivery_pending");
+          expect(
+            f.calls
+              .flatMap(
+                (c) => (c.body as { events?: Array<{ payload: { type: string } }> })?.events ?? [],
+              )
+              .filter((e) => e.payload.type === "user"),
+          ).toHaveLength(1);
+          expect(
+            f.rpcCalls.filter((rpc) => JSON.stringify(rpc).includes("t3_workspace_write")),
+          ).toHaveLength(0);
+        }),
+      ),
+  );
   it.effect("stops initialization when a late tool request arrives during MCP setup", () =>
     run(
       Effect.gen(function* () {
