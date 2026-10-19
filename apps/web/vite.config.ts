@@ -17,6 +17,11 @@ import {
 
 import { loadRepoEnv } from "../../scripts/lib/public-config";
 import { thirdPartyLicensesPlugin } from "../../scripts/lib/third-party-licenses";
+import {
+  browserApiCorsAllowedHeaders,
+  browserApiCorsAllowedMethods,
+  DESKTOP_RENDERER_ORIGINS,
+} from "../server/src/httpCors";
 import { tailwindPlugins } from "./vite/tailwind";
 
 const repoEnv = loadRepoEnv();
@@ -164,6 +169,10 @@ const configuredAllowedHosts = (process.env.T3CODE_DEV_ALLOWED_HOSTS ?? "")
   .map((entry) => entry.trim())
   .filter((entry) => entry.length > 0);
 const allowedHosts = [".ts.net", ...configuredAllowedHosts];
+const configuredAllowedOrigins = (process.env.T3CODE_DEV_ALLOWED_ORIGINS ?? "")
+  .split(",")
+  .map((entry) => entry.trim())
+  .filter((entry) => entry.length > 0);
 
 export default defineConfig(() => {
   return {
@@ -229,6 +238,19 @@ export default defineConfig(() => {
       port,
       strictPort: true,
       allowedHosts,
+      // Vite answers OPTIONS before proxying, so its preflight must accept
+      // the same desktop origins and request headers as the backend.
+      cors: {
+        origin: [
+          /^https?:\/\/(?:(?:[^:]+\.)?localhost|127\.0\.0\.1|\[::1\])(?::\d+)?$/,
+          ...DESKTOP_RENDERER_ORIGINS,
+          ...configuredAllowedOrigins,
+        ],
+        credentials: true,
+        methods: [...browserApiCorsAllowedMethods],
+        allowedHeaders: [...browserApiCorsAllowedHeaders],
+        maxAge: 600,
+      },
       // Transform the whole module graph at server start instead of on the
       // first request. Without this, a cold worktree discovers and transforms
       // modules one import-level at a time while the browser waits — which
