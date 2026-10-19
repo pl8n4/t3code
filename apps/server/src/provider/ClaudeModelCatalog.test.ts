@@ -14,6 +14,8 @@ import {
   resolveClaudeModelSlug,
   resolveClaudeUpdateRequiredModels,
   scopeClaudeModelCatalog,
+  scopeClaudeCloudModels,
+  BUNDLED_CLAUDE_MODEL_CATALOG,
 } from "./ClaudeModelCatalog.ts";
 
 const manifest = (): ModelManifestData => ({
@@ -70,6 +72,34 @@ const catalogFromManifest = (data: ModelManifestData) =>
   resolveClaudeModelCatalog(resolveProviderCatalog(data, CLAUDE) ?? undefined);
 
 describe("Claude model catalog", () => {
+  it("offers supported cloud models and effort controls without unsupported fast or native workflow modes", () => {
+    const original = BUNDLED_CLAUDE_MODEL_CATALOG.models.map((entry) => entry.model);
+    const scoped = scopeClaudeCloudModels(original);
+    assert.deepEqual(scoped.map((model) => model.slug).toSorted(), [
+      "claude-fable-5-1",
+      "claude-haiku-5-5",
+      "claude-opus-5-5",
+    ]);
+    for (const model of scoped) {
+      assert.isFalse(
+        model.capabilities.optionDescriptors.some((descriptor) => descriptor.id === "fastMode"),
+      );
+      const effort = model.capabilities.optionDescriptors.find(
+        (descriptor) => descriptor.id === "effort",
+      );
+      assert.isDefined(effort);
+      if (effort?.type === "select") {
+        assert.isTrue(effort.options.some((option) => option.id === "high"));
+        assert.isTrue(effort.options.some((option) => option.id === "max"));
+        assert.isFalse(effort.options.some((option) => option.id === "ultracode"));
+      }
+    }
+    assert.isTrue(
+      original
+        .find((model) => model.slug === "claude-opus-5-5")
+        ?.capabilities?.optionDescriptors?.some((descriptor) => descriptor.id === "fastMode"),
+    );
+  });
   it("resolves capacity from selected options and fixed catalog windows without guessing custom models", () => {
     const source = manifest();
     const profile = source.providers!.claudeAgent!.profiles.synthetic!;

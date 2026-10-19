@@ -1,3 +1,4 @@
+import * as ClaudeCloudExecutionPolicyTestkit from "../provider/ClaudeCloudExecutionPolicy.testkit.ts";
 // @effect-diagnostics-next-line nodeBuiltinImport:off -- Effect's Crypto has no createHmac.
 import * as NodeCrypto from "node:crypto";
 
@@ -99,7 +100,13 @@ const withService = <A, E>(
     return yield* Effect.gen(function* () {
       const service = yield* ScheduledTaskService.ScheduledTaskService;
       return yield* body({ service, launches, secretsByRef });
-    }).pipe(Effect.provide(ScheduledTaskService.layer.pipe(Layer.provide(layerDependencies))));
+    }).pipe(
+      Effect.provide(
+        ScheduledTaskService.layer
+          .pipe(Layer.provide(ClaudeCloudExecutionPolicyTestkit.layer))
+          .pipe(Layer.provide(layerDependencies)),
+      ),
+    );
   }).pipe(Effect.provide(SqlitePersistence.layerMemory));
 
 it.effect("dispatches exactly the rendered prompt and logs the delivery", () =>

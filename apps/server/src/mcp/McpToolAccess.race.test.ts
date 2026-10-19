@@ -1,3 +1,4 @@
+import * as ClaudeCloudExecutionPolicyTestkit from "../provider/ClaudeCloudExecutionPolicy.testkit.ts";
 import { assert, it } from "@effect/vitest";
 import {
   CommandId,
@@ -141,6 +142,7 @@ const renameRacingTheUser = (threadId: ThreadId, userRaises: boolean) =>
       Effect.provideService(McpSchema.McpServerClient, mcpClient),
       Effect.provide(
         McpHttpServer.toolkitRegistration(RenameToolkit, handlers).pipe(
+          Layer.provide(ClaudeCloudExecutionPolicyTestkit.layer),
           Layer.provideMerge(McpServer.McpServer.layer),
         ),
       ),
@@ -181,10 +183,12 @@ it.layer(layerOrchestrator)("writesThreads against a mode raise", (it) => {
       assert.equal(shell?.title, "Before");
     }).pipe(
       Effect.provide(
-        ThreadManagement.layer.pipe(
-          Layer.provide(ServerSettings.layerTest()),
-          Layer.provide(CommandReceiptStore.layer.pipe(Layer.provide(layerDatabase))),
-        ),
+        ThreadManagement.layer
+          .pipe(Layer.provide(ClaudeCloudExecutionPolicyTestkit.layer))
+          .pipe(
+            Layer.provide(ServerSettings.layerTest()),
+            Layer.provide(CommandReceiptStore.layer.pipe(Layer.provide(layerDatabase))),
+          ),
       ),
     ),
   );
@@ -199,10 +203,12 @@ it.layer(layerOrchestrator)("writesThreads against a mode raise", (it) => {
       assert.equal((yield* projections.getThreadShell(threadId))?.title, "Renamed by the agent");
     }).pipe(
       Effect.provide(
-        ThreadManagement.layer.pipe(
-          Layer.provide(ServerSettings.layerTest()),
-          Layer.provide(CommandReceiptStore.layer.pipe(Layer.provide(layerDatabase))),
-        ),
+        ThreadManagement.layer
+          .pipe(Layer.provide(ClaudeCloudExecutionPolicyTestkit.layer))
+          .pipe(
+            Layer.provide(ServerSettings.layerTest()),
+            Layer.provide(CommandReceiptStore.layer.pipe(Layer.provide(layerDatabase))),
+          ),
       ),
     ),
   );

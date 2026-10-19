@@ -1070,6 +1070,36 @@ describe("CodexAdapterV2 dynamic tool projection", () => {
 });
 
 describe("CodexAdapterV2 native protocol logging", () => {
+  it.effect("redacts whole merged configuration responses before bounding protocol logs", () =>
+    Effect.gen(function* () {
+      const writes: unknown[] = [];
+      const logger = CodexAdapterV2.makeCodexAppServerProtocolLogger({
+        nativeEventLogger: {
+          filePath: "/tmp/unused",
+          write: (event) =>
+            Effect.sync(() => {
+              writes.push(event);
+            }),
+          close: () => Effect.void,
+        },
+        threadId: ThreadId.make("guarded-config"),
+        providerSessionId: ProviderSessionId.make("guarded-config"),
+      })!;
+      const result = {
+        config: { mcp_servers: { private: { env: { SESSION: "secret-arbitrary-name" } } } },
+        layers: [{ config: { env: { SOMETHING: "layer-secret" } } }],
+        origins: { private: "origin-secret" },
+      };
+      for (const payload of [{ id: 1, result }, JSON.stringify({ id: 2, result })])
+        yield* logger({ direction: "incoming", stage: "decoded", payload });
+      const serialized = encodeUnknownJson(writes);
+      assert.lengthOf(writes, 2);
+      assert.notInclude(serialized, "secret-arbitrary-name");
+      assert.notInclude(serialized, "layer-secret");
+      assert.notInclude(serialized, "origin-secret");
+      assert.include(serialized, "[REDACTED]");
+    }),
+  );
   it.effect("logs decoded app-server frames once with credentials redacted", () =>
     Effect.gen(function* () {
       const writes: Array<{
@@ -1763,6 +1793,7 @@ describe("CodexAdapterV2 session initialize", () => {
         beforeEmitInbound === undefined ? {} : { beforeEmitInbound },
       );
       let initializeRequests = 0;
+      const requests: Array<{ method: string; params: unknown }> = [];
       const adapter = yield* CodexAdapterV2.makeCodexAdapterV2({
         instanceId: CodexAdapterV2.CODEX_DEFAULT_INSTANCE_ID,
         settings: DEFAULT_CODEX_SETTINGS,
@@ -1779,6 +1810,7 @@ describe("CodexAdapterV2 session initialize", () => {
                     ...client,
                     request: (method, params) =>
                       Effect.sync(() => {
+                        requests.push({ method, params });
                         if (method === "initialize") initializeRequests++;
                       }).pipe(Effect.andThen(client.request(method, params))),
                   }) satisfies CodexClient.CodexAppServerClient["Service"],
@@ -1805,6 +1837,8 @@ describe("CodexAdapterV2 session initialize", () => {
         runtimePolicy: CODEX_TEST_RUNTIME_POLICY,
       });
       return {
+        runtime,
+        requests,
         ensureThread: (threadId: string) =>
           runtime.ensureThread({
             threadId: ThreadId.make(threadId),
@@ -1817,6 +1851,357 @@ describe("CodexAdapterV2 session initialize", () => {
 
   const replayPreamble = (nativeThreadId: string) =>
     codexReplayPreamble({ nativeThreadId, nativeTurnId: "unused", prompt: "unused" });
+
+  const mergedSubscriptionConfig = {
+    config: {
+      model_provider: null,
+      model_providers: {},
+      forced_login_method: null,
+      profile: null,
+      profiles: {},
+      openai_base_url: null,
+      chatgpt_base_url: "https://chatgpt.com/backend-api/",
+    },
+    layers: [],
+    origins: {},
+  };
+  const subscriptionFailureText = (value: unknown): string =>
+    !Predicate.isObject(value)
+      ? String(value)
+      : `${value instanceof Error ? value.message : ""} ${subscriptionFailureText(value.cause)} ${subscriptionFailureText(value.payload)}`;
+  const subscriptionTranscript = (name: string) => {
+    const preamble = replayPreamble(name);
+    const entries = preamble.slice(0, 3);
+    let id = 2;
+    const rpc = (method: string, params: unknown, result: unknown) => {
+      entries.push(
+        { type: "expect_outbound", frame: { id, method, params } },
+        { type: "emit_inbound", frame: { id, result } },
+      );
+      id++;
+    };
+    const verify = (accountType = "chatgpt", config = mergedSubscriptionConfig) => {
+      rpc("config/read", { cwd: "/workspace", includeLayers: true }, config);
+      rpc(
+        "account/read",
+        { refreshToken: false },
+        accountType === "chatgpt"
+          ? {
+              account: { type: "chatgpt", email: null, planType: "plus" },
+              requiresOpenaiAuth: true,
+            }
+          : { account: { type: accountType }, requiresOpenaiAuth: true },
+      );
+    };
+    const reply = preamble[4]!;
+    if (reply.type !== "emit_inbound") throw new Error("Missing native start fixture");
+    assert.isTrue(Predicate.isObject(reply.frame));
+    const nativeResult = (reply.frame as Record<string, unknown>).result;
+    const start = (guarded = true, result = nativeResult) =>
+      rpc(
+        "thread/start",
+        {
+          cwd: "/workspace",
+          model: "gpt-5.4",
+          ...(guarded ? { modelProvider: "openai" } : {}),
+          config: {
+            ...CodexAdapterV2.CODEX_THREAD_CONFIG,
+            ...(guarded ? { forced_login_method: "chatgpt" } : {}),
+          },
+        },
+        result,
+      );
+    return {
+      entries,
+      rpc,
+      verify,
+      start,
+      nativeResult,
+      transcript: () => makeCodexReplayTranscript({ scenario: name, entries }),
+    };
+  };
+  const subscriptionTestLayers = Layer.mergeAll(
+    IdAllocator.layer,
+    McpProviderSessions.layer,
+    NodeServices.layer,
+  );
+
+  it.effect(
+    "rechecks the actual account before guarded start, compact and steer without restricting sibling threads",
+    () =>
+      Effect.gen(function* () {
+        const replay = subscriptionTranscript("subscription-runtime-recheck");
+        replay.verify(); // registration
+        replay.verify(); // native creation
+        replay.start();
+        replay.verify("apiKey"); // start refused
+        replay.verify("apiKey"); // compact refused
+        replay.verify("apiKey"); // steer refused
+        replay.start(false); // ordinary sibling bypasses subscription restrictions
+        const session = yield* openReplaySession(replay.transcript());
+        const threadId = ThreadId.make("thread-subscription-runtime-recheck");
+        yield* session.runtime.guardSubscriptionThread!({ threadId, cwd: "/workspace" });
+        const providerThread = yield* session.ensureThread(threadId);
+        const turn = makeCodexTestTurnInput({
+          threadId,
+          providerThread,
+          now: yield* DateTime.now,
+          attemptId: RunAttemptId.make("guarded-runtime"),
+          text: "Inspect this repository",
+        });
+        for (const action of [
+          session.runtime.startTurn(turn),
+          session.runtime.compactThread!(turn),
+          session.runtime.steerTurn({ ...turn, providerTurnId: ProviderTurnId.make("unused") }),
+        ]) {
+          const result = yield* action.pipe(Effect.result);
+          assert.equal(result._tag, "Failure");
+          if (result._tag === "Failure")
+            assert.include(subscriptionFailureText(result.failure), "signed in with ChatGPT");
+        }
+        const goal = yield* session.runtime
+          .startTurn({ ...turn, message: { ...turn.message, text: "/goal Keep working" } })
+          .pipe(Effect.result);
+        assert.equal(goal._tag, "Failure");
+        if (goal._tag === "Failure")
+          assert.include(
+            subscriptionFailureText(goal.failure),
+            "Native Codex /goal is unavailable",
+          );
+        yield* session.ensureThread("ordinary-sibling");
+        assert.lengthOf(
+          session.requests.filter(({ method }) => method === "account/read"),
+          5,
+        );
+        assert.isFalse(
+          session.requests.some(({ method }) =>
+            ["turn/start", "turn/steer", "thread/compact/start", "thread/goal/set"].includes(
+              method,
+            ),
+          ),
+        );
+      }).pipe(Effect.scoped, Effect.provide(subscriptionTestLayers)),
+  );
+
+  it.effect("confirms the native provider pin before allowing subscription-backed inference", () =>
+    Effect.gen(function* () {
+      const replay = subscriptionTranscript("subscription-native-confirmed");
+      replay.verify();
+      replay.verify();
+      replay.start();
+      replay.verify();
+      replay.rpc(
+        "turn/start",
+        {
+          threadId: "subscription-native-confirmed",
+          input: [{ type: "text", text: "Inspect this repository" }],
+          cwd: "/workspace",
+          model: "gpt-5.4",
+          approvalPolicy: "never",
+          approvalsReviewer: "user",
+          sandboxPolicy: { type: "dangerFullAccess" },
+          summary: "detailed",
+        },
+        { turn: makeCodexReplayTurn({ id: "guarded-turn", status: "inProgress" }) },
+      );
+      const session = yield* openReplaySession(replay.transcript());
+      const threadId = ThreadId.make("guarded-confirmed");
+      yield* session.runtime.guardSubscriptionThread!({ threadId, cwd: "/workspace" });
+      const providerThread = yield* session.ensureThread(threadId);
+      yield* session.runtime.startTurn(
+        makeCodexTestTurnInput({
+          threadId,
+          providerThread,
+          now: yield* DateTime.now,
+          attemptId: RunAttemptId.make("guarded-confirmed"),
+          text: "Inspect this repository",
+        }),
+      );
+      assert.lengthOf(
+        session.requests.filter(({ method }) => method === "turn/start"),
+        1,
+      );
+    }).pipe(Effect.scoped, Effect.provide(subscriptionTestLayers)),
+  );
+
+  it.effect.each(["effective", "saved"] as const)(
+    "refuses mismatched %s native provider provenance",
+    (mismatch) =>
+      Effect.gen(function* () {
+        const replay = subscriptionTranscript(`subscription-native-${mismatch}`);
+        replay.verify();
+        replay.verify();
+        assert.isTrue(Predicate.isObject(replay.nativeResult));
+        const native = replay.nativeResult as Record<string, unknown>;
+        replay.start(true, {
+          ...native,
+          ...(mismatch === "effective"
+            ? { modelProvider: "custom" }
+            : { thread: { ...(native.thread as object), modelProvider: "custom" } }),
+        });
+        const session = yield* openReplaySession(replay.transcript());
+        const threadId = ThreadId.make(`guarded-${mismatch}`);
+        yield* session.runtime.guardSubscriptionThread!({ threadId, cwd: "/workspace" });
+        const result = yield* session.ensureThread(threadId).pipe(Effect.result);
+        assert.equal(result._tag, "Failure");
+        if (result._tag === "Failure")
+          assert.include(
+            subscriptionFailureText(result.failure),
+            "confirm the built-in OpenAI route",
+          );
+        assert.isFalse(session.requests.some(({ method }) => method === "turn/start"));
+      }).pipe(Effect.scoped, Effect.provide(subscriptionTestLayers)),
+  );
+
+  it.effect.each(["safe", "api-provenance", "active-goal", "effective-mismatch"] as const)(
+    "verifies saved thread resume before guarded work: %s",
+    (mode) =>
+      Effect.gen(function* () {
+        const name = `subscription-resume-${mode}`;
+        const replay = subscriptionTranscript(name);
+        replay.start(false);
+        replay.verify(); // register an existing native thread
+        replay.verify(); // check actual runtime before resume
+        const native = replay.nativeResult as Record<string, unknown>;
+        replay.rpc(
+          "thread/read",
+          { threadId: name, includeTurns: false },
+          {
+            thread: {
+              ...(native.thread as object),
+              ...(mode === "api-provenance" ? { modelProvider: "custom-api" } : {}),
+            },
+          },
+        );
+        if (mode !== "api-provenance") {
+          replay.rpc(
+            "thread/goal/get",
+            { threadId: name },
+            {
+              goal:
+                mode === "active-goal"
+                  ? {
+                      objective: "Keep working",
+                      status: "active",
+                      tokenBudget: null,
+                      tokensUsed: 0,
+                      threadId: name,
+                      timeUsedSeconds: 0,
+                      createdAt: 1,
+                      updatedAt: 1,
+                    }
+                  : null,
+            },
+          );
+          if (mode !== "active-goal")
+            replay.rpc(
+              "thread/resume",
+              {
+                threadId: name,
+                excludeTurns: true,
+                ...CodexAdapterV2.codexThreadRuntimeParams({
+                  mcpSession: undefined,
+                  subscriptionOnly: true,
+                }),
+              },
+              mode === "effective-mismatch" ? { ...native, modelProvider: "custom-api" } : native,
+            );
+        }
+        const session = yield* openReplaySession(replay.transcript());
+        const threadId = ThreadId.make(name);
+        const providerThread = yield* session.ensureThread(threadId);
+        yield* session.runtime.guardSubscriptionThread!({ threadId, cwd: "/workspace" });
+        const result = yield* session.runtime.resumeThread({ providerThread }).pipe(Effect.result);
+        assert.equal(result._tag, mode === "safe" ? "Success" : "Failure");
+        if (result._tag === "Failure")
+          assert.include(
+            subscriptionFailureText(result.failure),
+            mode === "api-provenance"
+              ? "verified built-in OpenAI provenance"
+              : mode === "active-goal"
+                ? "active native goal"
+                : "confirm the built-in OpenAI route",
+          );
+        assert.isFalse(
+          session.requests.some(
+            ({ method }) => method === "turn/start" || method === "thread/goal/set",
+          ),
+        );
+      }).pipe(Effect.scoped, Effect.provide(subscriptionTestLayers)),
+  );
+
+  it.effect("blocks changed merged system or managed routes before a model action", () =>
+    Effect.gen(function* () {
+      const replay = subscriptionTranscript("subscription-merged-route-change");
+      replay.verify();
+      replay.verify();
+      replay.start();
+      replay.rpc(
+        "config/read",
+        { cwd: "/workspace", includeLayers: true },
+        {
+          ...mergedSubscriptionConfig,
+          config: {
+            ...mergedSubscriptionConfig.config,
+            openai_base_url: "https://example.invalid",
+          },
+        },
+      );
+      const session = yield* openReplaySession(replay.transcript());
+      const threadId = ThreadId.make("guarded-config-change");
+      yield* session.runtime.guardSubscriptionThread!({ threadId, cwd: "/workspace" });
+      const providerThread = yield* session.ensureThread(threadId);
+      const result = yield* session.runtime
+        .startTurn(
+          makeCodexTestTurnInput({
+            threadId,
+            providerThread,
+            now: yield* DateTime.now,
+            attemptId: RunAttemptId.make("guarded-route-change"),
+            text: "Do work",
+          }),
+        )
+        .pipe(Effect.result);
+      assert.equal(result._tag, "Failure");
+      if (result._tag === "Failure")
+        assert.include(subscriptionFailureText(result.failure), "refuses config.openai_base_url");
+      assert.lengthOf(
+        session.requests.filter(({ method }) => method === "account/read"),
+        2,
+      );
+      assert.isFalse(session.requests.some(({ method }) => method === "turn/start"));
+    }).pipe(Effect.scoped, Effect.provide(subscriptionTestLayers)),
+  );
+
+  it.effect("fails closed when the actual runtime cannot read merged configuration", () =>
+    Effect.gen(function* () {
+      const replay = subscriptionTranscript("subscription-config-unsupported");
+      replay.entries.push(
+        {
+          type: "expect_outbound",
+          frame: {
+            id: 2,
+            method: "config/read",
+            params: { cwd: "/workspace", includeLayers: true },
+          },
+        },
+        {
+          type: "emit_inbound",
+          frame: { id: 2, error: { code: -32601, message: "Unknown method" } },
+        },
+      );
+      const session = yield* openReplaySession(replay.transcript());
+      const result = yield* session.runtime.guardSubscriptionThread!({
+        threadId: ThreadId.make("guarded-unsupported"),
+        cwd: "/workspace",
+      }).pipe(Effect.result);
+      assert.equal(result._tag, "Failure");
+      assert.deepEqual(
+        session.requests.map(({ method }) => method),
+        ["initialize", "config/read"],
+      );
+    }).pipe(Effect.scoped, Effect.provide(subscriptionTestLayers)),
+  );
 
   it.effect("sends one initialize when two threads start on a fresh session at once", () =>
     Effect.gen(function* () {

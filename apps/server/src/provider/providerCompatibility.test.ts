@@ -358,6 +358,7 @@ it.effect("a remote policy refresh preserves a newer health result on the regist
       }),
       Layer.succeed(ProviderInstanceRegistry.ProviderInstanceRegistry, {
         getInstance: (id) => Effect.succeed(id === instance.instanceId ? instance : undefined),
+        getInstanceForConfig: () => Effect.succeed(undefined),
         listInstances: Effect.succeed([instance]),
         listUnavailable: Effect.succeed([]),
         streamChanges: Stream.empty,

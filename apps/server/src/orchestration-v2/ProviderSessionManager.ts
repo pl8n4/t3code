@@ -152,6 +152,8 @@ export interface ProviderSessionManagerV2Shape {
     readonly resumeFromSession?: OrchestrationV2ProviderSession;
     readonly initialNativeThreadId?: string;
     readonly initialProviderItemIdentityVersion?: 2;
+    /** Discard any runtime opened before promotional-credit admission. */
+    readonly guardedExecution?: true;
   }) => Effect.Effect<
     ProviderAdapter.ProviderAdapterV2SessionRuntime,
     ProviderSessionManagerV2Error
@@ -188,6 +190,8 @@ export class ProviderSessionManagerV2 extends Context.Service<
 >()("t3/orchestration-v2/ProviderSessionManager/ProviderSessionManagerV2") {}
 
 interface LiveSessionEntry {
+  readonly guardedExecution: boolean;
+  readonly adapter: ProviderAdapter.ProviderAdapterV2["Service"];
   readonly attachedThreadIds: ReadonlySet<ThreadId>;
   readonly loadedProviderThreadKeyByThread: ReadonlyMap<ThreadId, string>;
   /**
@@ -1702,11 +1706,34 @@ export const layerWithOptions = (
 
       const decorateRuntime = (
         runtime: ProviderAdapter.ProviderAdapterV2SessionRuntime,
+        adapter: ProviderAdapter.ProviderAdapterV2["Service"],
         eventSubscribers: Ref.Ref<
           ReadonlyMap<number, Queue.Queue<ProviderSessionEventSignal, Cause.Done>>
         >,
       ): ProviderAdapter.ProviderAdapterV2SessionRuntime => {
         const providerSessionId = runtime.providerSessionId;
+        // A hydrated replacement can share the same instance/session IDs while
+        // using another account or billing route. Held runtime references must
+        // not outlive the adapter that actually opened them.
+        const assertCurrentAdapter = Effect.gen(function* () {
+          const current = yield* registry.get(runtime.instanceId).pipe(
+            Effect.mapError(
+              (cause) =>
+                new ProviderAdapter.ProviderAdapterEventStreamError({
+                  driver: runtime.driver,
+                  providerSessionId,
+                  cause,
+                }),
+            ),
+          );
+          const live = (yield* Ref.get(sessions)).get(sessionKey(providerSessionId));
+          if (current !== adapter || live?.runtime !== runtime)
+            return yield* new ProviderAdapter.ProviderAdapterEventStreamError({
+              driver: runtime.driver,
+              providerSessionId,
+              cause: "The provider configuration changed. Reopen the session before continuing.",
+            });
+        });
         const subscribeEvents = makeEventSubscription(eventSubscribers);
         const turnMetrics = (operation: string, model?: string) =>
           withMetrics({
@@ -1823,58 +1850,82 @@ export const layerWithOptions = (
               ),
             ),
           startTurn: (input) =>
-            observeActivity(
-              providerSessionId,
-              ensureThreadAttached({
-                providerSessionId,
-                threadId: input.threadId,
-                providerInstanceId: runtime.instanceId,
-              }),
-            ).pipe(
-              // A start that fails or is stopped may never emit turn.terminal,
-              // so it clears its own turn or the session never goes idle.
-              Effect.andThen(
-                holdThreadLoaded({
+            assertCurrentAdapter.pipe(
+              Effect.flatMap(() =>
+                observeActivity(
                   providerSessionId,
-                  threadId: input.threadId,
-                  providerThread: input.providerThread,
-                }),
-              ),
-              Effect.andThen(
-                Effect.acquireUseRelease(
-                  observeActivity(
+                  ensureThreadAttached({
                     providerSessionId,
-                    markBusy(
+                    threadId: input.threadId,
+                    providerInstanceId: runtime.instanceId,
+                  }),
+                ).pipe(
+                  // A start that fails or is stopped may never emit turn.terminal,
+                  // so it clears its own turn or the session never goes idle.
+                  Effect.andThen(
+                    holdThreadLoaded({
                       providerSessionId,
-                      busyTurnKey(input.providerThread.id, input.runOrdinal),
+                      threadId: input.threadId,
+                      providerThread: input.providerThread,
+                    }),
+                  ),
+                  Effect.andThen(
+                    Effect.acquireUseRelease(
+                      observeActivity(
+                        providerSessionId,
+                        markBusy(
+                          providerSessionId,
+                          busyTurnKey(input.providerThread.id, input.runOrdinal),
+                        ),
+                      ),
+                      () =>
+                        runtime
+                          .startTurn(input)
+                          .pipe(turnMetrics("send", input.modelSelection.model)),
+                      (_, exit) =>
+                        Exit.isFailure(exit)
+                          ? observeActivity(
+                              providerSessionId,
+                              markIdle(
+                                providerSessionId,
+                                input.providerThread.id,
+                                input.runOrdinal,
+                              ),
+                            )
+                          : Effect.void,
                     ),
                   ),
-                  () =>
-                    runtime.startTurn(input).pipe(turnMetrics("send", input.modelSelection.model)),
-                  (_, exit) =>
-                    Exit.isFailure(exit)
-                      ? observeActivity(
-                          providerSessionId,
-                          markIdle(providerSessionId, input.providerThread.id, input.runOrdinal),
-                        )
-                      : Effect.void,
                 ),
               ),
             ),
+          ...(runtime.compactThread === undefined
+            ? {}
+            : {
+                compactThread: (input: Parameters<NonNullable<typeof runtime.compactThread>>[0]) =>
+                  assertCurrentAdapter.pipe(Effect.flatMap(() => runtime.compactThread!(input))),
+              }),
           steerTurn: (input) =>
-            observeActivity(providerSessionId, touchActivity(providerSessionId)).pipe(
-              Effect.andThen(runtime.steerTurn(input).pipe(turnMetrics("steer"))),
+            assertCurrentAdapter.pipe(
+              Effect.flatMap(() =>
+                observeActivity(providerSessionId, touchActivity(providerSessionId)).pipe(
+                  Effect.flatMap(() => runtime.steerTurn(input).pipe(turnMetrics("steer"))),
+                ),
+              ),
             ),
           interruptTurn: (input) =>
             observeActivity(providerSessionId, touchActivity(providerSessionId)).pipe(
               Effect.andThen(runtime.interruptTurn(input).pipe(turnMetrics("interrupt"))),
             ),
           respondToRuntimeRequest: (input) =>
-            observeActivity(providerSessionId, touchActivity(providerSessionId)).pipe(
-              Effect.andThen(
-                runtime
-                  .respondToRuntimeRequest(input)
-                  .pipe(turnMetrics("runtime-request-response")),
+            assertCurrentAdapter.pipe(
+              Effect.flatMap(() =>
+                observeActivity(providerSessionId, touchActivity(providerSessionId)).pipe(
+                  Effect.andThen(
+                    runtime
+                      .respondToRuntimeRequest(input)
+                      .pipe(turnMetrics("runtime-request-response")),
+                  ),
+                ),
               ),
             ),
         };
@@ -2081,27 +2132,6 @@ export const layerWithOptions = (
                   });
                 }
               }
-              const key = sessionKey(input.providerSessionId);
-              const existing = (yield* Ref.get(sessions)).get(key);
-              if (existing !== undefined) {
-                const attached = existing.attachedThreadIds.has(input.threadId);
-                if (!attached && !existing.supportsMultipleProviderThreads) {
-                  return yield* new ProviderSessionOpenError({
-                    instanceId: input.modelSelection.instanceId,
-                    providerSessionId: input.providerSessionId,
-                    cause: `Provider ${existing.runtime.driver} does not support attaching multiple app threads to one session.`,
-                  });
-                }
-                if (!attached) yield* agentScope.clear(input.threadId);
-                yield* ensureThreadAttached({
-                  providerSessionId: input.providerSessionId,
-                  threadId: input.threadId,
-                  providerInstanceId: existing.runtime.instanceId,
-                });
-                yield* touchActivity(input.providerSessionId);
-                return existing.exposedRuntime;
-              }
-
               const adapter = yield* registry.get(input.modelSelection.instanceId).pipe(
                 Effect.mapError(
                   (cause) =>
@@ -2112,6 +2142,83 @@ export const layerWithOptions = (
                     }),
                 ),
               );
+              const key = sessionKey(input.providerSessionId);
+              const verifySubscription = (
+                runtime: ProviderAdapter.ProviderAdapterV2SessionRuntime,
+              ) =>
+                Effect.gen(function* () {
+                  if (input.guardedExecution !== true || runtime.driver !== "codex") return;
+                  if (runtime.guardSubscriptionThread === undefined)
+                    return yield* new ProviderSessionOpenError({
+                      instanceId: input.modelSelection.instanceId,
+                      providerSessionId: input.providerSessionId,
+                      cause:
+                        "This Codex runtime cannot verify subscription-only execution. Update the provider before delegating guarded work.",
+                    });
+                  yield* runtime.guardSubscriptionThread({ threadId: input.threadId, cwd }).pipe(
+                    Effect.mapError(
+                      (cause) =>
+                        new ProviderSessionOpenError({
+                          instanceId: input.modelSelection.instanceId,
+                          providerSessionId: input.providerSessionId,
+                          cause,
+                        }),
+                    ),
+                  );
+                });
+              let existing = (yield* Ref.get(sessions)).get(key);
+              if (
+                existing !== undefined &&
+                (existing.adapter !== adapter ||
+                  (input.guardedExecution === true && !existing.guardedExecution))
+              ) {
+                const busy =
+                  existing.busyTurns.size > 0 ||
+                  (existing.runtime.hasPendingBackgroundWork !== undefined &&
+                    (yield* existing.runtime.hasPendingBackgroundWork));
+                if (busy)
+                  return yield* new ProviderSessionOpenError({
+                    instanceId: input.modelSelection.instanceId,
+                    providerSessionId: input.providerSessionId,
+                    cause:
+                      "This provider still has active work. Wait for it to finish before changing its execution policy, or use a separate provider instance.",
+                  });
+                yield* releaseEntry({
+                  providerSessionId: input.providerSessionId,
+                  reason: "manual_shutdown",
+                  detail: "The provider configuration or guarded execution policy changed.",
+                }).pipe(
+                  Effect.mapError(
+                    (cause) =>
+                      new ProviderSessionOpenError({
+                        instanceId: input.modelSelection.instanceId,
+                        providerSessionId: input.providerSessionId,
+                        cause,
+                      }),
+                  ),
+                );
+                existing = undefined;
+              }
+              if (existing !== undefined) {
+                const attached = existing.attachedThreadIds.has(input.threadId);
+                if (!attached && !existing.supportsMultipleProviderThreads) {
+                  return yield* new ProviderSessionOpenError({
+                    instanceId: input.modelSelection.instanceId,
+                    providerSessionId: input.providerSessionId,
+                    cause: `Provider ${existing.runtime.driver} does not support attaching multiple app threads to one session.`,
+                  });
+                }
+                yield* verifySubscription(existing.runtime);
+                if (!attached) yield* agentScope.clear(input.threadId);
+                yield* ensureThreadAttached({
+                  providerSessionId: input.providerSessionId,
+                  threadId: input.threadId,
+                  providerInstanceId: existing.runtime.instanceId,
+                });
+                yield* touchActivity(input.providerSessionId);
+                return existing.exposedRuntime;
+              }
+
               const prepared = yield* prepareMcpSession(
                 input.threadId,
                 input.modelSelection.instanceId,
@@ -2147,6 +2254,7 @@ export const layerWithOptions = (
                 })
                 .pipe(
                   Effect.provideService(Scope.Scope, sessionScope),
+                  Effect.tap(verifySubscription),
                   // The session cleanup runs first, and the close is
                   // time-boxed: this runs under the session's open lock, so an
                   // adapter finalizer that never finishes must not hold the
@@ -2182,9 +2290,11 @@ export const layerWithOptions = (
               const eventSubscribers = yield* Ref.make<
                 ReadonlyMap<number, Queue.Queue<ProviderSessionEventSignal, Cause.Done>>
               >(new Map());
-              const exposedRuntime = decorateRuntime(runtime, eventSubscribers);
+              const exposedRuntime = decorateRuntime(runtime, adapter, eventSubscribers);
               const now = yield* Clock.currentTimeMillis;
               const entry: LiveSessionEntry = {
+                guardedExecution: input.guardedExecution === true,
+                adapter,
                 attachedThreadIds: new Set([input.threadId]),
                 loadedProviderThreadKeyByThread: new Map(),
                 mcpCredentialIdByThread:

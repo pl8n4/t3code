@@ -1,3 +1,4 @@
+import * as ClaudeCloudExecutionPolicyTestkit from "../provider/ClaudeCloudExecutionPolicy.testkit.ts";
 import * as Scheduler from "../scheduling/Scheduler.ts";
 import * as NodeUtil from "node:util";
 
@@ -180,7 +181,9 @@ it.effect(
         Effect.gen(function* () {
           yield* Layer.build(
             Layer.provideMerge(
-              ScheduledTaskService.layer,
+              ScheduledTaskService.layer.pipe(
+                Layer.provide(ClaudeCloudExecutionPolicyTestkit.layer),
+              ),
               Layer.mergeAll(
                 Layer.mock(ThreadLaunchService.ThreadLaunchService)({
                   launch: () =>
@@ -270,7 +273,9 @@ it.effect(
         Effect.gen(function* () {
           yield* Layer.build(
             Layer.provideMerge(
-              ScheduledTaskService.layer,
+              ScheduledTaskService.layer.pipe(
+                Layer.provide(ClaudeCloudExecutionPolicyTestkit.layer),
+              ),
               Layer.mergeAll(
                 Layer.mock(ThreadLaunchService.ThreadLaunchService)({
                   launch: () =>

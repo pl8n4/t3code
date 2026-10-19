@@ -76,9 +76,9 @@ Model changes apply to the next message, including in existing cloud threads.
 Fable may require usage credits on your account. If promotional credit cannot
 cover a model, leave paid usage disabled; the bridge does not enable it.
 
-Also select the cloud instance for **Settings > General > Text generation model**
-if you want to prevent background titles and other generated text from using a
-different provider. Those helpers are disabled on the cloud instance.
+Cloud workflows keep their seed titles and automatic worktree names instead of
+calling a background text model. The **Text generation model** setting still
+applies to ordinary threads.
 
 Cloud launches require unexpired promotional credit and disabled paid usage
 credits in Claude's usage settings. The prototype checks these before each
@@ -89,9 +89,24 @@ The model runs in Anthropic's cloud while T3 tools work in the thread's actual
 local project or worktree. Existing edits and untracked files are available;
 there is no clean-checkout, GitHub remote, push, or manual synchronization step.
 Edits appear in T3's normal local diffs and checkpoints. Browser and thread-history
-tools use the same T3 permissions as other providers. Tools that start other model
-work or change provider settings are disabled in free-credit mode. Keep T3 and
-the environment's machine running while a cloud task uses those tools.
+tools use the same T3 permissions as other providers. Keep T3 and the environment's
+machine running while a cloud task uses those tools.
+
+Use T3 delegation for child tasks, scheduled tasks for recurring work, and PR
+watching for requested follow-ups. Claude child tasks stay on the same verified
+free-credit instance. Every later turn, including automated wake-ups, rechecks
+the permitted provider route. Changing a child or scheduled thread to a paid or
+unknown route blocks its next turn. Each guarded thread can have four active
+delegated tasks, with nesting up to three levels.
+
+To request Codex children, first enable **Allow requested Codex delegation** on the
+cloud instance and enable a Codex instance signed in with ChatGPT. Then explicitly
+ask Claude to delegate to Codex. These children use the separate Codex subscription;
+Claude promotional credit does not pay for them. API-key and custom model routes
+are rejected. Descendants inherit the workflow restrictions, so they cannot
+change providers or use other model-launch tools to bypass the checks.
+Use T3 schedules and PR watching for automation in these Codex children. Native
+`/goal` and custom Codex agent configuration files are unavailable.
 
 T3 verifies the selected project before sending each task and supplies its current
 repository and worktree context. PR questions use the environment's existing
@@ -108,16 +123,28 @@ free-credit cloud instance enabled for that same Claude config directory and
 account. In a **Full access**, default-mode thread, a rejected usage-limit turn
 stops and continues on cloud Opus 5.5 in the same conversation. T3 transfers the
 conversation context and keeps the current workspace; the composer follows the
-cloud instance for subsequent messages. You can select the local instance again
-later. Ambiguous accounts, pending approvals, queued work, snoozed threads, or
+cloud instance for subsequent messages. The free-credit workflow keeps this
+thread and its descendants restricted to verified routes. To return to ordinary
+local Claude, start a separate local thread. Ambiguous accounts, pending approvals, queued work, snoozed threads, or
 unknown billing information block automatic continuation.
 
 For manual switching, stop the current turn, select the cloud instance, and send
 a follow-up. You can also start a new cloud thread in any local project.
 
-This prototype supports Haiku 5.5, Opus 5.5, Fable 5.1, and Full access. File tools use paths relative
-to the thread's workspace; commands currently require a Unix shell and have a
-60-second timeout. Local dependencies still run on the environment's machine.
+This prototype supports Haiku 5.5, Opus 5.5, Fable 5.1, and Full access. Select
+reasoning effort in the composer; T3 confirms that Claude applied it before
+sending your message. Fast and Ultracode modes are unavailable.
+
+File tools use paths relative to the thread's workspace. Commands require a Unix
+shell and run as persistent jobs with saved output, status, and cancellation.
+They have no default execution deadline; an agent can set one explicitly.
+Commands continue through a browser or backend reconnect, and stopping a model
+turn leaves its jobs running until explicitly cancelled. Agents can read more
+output or cancel by job ID instead of starting the command again. Jobs are
+noninteractive and do not open a terminal tab or send a completion notification;
+the agent checks their status. Local dependencies still run on the environment's
+machine.
+
 Cloud-native skills, binary/image attachments, and native conversation fork or
 rollback are not fully integrated. Text handoffs are summaries, so they cannot
 preserve a provider's hidden reasoning or every detail of a long conversation.
@@ -125,15 +152,24 @@ preserve a provider's hidden reasoning or every detail of a long conversation.
 This experimental mode depends on Claude's internal browser interface and may
 break when that interface changes. Leave its transport browser tabs alone and
 avoid opening the same cloud session in Claude's own interface while T3 is using
-it; competing clients can disconnect the tool bridge. Interrupted tool calls
-are not automatically replayed: inspect the workspace before retrying.
+it; competing clients can disconnect the tool bridge.
 
-Replies and tool outcomes are saved in a local recovery journal before T3 advances
-its cloud cursor. Completed turns record a delivery checkpoint with the thread's
-saved history. If an interruption leaves output whose delivery T3 cannot confirm,
-resume is blocked and the cloud conversation opens in the Browser panel for
-recovery. Copy the needed context into a new thread; starting another turn does
-not discard that saved output or repeat an uncertain local command.
+T3 retries interrupted reads without sending your prompt again. If delivery of a
+new prompt cannot be confirmed, T3 keeps checking the existing session; it never
+resends the prompt automatically. After a backend
+restart, a continuation reconnects the existing cloud turn, restores saved
+replies and tool state, and collects any remaining output. Completed tool calls
+reuse their saved outcomes. Workspace commands reconnect to their persistent
+jobs instead of running twice. A graceful shutdown can interrupt the remote
+model; recovery collects that result, and you can continue in the same thread.
+If automatic recovery fails, resolve the reported issue, then send `/recover`
+alone in the same thread. This reconnects the previous cloud turn without sending
+another coding prompt. After it finishes, send your next task normally.
+
+A truly uncertain tool side effect, an older journal without recovery data, or missing
+cloud history still blocks automatic recovery: inspect the workspace and the
+cloud conversation before retrying. Starting another turn does not discard saved
+output or repeat an uncertain action.
 
 Promotional credit can expire or become unavailable, at which point the bridge stops instead
 of falling back to a paid API. If session creation cannot be confirmed, inspect

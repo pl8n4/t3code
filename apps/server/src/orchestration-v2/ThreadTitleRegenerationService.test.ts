@@ -1,3 +1,5 @@
+import * as ClaudeCloudExecutionPolicy from "../provider/ClaudeCloudExecutionPolicy.ts";
+import * as ClaudeCloudExecutionPolicyTestkit from "../provider/ClaudeCloudExecutionPolicy.testkit.ts";
 import { assert, describe, it, vi } from "@effect/vitest";
 import {
   type ChatAttachment,
@@ -46,6 +48,7 @@ const adapter = {
 function makeHarness(
   options: {
     readonly generateTitle?: TextGeneration.TextGeneration["Service"]["generateThreadTitle"];
+    readonly isGuarded?: ClaudeCloudExecutionPolicy.ClaudeCloudExecutionPolicy["Service"]["isGuarded"];
   } = {},
 ) {
   const layerDatabase = SqlitePersistence.layerMemory;
@@ -56,11 +59,13 @@ function makeHarness(
     { databaseLayer: layerDatabase, runEffectWorker: false },
   );
   const layerServerSettings = ServerSettings.layerTest({});
-  const layerThreadManagement = ThreadManagement.layer.pipe(
-    Layer.provide(layerOrchestrator),
-    Layer.provide(layerServerSettings),
-    Layer.provide(CommandReceiptStore.layer.pipe(Layer.provide(layerDatabase))),
-  );
+  const layerThreadManagement = ThreadManagement.layer
+    .pipe(Layer.provide(ClaudeCloudExecutionPolicyTestkit.layer))
+    .pipe(
+      Layer.provide(layerOrchestrator),
+      Layer.provide(layerServerSettings),
+      Layer.provide(CommandReceiptStore.layer.pipe(Layer.provide(layerDatabase))),
+    );
   const layerOutbox = EffectOutbox.layer.pipe(Layer.provide(layerDatabase));
   const generateThreadTitle = vi.fn(
     options.generateTitle ?? (() => Effect.succeed({ title: "Generated title" })),
@@ -87,6 +92,13 @@ function makeHarness(
       ),
   });
   const layerTitleRegeneration = ThreadTitleRegeneration.layer.pipe(
+    Layer.provide(
+      options.isGuarded === undefined
+        ? ClaudeCloudExecutionPolicyTestkit.layer
+        : Layer.mock(ClaudeCloudExecutionPolicy.ClaudeCloudExecutionPolicy)({
+            isGuarded: options.isGuarded,
+          }),
+    ),
     Layer.provide(
       Layer.mergeAll(
         layerThreadManagement,
@@ -230,6 +242,51 @@ describe("formatThreadTitleContext", () => {
 });
 
 describe("ThreadTitleRegenerationService", () => {
+  it.effect.each([
+    ["initial", "guarded"],
+    ["initial", "unavailable"],
+    ["regenerate", "guarded"],
+    ["regenerate", "unavailable"],
+  ] as const)("preserves the title without calling a model (%s)", ([kind, policyState]) =>
+    Effect.gen(function* () {
+      const harness = makeHarness({
+        isGuarded: () =>
+          policyState === "guarded"
+            ? Effect.succeed(true)
+            : Effect.fail(
+                new ClaudeCloudExecutionPolicy.ClaudeCloudExecutionPolicyError({
+                  detail: "Policy storage unavailable",
+                }),
+              ),
+      });
+      yield* Effect.gen(function* () {
+        const threads = yield* ThreadManagement.ThreadManagementService;
+        const titleRegeneration = yield* ThreadTitleRegeneration.ThreadTitleRegenerationService;
+        const key = `title:guard:${kind}:${policyState}`;
+        const threadId = yield* createThread({ command: `${key}:create`, thread: key });
+        const messageCommand = `${key}:message`;
+        yield* dispatchUserMessage({
+          command: messageCommand,
+          threadId,
+          text: "A title that could invoke the paid project writer",
+        });
+        const requestId = yield* armRegeneration({ command: `${key}:request`, threadId });
+        yield* titleRegeneration.execute({
+          threadId,
+          requestId,
+          kind:
+            kind === "initial"
+              ? { type: "initial", messageId: MessageId.make(`${messageCommand}:message`) }
+              : { type: "regenerate" },
+        });
+        const projection = yield* threads.getThreadProjection(threadId);
+        assert.equal(harness.generateThreadTitle.mock.calls.length, 0);
+        assert.equal(projection.thread.title, "Seed title");
+        assert.isNotOk(projection.thread.titleRegeneration);
+      }).pipe(Effect.provide(harness.layer));
+    }),
+  );
+
   it.effect("arms and clears the regeneration marker through metadata commands", () =>
     Effect.gen(function* () {
       const harness = makeHarness();

@@ -1,3 +1,5 @@
+import * as ClaudeCloudExecutionPolicy from "../provider/ClaudeCloudExecutionPolicy.ts";
+import * as ClaudeCloudExecutionPolicyTestkit from "../provider/ClaudeCloudExecutionPolicy.testkit.ts";
 import { expect, it } from "@effect/vitest";
 import {
   CommandId,
@@ -279,12 +281,14 @@ const layerReceiptsTest = CommandReceiptStore.layer.pipe(
 );
 
 const layerThreadManagementTest = (settingsLayer: ReturnType<typeof ServerSettings.layerTest>) =>
-  ThreadManagementService.layer.pipe(
-    Layer.provide(Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({})),
-    Layer.provide(Layer.mock(Orchestrator.OrchestratorV2)({})),
-    Layer.provide(settingsLayer),
-    Layer.provide(layerReceiptsTest),
-  );
+  ThreadManagementService.layer
+    .pipe(Layer.provide(ClaudeCloudExecutionPolicyTestkit.layer))
+    .pipe(
+      Layer.provide(Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({})),
+      Layer.provide(Layer.mock(Orchestrator.OrchestratorV2)({})),
+      Layer.provide(settingsLayer),
+      Layer.provide(layerReceiptsTest),
+    );
 
 it.effect("refuses a new turn when the project effectively disables the instance", () => {
   const projectId = ProjectId.make("project:thread-management:gate-disabled");
@@ -358,7 +362,7 @@ it.effect("inherits the machine value when the project has no override", () => {
 
 const layerDispatchChokepointTest =
   (settingsLayer: ReturnType<typeof ServerSettings.layerTest>) => (dispatched: Array<string>) =>
-    ThreadManagementService.layer.pipe(
+    ThreadManagementService.layer.pipe(Layer.provide(ClaudeCloudExecutionPolicyTestkit.layer)).pipe(
       Layer.provide(Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({})),
       Layer.provide(
         Layer.mock(Orchestrator.OrchestratorV2)({
@@ -482,16 +486,18 @@ it.effect("classifies projection infrastructure failures separately from a missi
     threadId,
     cause: infrastructureCause,
   });
-  const layerTest = ThreadManagementService.layer.pipe(
-    Layer.provide(Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({})),
-    Layer.provide(
-      Layer.mock(Orchestrator.OrchestratorV2)({
-        getThreadProjection: () => Effect.fail(projectionError),
-      }),
-    ),
-    Layer.provide(ServerSettings.layerTest()),
-    Layer.provide(layerReceiptsTest),
-  );
+  const layerTest = ThreadManagementService.layer
+    .pipe(Layer.provide(ClaudeCloudExecutionPolicyTestkit.layer))
+    .pipe(
+      Layer.provide(Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({})),
+      Layer.provide(
+        Layer.mock(Orchestrator.OrchestratorV2)({
+          getThreadProjection: () => Effect.fail(projectionError),
+        }),
+      ),
+      Layer.provide(ServerSettings.layerTest()),
+      Layer.provide(layerReceiptsTest),
+    );
 
   return Effect.gen(function* () {
     const service = yield* ThreadManagementService.ThreadManagementService;
@@ -518,16 +524,18 @@ it.effect("uses thread-not-found only after a projection loads outside the proje
       deletedAt: null,
     },
   } as OrchestrationV2ThreadProjection;
-  const layerTest = ThreadManagementService.layer.pipe(
-    Layer.provide(Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({})),
-    Layer.provide(
-      Layer.mock(Orchestrator.OrchestratorV2)({
-        getThreadProjection: () => Effect.succeed(projection),
-      }),
-    ),
-    Layer.provide(ServerSettings.layerTest()),
-    Layer.provide(layerReceiptsTest),
-  );
+  const layerTest = ThreadManagementService.layer
+    .pipe(Layer.provide(ClaudeCloudExecutionPolicyTestkit.layer))
+    .pipe(
+      Layer.provide(Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({})),
+      Layer.provide(
+        Layer.mock(Orchestrator.OrchestratorV2)({
+          getThreadProjection: () => Effect.succeed(projection),
+        }),
+      ),
+      Layer.provide(ServerSettings.layerTest()),
+      Layer.provide(layerReceiptsTest),
+    );
 
   return Effect.gen(function* () {
     const service = yield* ThreadManagementService.ThreadManagementService;
@@ -546,22 +554,24 @@ it.effect("preserves failed legacy materialization when reading checkpoint conte
     operation: "hydrate transcript for",
     cause: new Error("checkpoint import failed"),
   });
-  const layerTest = ThreadManagementService.layerWithLegacyImporter.pipe(
-    Layer.provide(Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({})),
-    Layer.provide(
-      Layer.mergeAll(
-        Layer.mock(Orchestrator.OrchestratorV2)({
-          getCheckpointContext: () =>
-            Effect.succeed({ runs: [], checkpointScopes: [], checkpoints: [] }),
-        }),
-        Layer.mock(LegacyV1ThreadImporter.LegacyV1ThreadImporter)({
-          ensureTranscript: () => Effect.fail(importError),
-        }),
+  const layerTest = ThreadManagementService.layerWithLegacyImporter
+    .pipe(Layer.provide(ClaudeCloudExecutionPolicyTestkit.layer))
+    .pipe(
+      Layer.provide(Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({})),
+      Layer.provide(
+        Layer.mergeAll(
+          Layer.mock(Orchestrator.OrchestratorV2)({
+            getCheckpointContext: () =>
+              Effect.succeed({ runs: [], checkpointScopes: [], checkpoints: [] }),
+          }),
+          Layer.mock(LegacyV1ThreadImporter.LegacyV1ThreadImporter)({
+            ensureTranscript: () => Effect.fail(importError),
+          }),
+        ),
       ),
-    ),
-    Layer.provide(ServerSettings.layerTest()),
-    Layer.provide(layerReceiptsTest),
-  );
+      Layer.provide(ServerSettings.layerTest()),
+      Layer.provide(layerReceiptsTest),
+    );
   return Effect.gen(function* () {
     const service = yield* ThreadManagementService.ThreadManagementService;
     const error = yield* service.getCheckpointContext(threadId).pipe(Effect.flip);
@@ -590,27 +600,29 @@ it.effect.each([
         thread: { id: threadId, projectId, deletedAt: null },
         runs: status === "missing" ? [] : [{ id: runId, status }],
       }) as unknown as OrchestrationV2ThreadProjection;
-    const layerTest = ThreadManagementService.layer.pipe(
-      Layer.provide(Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({})),
-      Layer.provide(
-        Layer.mock(Orchestrator.OrchestratorV2)({
-          getThreadEventSequence: () => Effect.succeed(0),
-          restartContinuationPending: () => Effect.succeed(false),
-          streamStoredEventsFrom: () =>
-            Stream.fromEffect(Deferred.succeed(subscribed, undefined)).pipe(
-              Stream.drain,
-              Stream.concat(Stream.never),
-            ),
-          getThreadRecords: () =>
-            Effect.sync(() => {
-              reads += 1;
-              return projection(reads === 1 ? "running" : scenario.finalStatus);
-            }),
-        }),
-      ),
-      Layer.provide(ServerSettings.layerTest()),
-      Layer.provide(layerReceiptsTest),
-    );
+    const layerTest = ThreadManagementService.layer
+      .pipe(Layer.provide(ClaudeCloudExecutionPolicyTestkit.layer))
+      .pipe(
+        Layer.provide(Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({})),
+        Layer.provide(
+          Layer.mock(Orchestrator.OrchestratorV2)({
+            getThreadEventSequence: () => Effect.succeed(0),
+            restartContinuationPending: () => Effect.succeed(false),
+            streamStoredEventsFrom: () =>
+              Stream.fromEffect(Deferred.succeed(subscribed, undefined)).pipe(
+                Stream.drain,
+                Stream.concat(Stream.never),
+              ),
+            getThreadRecords: () =>
+              Effect.sync(() => {
+                reads += 1;
+                return projection(reads === 1 ? "running" : scenario.finalStatus);
+              }),
+          }),
+        ),
+        Layer.provide(ServerSettings.layerTest()),
+        Layer.provide(layerReceiptsTest),
+      );
     const service = yield* ThreadManagementService.ThreadManagementService.pipe(
       Effect.provide(layerTest),
     );
@@ -658,32 +670,34 @@ it.effect("waitForThread reads the run again only when the run updates", () =>
     let reads = 0;
     const stored = (sequence: number, event: object) =>
       ({ sequence, event: { threadId, ...event } }) as unknown as OrchestrationV2StoredEvent;
-    const layerTest = ThreadManagementService.layer.pipe(
-      Layer.provide(Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({})),
-      Layer.provide(
-        Layer.mock(Orchestrator.OrchestratorV2)({
-          getThreadEventSequence: () => Effect.succeed(0),
-          restartContinuationPending: () => Effect.succeed(false),
-          streamStoredEventsFrom: (input) =>
-            input?.eventType === "run.updated"
-              ? Stream.fromEffect(Deferred.succeed(subscribed, undefined)).pipe(
-                  Stream.drain,
-                  Stream.concat(Stream.fromQueue(events)),
-                )
-              : Stream.never,
-          getThreadRecords: () =>
-            Effect.sync(() => {
-              reads += 1;
-              return {
-                thread: { id: threadId, projectId, deletedAt: null },
-                runs: [{ id: runId, status }],
-              } as unknown as OrchestrationV2ThreadProjection;
-            }),
-        }),
-      ),
-      Layer.provide(ServerSettings.layerTest()),
-      Layer.provide(layerReceiptsTest),
-    );
+    const layerTest = ThreadManagementService.layer
+      .pipe(Layer.provide(ClaudeCloudExecutionPolicyTestkit.layer))
+      .pipe(
+        Layer.provide(Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({})),
+        Layer.provide(
+          Layer.mock(Orchestrator.OrchestratorV2)({
+            getThreadEventSequence: () => Effect.succeed(0),
+            restartContinuationPending: () => Effect.succeed(false),
+            streamStoredEventsFrom: (input) =>
+              input?.eventType === "run.updated"
+                ? Stream.fromEffect(Deferred.succeed(subscribed, undefined)).pipe(
+                    Stream.drain,
+                    Stream.concat(Stream.fromQueue(events)),
+                  )
+                : Stream.never,
+            getThreadRecords: () =>
+              Effect.sync(() => {
+                reads += 1;
+                return {
+                  thread: { id: threadId, projectId, deletedAt: null },
+                  runs: [{ id: runId, status }],
+                } as unknown as OrchestrationV2ThreadProjection;
+              }),
+          }),
+        ),
+        Layer.provide(ServerSettings.layerTest()),
+        Layer.provide(layerReceiptsTest),
+      );
     const service = yield* ThreadManagementService.ThreadManagementService.pipe(
       Effect.provide(layerTest),
     );
@@ -717,33 +731,35 @@ it.effect("waitForThread follows a restart continuation instead of the cut run",
     let pending = true;
     const stored = (sequence: number, event: object) =>
       ({ sequence, event: { threadId, ...event } }) as unknown as OrchestrationV2StoredEvent;
-    const layerTest = ThreadManagementService.layer.pipe(
-      Layer.provide(Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({})),
-      Layer.provide(
-        Layer.mock(Orchestrator.OrchestratorV2)({
-          getThreadEventSequence: () => Effect.succeed(0),
-          restartContinuationPending: (run) => Effect.succeed(pending && run.id === runId),
-          awaitRestartContinuation: () => Effect.never,
-          streamStoredEventsFrom: (input) =>
-            input?.eventType === "run.updated"
-              ? Stream.fromEffect(Deferred.succeed(subscribed, undefined)).pipe(
-                  Stream.drain,
-                  Stream.concat(Stream.fromQueue(events)),
-                )
-              : Stream.never,
-          getThreadRecords: () =>
-            Effect.sync(
-              () =>
-                ({
-                  thread: { id: threadId, projectId, deletedAt: null },
-                  runs,
-                }) as unknown as OrchestrationV2ThreadProjection,
-            ),
-        }),
-      ),
-      Layer.provide(ServerSettings.layerTest()),
-      Layer.provide(layerReceiptsTest),
-    );
+    const layerTest = ThreadManagementService.layer
+      .pipe(Layer.provide(ClaudeCloudExecutionPolicyTestkit.layer))
+      .pipe(
+        Layer.provide(Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({})),
+        Layer.provide(
+          Layer.mock(Orchestrator.OrchestratorV2)({
+            getThreadEventSequence: () => Effect.succeed(0),
+            restartContinuationPending: (run) => Effect.succeed(pending && run.id === runId),
+            awaitRestartContinuation: () => Effect.never,
+            streamStoredEventsFrom: (input) =>
+              input?.eventType === "run.updated"
+                ? Stream.fromEffect(Deferred.succeed(subscribed, undefined)).pipe(
+                    Stream.drain,
+                    Stream.concat(Stream.fromQueue(events)),
+                  )
+                : Stream.never,
+            getThreadRecords: () =>
+              Effect.sync(
+                () =>
+                  ({
+                    thread: { id: threadId, projectId, deletedAt: null },
+                    runs,
+                  }) as unknown as OrchestrationV2ThreadProjection,
+              ),
+          }),
+        ),
+        Layer.provide(ServerSettings.layerTest()),
+        Layer.provide(layerReceiptsTest),
+      );
     const service = yield* ThreadManagementService.ThreadManagementService.pipe(
       Effect.provide(layerTest),
     );
@@ -780,30 +796,32 @@ it.effect("waitForThread returns the cut run once its continuation is declined",
     const subscribed = yield* Deferred.make<void>();
     const declined = yield* Deferred.make<void>();
     let pending = true;
-    const layerTest = ThreadManagementService.layer.pipe(
-      Layer.provide(Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({})),
-      Layer.provide(
-        Layer.mock(Orchestrator.OrchestratorV2)({
-          getThreadEventSequence: () => Effect.succeed(0),
-          restartContinuationPending: () => Effect.succeed(pending),
-          awaitRestartContinuation: () => Deferred.await(declined),
-          streamStoredEventsFrom: (input) =>
-            input?.eventType === "run.updated"
-              ? Stream.fromEffect(Deferred.succeed(subscribed, undefined)).pipe(
-                  Stream.drain,
-                  Stream.concat(Stream.never),
-                )
-              : Stream.never,
-          getThreadRecords: () =>
-            Effect.succeed({
-              thread: { id: threadId, projectId, deletedAt: null },
-              runs: [{ id: runId, status: "cancelled" }],
-            } as unknown as OrchestrationV2ThreadProjection),
-        }),
-      ),
-      Layer.provide(ServerSettings.layerTest()),
-      Layer.provide(layerReceiptsTest),
-    );
+    const layerTest = ThreadManagementService.layer
+      .pipe(Layer.provide(ClaudeCloudExecutionPolicyTestkit.layer))
+      .pipe(
+        Layer.provide(Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({})),
+        Layer.provide(
+          Layer.mock(Orchestrator.OrchestratorV2)({
+            getThreadEventSequence: () => Effect.succeed(0),
+            restartContinuationPending: () => Effect.succeed(pending),
+            awaitRestartContinuation: () => Deferred.await(declined),
+            streamStoredEventsFrom: (input) =>
+              input?.eventType === "run.updated"
+                ? Stream.fromEffect(Deferred.succeed(subscribed, undefined)).pipe(
+                    Stream.drain,
+                    Stream.concat(Stream.never),
+                  )
+                : Stream.never,
+            getThreadRecords: () =>
+              Effect.succeed({
+                thread: { id: threadId, projectId, deletedAt: null },
+                runs: [{ id: runId, status: "cancelled" }],
+              } as unknown as OrchestrationV2ThreadProjection),
+          }),
+        ),
+        Layer.provide(ServerSettings.layerTest()),
+        Layer.provide(layerReceiptsTest),
+      );
     const service = yield* ThreadManagementService.ThreadManagementService.pipe(
       Effect.provide(layerTest),
     );
@@ -921,32 +939,36 @@ it.effect.each([
                     }),
           }),
     } as unknown as ProviderAdapter.ProviderAdapterV2SessionRuntime;
-    const layerTest = ThreadManagementService.layer.pipe(
-      Layer.provide(
-        Layer.mergeAll(
-          Layer.mock(Orchestrator.OrchestratorV2)({
-            getThreadRecords: () =>
-              Effect.sync(
-                () =>
-                  ({
-                    thread: { id: threadId, deletedAt: null, ...targetModes },
-                    subagents: state === "missing" ? [] : [task],
-                    runs: [{ id: runId, providerThreadId }],
-                    providerThreads: [providerThread],
-                  }) as unknown as OrchestrationV2ThreadProjection,
-              ),
-          }),
-          Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({
-            get: (id) => {
-              expect(id).toBe(providerSessionId);
-              return Effect.succeed(state === "no-session" ? Option.none() : Option.some(runtime));
-            },
-          }),
+    const layerTest = ThreadManagementService.layer
+      .pipe(Layer.provide(ClaudeCloudExecutionPolicyTestkit.layer))
+      .pipe(
+        Layer.provide(
+          Layer.mergeAll(
+            Layer.mock(Orchestrator.OrchestratorV2)({
+              getThreadRecords: () =>
+                Effect.sync(
+                  () =>
+                    ({
+                      thread: { id: threadId, deletedAt: null, ...targetModes },
+                      subagents: state === "missing" ? [] : [task],
+                      runs: [{ id: runId, providerThreadId }],
+                      providerThreads: [providerThread],
+                    }) as unknown as OrchestrationV2ThreadProjection,
+                ),
+            }),
+            Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({
+              get: (id) => {
+                expect(id).toBe(providerSessionId);
+                return Effect.succeed(
+                  state === "no-session" ? Option.none() : Option.some(runtime),
+                );
+              },
+            }),
+          ),
         ),
-      ),
-      Layer.provide(ServerSettings.layerTest()),
-      Layer.provide(layerReceiptsTest),
-    );
+        Layer.provide(ServerSettings.layerTest()),
+        Layer.provide(layerReceiptsTest),
+      );
     yield* Effect.gen(function* () {
       const service = yield* ThreadManagementService.ThreadManagementService;
       const refused = yield* Ref.make<DispatchModeRefusal | undefined>(undefined);
@@ -1047,27 +1069,29 @@ it.effect.each([
     const threadId = ThreadId.make("thread:thread-management:settle-after-run");
     const runId = RunId.make("run:thread-management:settle-after-run");
     const dispatched: Array<string> = [];
-    const layerTest = ThreadManagementService.layer.pipe(
-      Layer.provide(Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({})),
-      Layer.provide(
-        Layer.mock(Orchestrator.OrchestratorV2)({
-          getThreadEventSequence: () => Effect.succeed(0),
-          restartContinuationPending: () => Effect.succeed(false),
-          getThreadRecords: () =>
-            Effect.succeed({
-              thread: { id: threadId, projectId, deletedAt: null },
-              runs: [{ id: runId, status }],
-            } as unknown as OrchestrationV2ThreadProjection),
-          dispatch: (command) =>
-            Effect.sync(() => {
-              dispatched.push(command.type);
-              return { sequence: 1, storedEvents: [] } as never;
-            }),
-        }),
-      ),
-      Layer.provide(ServerSettings.layerTest()),
-      Layer.provide(layerReceiptsTest),
-    );
+    const layerTest = ThreadManagementService.layer
+      .pipe(Layer.provide(ClaudeCloudExecutionPolicyTestkit.layer))
+      .pipe(
+        Layer.provide(Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({})),
+        Layer.provide(
+          Layer.mock(Orchestrator.OrchestratorV2)({
+            getThreadEventSequence: () => Effect.succeed(0),
+            restartContinuationPending: () => Effect.succeed(false),
+            getThreadRecords: () =>
+              Effect.succeed({
+                thread: { id: threadId, projectId, deletedAt: null },
+                runs: [{ id: runId, status }],
+              } as unknown as OrchestrationV2ThreadProjection),
+            dispatch: (command) =>
+              Effect.sync(() => {
+                dispatched.push(command.type);
+                return { sequence: 1, storedEvents: [] } as never;
+              }),
+          }),
+        ),
+        Layer.provide(ServerSettings.layerTest()),
+        Layer.provide(layerReceiptsTest),
+      );
     const service = yield* ThreadManagementService.ThreadManagementService.pipe(
       Effect.provide(layerTest),
     );
@@ -1075,5 +1099,85 @@ it.effect.each([
     yield* service.settleAfterRun({ projectId, threadId, runId });
 
     expect(dispatched).toEqual(settles ? ["thread.settle"] : []);
+  }),
+);
+
+it.effect("serializes guarded delegated-task admission at four active children", () =>
+  Effect.gen(function* () {
+    const parentId = ThreadId.make("guarded-parent");
+    const instanceId = ProviderInstanceId.make("codex");
+    const selection = { instanceId, model: "gpt-6.1-sol" };
+    const active = yield* Ref.make(3);
+    let accepted = 0;
+    const layerTest = ThreadManagementService.layer.pipe(
+      Layer.provide(
+        Layer.mergeAll(
+          layerReceiptsTest,
+          ServerSettings.layerTest(),
+          Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({}),
+          Layer.mock(ClaudeCloudExecutionPolicy.ClaudeCloudExecutionPolicy)({
+            admit: () =>
+              Effect.succeed({
+                rootThreadId: parentId,
+                cloudInstanceId: ProviderInstanceId.make("cloud"),
+                organizationId: "org",
+                depth: 0,
+              }),
+            inherit: () => Effect.void,
+          }),
+          Layer.mock(Orchestrator.OrchestratorV2)({
+            getThreadRecords: () =>
+              Ref.get(active).pipe(
+                Effect.map(
+                  (count) =>
+                    ({
+                      thread: {
+                        id: parentId,
+                        projectId: ProjectId.make("project"),
+                        modelSelection: selection,
+                        worktreePath: null,
+                      },
+                      subagents: Array.from({ length: count }, () => ({
+                        origin: "app_owned",
+                        status: "running",
+                      })),
+                    }) as never,
+                ),
+              ),
+            dispatch: () =>
+              Ref.update(active, (count) => count + 1).pipe(
+                Effect.map(() => {
+                  accepted++;
+                  return { sequence: accepted, storedEvents: [] };
+                }),
+              ),
+          }),
+        ),
+      ),
+    );
+    yield* Effect.gen(function* () {
+      const threads = yield* ThreadManagementService.ThreadManagementService;
+      const requests = [1, 2].map((index) =>
+        threads
+          .dispatch({
+            type: "delegated_task.request",
+            commandId: CommandId.make(`guarded-admission-${index}`),
+            parentThreadId: parentId,
+            parentRunId: RunId.make("parent-run"),
+            parentNodeId: NodeId.make("parent-node"),
+            task: "Small child",
+            modelSelection: selection,
+            runtimeMode: "full-access",
+            interactionMode: "default",
+            createdBy: "agent",
+            creationSource: "mcp",
+          })
+          .pipe(Effect.result),
+      );
+      const results = yield* Effect.all(requests, { concurrency: "unbounded" });
+      expect(results.filter((result) => result._tag === "Success")).toHaveLength(1);
+      expect(results.filter((result) => result._tag === "Failure")).toHaveLength(1);
+      expect(accepted).toBe(1);
+    }).pipe(Effect.provide(layerTest));
   }),
 );

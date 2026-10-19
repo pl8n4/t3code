@@ -5,6 +5,8 @@ import {
   type ThreadId,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
+import * as Option from "effect/Option";
+import * as ClaudeCloudExecutionPolicy from "../provider/ClaudeCloudExecutionPolicy.ts";
 import * as Ref from "effect/Ref";
 import * as Struct from "effect/Struct";
 import type * as Layer from "effect/Layer";
@@ -243,17 +245,64 @@ export class HandlersLayer<Tools extends Record<string, Tool.Any>, EX = never, R
   }
 }
 
-const checkedHandlers = <Handlers>(declarations: Declarations<Handlers>): Handlers =>
+const verifyDeclarations = <Handlers>(declarations: Declarations<Handlers>): Handlers =>
   Struct.map(declarations, checkedHandler);
+
+const guardHandler =
+  <A, E, R>(
+    name: string,
+    handler: (...args: ReadonlyArray<unknown>) => Effect.Effect<A, E, R>,
+    policy: ClaudeCloudExecutionPolicy.ClaudeCloudExecutionPolicy["Service"],
+  ) =>
+  (...args: ReadonlyArray<unknown>) =>
+    Effect.serviceOption(McpInvocationContext.McpInvocationContext).pipe(
+      Effect.flatMap((scope) =>
+        Option.isSome(scope) && scope.value.thread !== undefined
+          ? policy.guardTool(scope.value.thread.threadId, name).pipe(
+              Effect.mapError(
+                (cause) =>
+                  new OrchestratorMcpFailure({
+                    code: "capability_denied",
+                    message: cause.message,
+                  }),
+              ),
+            )
+          : Effect.void,
+      ),
+      Effect.flatMap(() => handler(...args)),
+    );
+
+const checkedHandlers = <Handlers>(
+  verified: Handlers,
+  policy: ClaudeCloudExecutionPolicy.ClaudeCloudExecutionPolicy["Service"],
+): Handlers =>
+  Object.fromEntries(
+    Object.entries(
+      verified as Record<
+        string,
+        (...args: ReadonlyArray<unknown>) => Effect.Effect<unknown, unknown>
+      >,
+    ).map(([name, handler]) => [name, guardHandler(name, handler, policy)]),
+  ) as Handlers;
 
 export const toLayer = <Tools extends Record<string, Tool.Any>, EX = never, RX = never>(
   toolkit: Toolkit.Toolkit<Tools>,
   build: Handlers<Tools> | Effect.Effect<Handlers<Tools>, EX, RX>,
-): HandlersLayer<Tools, EX, Exclude<RX, Scope.Scope>> =>
-  handlersLayer(
+): HandlersLayer<
+  Tools,
+  EX,
+  Exclude<RX, Scope.Scope> | ClaudeCloudExecutionPolicy.ClaudeCloudExecutionPolicy
+> => {
+  const verified = Effect.isEffect(build)
+    ? Effect.map(build, verifyDeclarations<Toolkit.HandlersFrom<Tools>>)
+    : Effect.succeed(verifyDeclarations<Toolkit.HandlersFrom<Tools>>(build));
+  return handlersLayer(
     toolkit.toLayer(
-      Effect.isEffect(build)
-        ? Effect.map(build, checkedHandlers<Toolkit.HandlersFrom<Tools>>)
-        : checkedHandlers(build),
+      Effect.gen(function* () {
+        const policy = yield* ClaudeCloudExecutionPolicy.ClaudeCloudExecutionPolicy;
+        const handlers = yield* verified;
+        return checkedHandlers<Toolkit.HandlersFrom<Tools>>(handlers, policy);
+      }),
     ),
   );
+};

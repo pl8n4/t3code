@@ -1,3 +1,4 @@
+import * as ClaudeCloudExecutionPolicyTestkit from "../provider/ClaudeCloudExecutionPolicy.testkit.ts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { describe, expect, it } from "@effect/vitest";
 import { AjvJsonSchemaValidator } from "@modelcontextprotocol/sdk/validation/ajv";
@@ -84,6 +85,7 @@ import { delegatedTaskRun, hasPendingChildRuns } from "./OrchestratorMcpService.
 import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 
 const layerOrchestratorToolkit = McpHttpServer.layerOrchestratorToolkit.pipe(
+  Layer.provide(ClaudeCloudExecutionPolicyTestkit.layer),
   Layer.provide(Layer.mock(ThreadLaunchService.ThreadLaunchService)({})),
   Layer.provide(Layer.mock(GitVcsDriver.GitVcsDriver)({})),
 );
@@ -612,13 +614,15 @@ describe("orchestrator MCP toolkit", () => {
           ).pipe(Layer.provide(layerContinuationProbe));
           const layerOrchestration = Layer.merge(
             layerOrchestrator,
-            ThreadManagementService.layer.pipe(
-              Layer.provide(layerOrchestrator),
-              Layer.provide(ServerSettings.layerTest()),
-              Layer.provide(
-                CommandReceiptStore.layer.pipe(Layer.provide(SqlitePersistence.layerMemory)),
+            ThreadManagementService.layer
+              .pipe(Layer.provide(ClaudeCloudExecutionPolicyTestkit.layer))
+              .pipe(
+                Layer.provide(layerOrchestrator),
+                Layer.provide(ServerSettings.layerTest()),
+                Layer.provide(
+                  CommandReceiptStore.layer.pipe(Layer.provide(SqlitePersistence.layerMemory)),
+                ),
               ),
-            ),
           );
           const layerProviderRegistry = ProviderRegistryMock.layer([
             makeProviderSnapshot({
@@ -679,7 +683,9 @@ describe("orchestrator MCP toolkit", () => {
           );
           const layerTest = Layer.merge(
             layerOrchestratorToolkit,
-            McpHttpServer.layerThreadToolkit,
+            McpHttpServer.layerThreadToolkit.pipe(
+              Layer.provide(ClaudeCloudExecutionPolicyTestkit.layer),
+            ),
           ).pipe(
             Layer.provideMerge(McpServer.McpServer.layer),
             Layer.provideMerge(layerOrchestration),
@@ -3780,13 +3786,15 @@ describe("orchestrator MCP toolkit", () => {
         );
         const layerOrchestration = Layer.merge(
           layerOrchestrator,
-          ThreadManagementService.layer.pipe(
-            Layer.provide(layerOrchestrator),
-            Layer.provide(ServerSettings.layerTest()),
-            Layer.provide(
-              CommandReceiptStore.layer.pipe(Layer.provide(SqlitePersistence.layerMemory)),
+          ThreadManagementService.layer
+            .pipe(Layer.provide(ClaudeCloudExecutionPolicyTestkit.layer))
+            .pipe(
+              Layer.provide(layerOrchestrator),
+              Layer.provide(ServerSettings.layerTest()),
+              Layer.provide(
+                CommandReceiptStore.layer.pipe(Layer.provide(SqlitePersistence.layerMemory)),
+              ),
             ),
-          ),
         );
         const layerProviderRegistry = ProviderRegistryMock.layer([
           makeProviderSnapshot({

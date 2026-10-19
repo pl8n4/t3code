@@ -1,3 +1,4 @@
+import * as ClaudeCloudExecutionPolicyTestkit from "../../../provider/ClaudeCloudExecutionPolicy.testkit.ts";
 import { expect, it } from "@effect/vitest";
 import {
   EnvironmentId,
@@ -88,9 +89,9 @@ it.effect("attributes a launched thread's first message to the calling thread", 
     );
     const toolkit = yield* ProjectToolkit.pipe(
       Effect.provide(
-        McpToolAccess.HandlersLayer.layer(ProjectHandlers.layer).pipe(
-          Layer.provide(layerDependencies),
-        ),
+        McpToolAccess.HandlersLayer.layer(ProjectHandlers.layer)
+          .pipe(Layer.provide(ClaudeCloudExecutionPolicyTestkit.layer))
+          .pipe(Layer.provide(layerDependencies)),
       ),
     );
     const result = yield* toolkit
@@ -163,9 +164,9 @@ it.effect("launches a scratch thread into the Scratch project", () =>
     );
     const toolkit = yield* ProjectToolkit.pipe(
       Effect.provide(
-        McpToolAccess.HandlersLayer.layer(ProjectHandlers.layer).pipe(
-          Layer.provide(layerDependencies),
-        ),
+        McpToolAccess.HandlersLayer.layer(ProjectHandlers.layer)
+          .pipe(Layer.provide(ClaudeCloudExecutionPolicyTestkit.layer))
+          .pipe(Layer.provide(layerDependencies)),
       ),
     );
     const handle = (params: Parameters<typeof toolkit.handle<"t3_thread_launch">>[1]) =>
@@ -267,9 +268,9 @@ it.effect("starts a project from just a title when workspaceRoot is omitted", ()
     );
     const toolkit = yield* ProjectToolkit.pipe(
       Effect.provide(
-        McpToolAccess.HandlersLayer.layer(ProjectHandlers.layer).pipe(
-          Layer.provide(layerDependencies),
-        ),
+        McpToolAccess.HandlersLayer.layer(ProjectHandlers.layer)
+          .pipe(Layer.provide(ClaudeCloudExecutionPolicyTestkit.layer))
+          .pipe(Layer.provide(layerDependencies)),
       ),
     );
     const handle = (params: Parameters<typeof toolkit.handle<"t3_project_create">>[1]) =>
@@ -380,7 +381,9 @@ it.effect("a client launches at its ceiling with the project's default model", (
     });
     const toolkit = yield* ProjectToolkit.pipe(
       Effect.provide(
-        McpToolAccess.HandlersLayer.layer(ProjectHandlers.layer).pipe(Layer.provide(dependencies)),
+        McpToolAccess.HandlersLayer.layer(ProjectHandlers.layer)
+          .pipe(Layer.provide(ClaudeCloudExecutionPolicyTestkit.layer))
+          .pipe(Layer.provide(dependencies)),
       ),
     );
     const handle = (params: Parameters<typeof toolkit.handle<"t3_thread_launch">>[1]) =>
@@ -429,7 +432,9 @@ it.effect("a launch binds only an existing checkout that is one of the project's
     }
     const toolkit = yield* ProjectToolkit.pipe(
       Effect.provide(
-        McpToolAccess.HandlersLayer.layer(ProjectHandlers.layer).pipe(Layer.provide(dependencies)),
+        McpToolAccess.HandlersLayer.layer(ProjectHandlers.layer)
+          .pipe(Layer.provide(ClaudeCloudExecutionPolicyTestkit.layer))
+          .pipe(Layer.provide(dependencies)),
       ),
     );
     const launchInto = (worktreePath: string) =>
@@ -481,7 +486,9 @@ it.effect("a launch into a new worktree creates nothing when its base ref has no
     });
     const toolkit = yield* ProjectToolkit.pipe(
       Effect.provide(
-        McpToolAccess.HandlersLayer.layer(ProjectHandlers.layer).pipe(Layer.provide(dependencies)),
+        McpToolAccess.HandlersLayer.layer(ProjectHandlers.layer)
+          .pipe(Layer.provide(ClaudeCloudExecutionPolicyTestkit.layer))
+          .pipe(Layer.provide(dependencies)),
       ),
     );
     const launchFrom = (baseRef: string) =>

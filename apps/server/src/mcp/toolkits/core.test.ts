@@ -1,3 +1,4 @@
+import * as ClaudeCloudExecutionPolicyTestkit from "../../provider/ClaudeCloudExecutionPolicy.testkit.ts";
 import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { expect, it } from "@effect/vitest";
@@ -61,10 +62,12 @@ import { ThreadToolkit } from "./thread/tools.ts";
 import { WorktreeToolkit } from "./worktree/tools.ts";
 import { DeviceToolkit } from "./device/tools.ts";
 
-const layerOrchestratorToolkit = McpHttpServer.layerOrchestratorToolkit.pipe(
-  Layer.provide(Layer.mock(ThreadLaunchService.ThreadLaunchService)({})),
-  Layer.provide(Layer.mock(GitVcsDriver.GitVcsDriver)({})),
-);
+const layerOrchestratorToolkit = McpHttpServer.layerOrchestratorToolkit
+  .pipe(Layer.provide(ClaudeCloudExecutionPolicyTestkit.layer))
+  .pipe(
+    Layer.provide(Layer.mock(ThreadLaunchService.ThreadLaunchService)({})),
+    Layer.provide(Layer.mock(GitVcsDriver.GitVcsDriver)({})),
+  );
 
 // Effect returns a declared tool failure as `isError` with its encoded payload
 // as JSON text, never as `structuredContent`.
@@ -84,10 +87,12 @@ import { htmlRenderFromToolItem } from "@t3tools/shared/toolOutput";
 const decodeMcpAttachmentInput = Schema.decodeUnknownEffect(McpAttachmentInput);
 const decodeThreadReadResult = Schema.decodeUnknownEffect(OrchestratorMcpThreadReadResult);
 
-const layerThreadToolkit = McpHttpServer.layerThreadToolkit.pipe(
-  Layer.provide(Layer.mock(ThreadSearch.ThreadSearch)({})),
-  Layer.provide(Layer.mock(ScheduledTaskService.ScheduledTaskService)({})),
-);
+const layerThreadToolkit = McpHttpServer.layerThreadToolkit
+  .pipe(Layer.provide(ClaudeCloudExecutionPolicyTestkit.layer))
+  .pipe(
+    Layer.provide(Layer.mock(ThreadSearch.ThreadSearch)({})),
+    Layer.provide(Layer.mock(ScheduledTaskService.ScheduledTaskService)({})),
+  );
 
 it("publishes unique tool names with reference-free object-root inputs", () => {
   const names = new Set<string>();
@@ -288,25 +293,27 @@ it.effect("returns an HTML render reference that Codex and Claude tool rows both
     ).toEqual(reference);
   }).pipe(
     Effect.provide(
-      McpHttpServer.layerHtmlToolkit.pipe(
-        Layer.provideMerge(McpServer.McpServer.layer),
-        Layer.provide(PreviewBrowser.layer),
-        Layer.provide(ServerConfig.layerTest(process.cwd(), { prefix: "t3-mcp-html-render-" })),
-        Layer.provide(NodeServices.layer),
-        Layer.provide(FetchHttpClient.layer),
-        Layer.provide(
-          Layer.mock(ThreadManagement.ThreadManagementService)({
-            getThreadShell: () =>
-              Effect.succeed({
-                id: threadId,
-                deletedAt: null,
-                archivedAt: null,
-                activeRunId: RunId.make("mcp-core-run"),
-                providerInstanceId: ProviderInstanceId.make("codex"),
-              } as OrchestrationV2ThreadShell),
-          }),
+      McpHttpServer.layerHtmlToolkit
+        .pipe(Layer.provide(ClaudeCloudExecutionPolicyTestkit.layer))
+        .pipe(
+          Layer.provideMerge(McpServer.McpServer.layer),
+          Layer.provide(PreviewBrowser.layer),
+          Layer.provide(ServerConfig.layerTest(process.cwd(), { prefix: "t3-mcp-html-render-" })),
+          Layer.provide(NodeServices.layer),
+          Layer.provide(FetchHttpClient.layer),
+          Layer.provide(
+            Layer.mock(ThreadManagement.ThreadManagementService)({
+              getThreadShell: () =>
+                Effect.succeed({
+                  id: threadId,
+                  deletedAt: null,
+                  archivedAt: null,
+                  activeRunId: RunId.make("mcp-core-run"),
+                  providerInstanceId: ProviderInstanceId.make("codex"),
+                } as OrchestrationV2ThreadShell),
+            }),
+          ),
         ),
-      ),
     ),
   ),
 );
@@ -868,13 +875,15 @@ it.effect("only the caller that prepared a pending upload can discard it", () =>
     expect(discarded.isError).toBe(false);
   }).pipe(
     Effect.provide(
-      McpHttpServer.layerAttachmentToolkit.pipe(
-        Layer.provideMerge(McpServer.McpServer.layer),
-        Layer.provide(McpToolAccessTestkit.liveThreadsLayer),
-        Layer.provide(ServerSecretStore.layer),
-        Layer.provide(ServerConfig.layerTest(process.cwd(), { prefix: "t3-mcp-attachment-" })),
-        Layer.provide(NodeServices.layer),
-      ),
+      McpHttpServer.layerAttachmentToolkit
+        .pipe(Layer.provide(ClaudeCloudExecutionPolicyTestkit.layer))
+        .pipe(
+          Layer.provideMerge(McpServer.McpServer.layer),
+          Layer.provide(McpToolAccessTestkit.liveThreadsLayer),
+          Layer.provide(ServerSecretStore.layer),
+          Layer.provide(ServerConfig.layerTest(process.cwd(), { prefix: "t3-mcp-attachment-" })),
+          Layer.provide(NodeServices.layer),
+        ),
     ),
   ),
 );

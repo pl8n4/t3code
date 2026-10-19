@@ -2,6 +2,7 @@ import { modelSelectionsEqual } from "@t3tools/shared/model";
 import { projectComposerContextForProvider } from "@t3tools/shared/composerContextReferences";
 import {
   CommandId,
+  ClaudeSettings,
   latestProviderTurnForAttempt,
   type OrchestrationV2DomainEvent,
   type OrchestrationV2ExecutionNode,
@@ -22,7 +23,6 @@ import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as Predicate from "effect/Predicate";
 import * as Schema from "effect/Schema";
-import * as HostProcess from "@t3tools/shared/HostProcess";
 
 import * as ServerConfig from "../config.ts";
 import { withWorkspaceLease } from "../workspace/workspaceLease.ts";
@@ -30,6 +30,7 @@ import * as GitWorkflowService from "../git/GitWorkflowService.ts";
 import * as ProjectService from "../project/ProjectService.ts";
 import * as ProviderAuthService from "../provider/ProviderAuthService.ts";
 import * as ServerSettings from "../serverSettings.ts";
+import * as ClaudeCloudExecutionPolicy from "../provider/ClaudeCloudExecutionPolicy.ts";
 import { makeIsManagedWorktreePath } from "../worktreesDirectory.ts";
 import * as EventSink from "./EventSink.ts";
 import * as ContextHandoffService from "./ContextHandoffService.ts";
@@ -65,6 +66,7 @@ export class ProviderTurnStartError extends Schema.TaggedError<ProviderTurnStart
 ) {}
 
 const isProviderTurnStartError = Schema.is(ProviderTurnStartError);
+const decodeClaudeSettings = Schema.decodeUnknownOption(ClaudeSettings);
 
 /** Claude refuses to replace a process running background work before it reads the prompt. */
 const refusedBeforePrompt = (error: unknown): boolean =>
@@ -101,6 +103,7 @@ export const layer: Layer.Layer<
   | ProviderSessionManager.ProviderSessionManagerV2
   | RunExecutionService.RunExecutionServiceV2
   | RuntimePolicy.RuntimePolicyV2
+  | ClaudeCloudExecutionPolicy.ClaudeCloudExecutionPolicy
 > = Layer.effect(
   ProviderTurnStartServiceV2,
   Effect.gen(function* () {
@@ -109,7 +112,6 @@ export const layer: Layer.Layer<
     const idAllocator = yield* IdAllocator.IdAllocatorV2;
     const fileSystem = yield* FileSystem.FileSystem;
     const path = yield* Path.Path;
-    const serverConfig = yield* ServerConfig.ServerConfig;
     const serverSettings = yield* ServerSettings.ServerSettingsService;
     const gitWorkflow = yield* GitWorkflowService.GitWorkflowService;
     const projects = yield* ProjectService.ProjectService;
@@ -118,6 +120,7 @@ export const layer: Layer.Layer<
     const providerSessions = yield* ProviderSessionManager.ProviderSessionManagerV2;
     const runExecution = yield* RunExecutionService.RunExecutionServiceV2;
     const runtimePolicy = yield* RuntimePolicy.RuntimePolicyV2;
+    const cloudExecutionPolicy = yield* ClaudeCloudExecutionPolicy.ClaudeCloudExecutionPolicy;
     const isManagedWorktreePath = yield* makeIsManagedWorktreePath;
 
     // These callbacks outlive startup while a run drains background work. Build
@@ -520,25 +523,53 @@ export const layer: Layer.Layer<
       const existingSessionProjection = projection.providerSessions.find(
         (candidate) => candidate.id === providerSessionId,
       );
+      const providerEntry = (yield* serverSettings.getSettings).providerInstances[
+        run.providerInstanceId
+      ];
+      const cloudSettings =
+        providerEntry?.driver === "claudeAgent"
+          ? decodeClaudeSettings(providerEntry.config ?? {})
+          : Option.none();
+      const explicitCloudRecovery =
+        Option.isSome(cloudSettings) &&
+        cloudSettings.value.cloudFreeCreditsOnly &&
+        message.attachments.length === 0 &&
+        message.text === "/recover";
+      const cloudContinuation =
+        Option.isSome(cloudSettings) &&
+        cloudSettings.value.cloudFreeCreditsOnly &&
+        (run.restartContinuationOfRunId !== undefined || explicitCloudRecovery);
+      const executionTarget = {
+        threadId: projection.thread.id,
+        modelSelection: run.modelSelection,
+        ...(resolvedRuntimePolicy.cwd === null || resolvedRuntimePolicy.cwd === undefined
+          ? {}
+          : { cwd: resolvedRuntimePolicy.cwd }),
+      };
       const sessionResult = yield* Effect.result(
-        providerSessions.open({
-          threadId: projection.thread.id,
-          providerSessionId,
-          modelSelection: run.modelSelection,
-          runtimePolicy: resolvedRuntimePolicy,
-          ...(existingSessionProjection === undefined
-            ? {}
-            : { resumeFromSession: existingSessionProjection }),
-          ...(providerThread.nativeThreadRef?.nativeId == null
-            ? {}
-            : { initialNativeThreadId: providerThread.nativeThreadRef.nativeId }),
-          ...(providerThread.nativeMetadata?.itemIdentityVersion === undefined
-            ? {}
-            : {
-                initialProviderItemIdentityVersion:
-                  providerThread.nativeMetadata.itemIdentityVersion,
-              }),
-        }),
+        cloudExecutionPolicy.admit(executionTarget).pipe(
+          Effect.flatMap((binding) =>
+            providerSessions.open({
+              ...(binding === undefined ? {} : { guardedExecution: true as const }),
+              threadId: projection.thread.id,
+              providerSessionId,
+              modelSelection: run.modelSelection,
+              runtimePolicy: resolvedRuntimePolicy,
+              ...(existingSessionProjection === undefined
+                ? {}
+                : { resumeFromSession: existingSessionProjection }),
+              ...(providerThread.nativeThreadRef?.nativeId == null
+                ? {}
+                : { initialNativeThreadId: providerThread.nativeThreadRef.nativeId }),
+              ...(providerThread.nativeMetadata?.itemIdentityVersion === undefined
+                ? {}
+                : {
+                    initialProviderItemIdentityVersion:
+                      providerThread.nativeMetadata.itemIdentityVersion,
+                  }),
+            }),
+          ),
+        ),
       );
       const settleStartFailure = (failed: {
         readonly signal: string;
@@ -931,10 +962,12 @@ export const layer: Layer.Layer<
       const routableSubagents = projection.subagents.filter((subagent) =>
         RunExecutionService.canRouteRelatedSubagent(subagent.status),
       );
-      const userText = projectComposerContextForProvider({
-        text: message.text,
-        records: message.context?.records ?? [],
-      });
+      const userText = explicitCloudRecovery
+        ? message.text
+        : projectComposerContextForProvider({
+            text: message.text,
+            records: message.context?.records ?? [],
+          });
       // Delivered once: this run's provider turn marks the work as told. A
       // restart continuation is prompted by its own text or resumes natively.
       const noteContinuation = isRestartNoteContinuation(
@@ -1152,7 +1185,7 @@ export const layer: Layer.Layer<
             .join("\n\n");
           const { restartContinuationOfRunId: _resumedRunId, ...promptedInput } = turnInput;
           yield* start({
-            ...(noteContinuation ? promptedInput : turnInput),
+            ...(noteContinuation && !cloudContinuation ? promptedInput : turnInput),
             message: {
               ...turnInput.message,
               text: context === "" ? userText : `${context}\n\nUser message:\n${userText}`,
@@ -1195,13 +1228,38 @@ export const layer: Layer.Layer<
                 }),
           ),
         );
-      const deliverySession =
-        effectiveHandoffs.length === 0 &&
-        missedItems.length === 0 &&
-        restartNote === "" &&
-        !noteContinuation
+      const unguardedDeliverySession =
+        cloudContinuation ||
+        (effectiveHandoffs.length === 0 &&
+          missedItems.length === 0 &&
+          restartNote === "" &&
+          !noteContinuation)
           ? session
           : makeDeliverySession(session, startWithHandoffs);
+      const guardTurn = (operation: () => ReturnType<typeof session.startTurn>) =>
+        cloudExecutionPolicy.admit(executionTarget).pipe(
+          Effect.mapError(
+            (cause) =>
+              new ProviderAdapter.ProviderAdapterTurnStartError({
+                driver: session.driver,
+                threadId: projection.thread.id,
+                providerThreadId: providerThread.id,
+                runId: run.id,
+                cause,
+              }),
+          ),
+          Effect.flatMap(operation),
+        );
+      const deliverySession: typeof session = {
+        ...unguardedDeliverySession,
+        startTurn: (input) => guardTurn(() => unguardedDeliverySession.startTurn(input)),
+        ...(unguardedDeliverySession.compactThread === undefined
+          ? {}
+          : {
+              compactThread: (input: Parameters<typeof session.startTurn>[0]) =>
+                guardTurn(() => unguardedDeliverySession.compactThread!(input)),
+            }),
+      };
       return runExecution.startRootRun({
         commandId: CommandId.make(`command:effect:provider-turn.start:${run.id}`),
         appThread: projection.thread,

@@ -1,3 +1,4 @@
+import * as ClaudeCloudExecutionPolicyTestkit from "../../../provider/ClaudeCloudExecutionPolicy.testkit.ts";
 import * as Orchestrator from "../../../orchestration-v2/Orchestrator.ts";
 import * as ProjectionStore from "../../../orchestration-v2/ProjectionStore.ts";
 import * as DeviceService from "../../../device/DeviceService.ts";
@@ -91,7 +92,9 @@ const decodeToolsListPayload = Schema.decodeUnknownEffect(ToolsListPayload);
 it.effect("production mcp layer lists worktree tools over http", () =>
   Effect.scoped(
     Effect.gen(function* () {
-      const layerRoutes = McpHttpServer.layer.pipe(Layer.provide(McpSessionRegistry.layer));
+      const layerRoutes = McpHttpServer.layer
+        .pipe(Layer.provide(ClaudeCloudExecutionPolicyTestkit.layer))
+        .pipe(Layer.provide(McpSessionRegistry.layer));
       yield* HttpRouter.serve(layerRoutes, {
         disableListenLog: true,
         disableLogger: true,

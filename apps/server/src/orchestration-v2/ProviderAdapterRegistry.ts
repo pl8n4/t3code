@@ -74,6 +74,9 @@ export const layerFromProviderInstanceRegistry: Layer.Layer<
   ProviderAdapterRegistryV2,
   Effect.gen(function* () {
     const instances = yield* ProviderInstanceRegistry.ProviderInstanceRegistry;
+    // Session provenance uses adapter identity. Cache the auth gate for each
+    // hydrated instance so repeated lookups preserve that identity.
+    const guardedAdapters = new WeakMap<object, ProviderAdapter.ProviderAdapterV2["Service"]>();
     return ProviderAdapterRegistryV2.of({
       get: (instanceId) =>
         instances.getInstance(instanceId).pipe(
@@ -83,7 +86,9 @@ export const layerFromProviderInstanceRegistry: Layer.Layer<
             const adapter = instance.orchestrationAdapter;
             const auth = instance.auth;
             if (!auth) return Effect.succeed(adapter);
-            return Effect.succeed({
+            const cached = guardedAdapters.get(instance);
+            if (cached !== undefined) return Effect.succeed(cached);
+            const guarded = {
               ...adapter,
               openSession: (input) => {
                 const open = Effect.gen(function* () {
@@ -129,7 +134,9 @@ export const layerFromProviderInstanceRegistry: Layer.Layer<
                   ),
                 );
               },
-            } satisfies ProviderAdapter.ProviderAdapterV2["Service"]);
+            } satisfies ProviderAdapter.ProviderAdapterV2["Service"];
+            guardedAdapters.set(instance, guarded);
+            return Effect.succeed(guarded);
           }),
         ),
       list: () =>

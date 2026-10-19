@@ -410,6 +410,7 @@ export interface ClaudeAgentSdkQueryOpenInput {
   readonly threadId: ThreadId;
   readonly providerSessionId: OrchestrationV2ProviderSession["id"];
   readonly durableCloudSequence?: string;
+  readonly recoverPendingCloudTurn?: boolean;
 }
 
 export interface ClaudeAgentSdkQuerySession {
@@ -419,6 +420,9 @@ export interface ClaudeAgentSdkQuerySession {
     durableCloudSequence?: string,
   ) => Effect.Effect<void, ClaudeAgentSdkQueryRunnerError>;
   readonly cloudEventSequence?: (message: SDKMessage) => string | undefined;
+  readonly cloudEventWasDurable?: (message: SDKMessage) => boolean;
+  readonly pendingCloudTurn?: { readonly promptUuid: string } | undefined;
+  readonly resumePendingCloudTurn?: Effect.Effect<void, ClaudeAgentSdkQueryRunnerError>;
   readonly setModel: (model: string) => Effect.Effect<void, ClaudeAgentSdkQueryRunnerError>;
   readonly applyFlagSettings: (
     settings: ClaudeFlagSettings,
@@ -2678,6 +2682,14 @@ function isClaudeProviderContinuationTurn(
   return input.message.createdBy === "agent" && input.message.creationSource === "provider";
 }
 
+function isClaudeCloudRecoveryCommand(input: ProviderAdapter.ProviderAdapterV2TurnInput): boolean {
+  return (
+    input.message.createdBy === "user" &&
+    input.message.attachments.length === 0 &&
+    input.message.text.trim() === "/recover"
+  );
+}
+
 function isClaudePromptEchoGatedFrame(message: SDKMessage): boolean {
   switch (message.type) {
     case "assistant":
@@ -3008,7 +3020,7 @@ interface ActiveClaudeTurnContext {
   readonly subagentsByTaskId: Map<string, ActiveClaudeSubagent>;
   readonly subagentsByToolUseId: Map<string, ActiveClaudeSubagent>;
   readonly subagentNodesByTaskId: Map<string, OrchestrationV2ExecutionNode["id"]>;
-  readonly promptUuid: string | null;
+  promptUuid: string | null;
   promptEcho: "pending" | "confirmed";
   promptStarted: boolean;
   gatedFramesBeforeEcho: number;
@@ -3711,8 +3723,29 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
         const runtimeContext = yield* Effect.context<never>();
         const runPromise = Effect.runPromiseWith(runtimeContext);
 
-        const emitProviderEvent = (event: ProviderAdapter.ProviderAdapterV2Event) =>
-          Queue.offer(events, event).pipe(Effect.asVoid);
+        let suppressCloudReplayEvents = false;
+        const cloudRecoveryRuns = new Set<RunId>();
+        const emitProviderEvent = (event: ProviderAdapter.ProviderAdapterV2Event) => {
+          if (suppressCloudReplayEvents) return Effect.void;
+          if (
+            event.type === "node.updated" ||
+            event.type === "message.updated" ||
+            event.type === "turn_item.updated"
+          ) {
+            const artifact =
+              event.type === "node.updated"
+                ? event.node
+                : event.type === "message.updated"
+                  ? event.message
+                  : event.turnItem;
+            if (artifact.runId !== null && cloudRecoveryRuns.has(artifact.runId))
+              return Queue.offer(events, {
+                ...event,
+                preserveExistingArtifactOwnership: true,
+              }).pipe(Effect.asVoid);
+          }
+          return Queue.offer(events, event).pipe(Effect.asVoid);
+        };
 
         // Claude emits retry progress but no recovered frame; the next
         // assistant message is the first reliable evidence of recovery.
@@ -8465,6 +8498,13 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                     durableCloudSequence:
                       turnInput.providerThread.nativeMetadata.cloudEventSequence,
                   }),
+              ...(turnInput.restartContinuationOfRunId === undefined &&
+              !(
+                adapterOptions.settings.cloudFreeCreditsOnly &&
+                isClaudeCloudRecoveryCommand(turnInput)
+              )
+                ? {}
+                : { recoverPendingCloudTurn: true }),
             })
             .pipe(
               Effect.onError(() =>
@@ -8522,7 +8562,46 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                   ) {
                     context.permissionMode = message.permissionMode;
                   }
-                  return handleSdkMessage({ query: querySession, message });
+                  return Effect.gen(function* () {
+                    const context = yield* Ref.get(activeTurn);
+                    const alreadyDurable = querySession.cloudEventWasDurable?.(message) === true;
+                    suppressCloudReplayEvents = alreadyDurable;
+                    yield* handleSdkMessage({ query: querySession, message }).pipe(
+                      Effect.ensuring(
+                        Effect.sync(() => {
+                          suppressCloudReplayEvents = false;
+                        }),
+                      ),
+                    );
+                    const sequence = querySession.cloudEventSequence?.(message);
+                    if (
+                      alreadyDurable ||
+                      sequence === undefined ||
+                      context === null ||
+                      !["assistant", "user"].includes(message.type) ||
+                      context.heldRootFrames.includes(message)
+                    )
+                      return;
+                    const remembered = (yield* Ref.get(lastProviderThreadByNativeThread)).get(
+                      context.nativeThreadId,
+                    );
+                    const providerThread = {
+                      ...(remembered ?? context.input.providerThread),
+                      nativeMetadata: {
+                        ...(remembered ?? context.input.providerThread).nativeMetadata,
+                        cloudEventSequence: sequence,
+                      },
+                      updatedAt: yield* DateTime.now,
+                    };
+                    // This follows every artifact from the complete SDK snapshot. Only a later
+                    // persisted projection of this event may prune the recovery journal.
+                    yield* rememberProviderThread(providerThread);
+                    yield* emitProviderEvent({
+                      type: "provider_thread.updated",
+                      driver: CLAUDE_PROVIDER,
+                      providerThread,
+                    });
+                  });
                 }),
               ),
             ),
@@ -8560,6 +8639,18 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
 
         const startTurn = Effect.fn("ClaudeAdapterV2.startTurn")(
           function* (turnInput: ProviderAdapter.ProviderAdapterV2TurnInput) {
+            const cloudRecoveryCommand =
+              adapterOptions.settings.cloudFreeCreditsOnly &&
+              isClaudeCloudRecoveryCommand(turnInput);
+            if (
+              adapterOptions.settings.cloudFreeCreditsOnly &&
+              /^\/recover(?:\s|$)/.test(turnInput.message.text.trim()) &&
+              !cloudRecoveryCommand
+            )
+              return yield* new ProviderAdapter.ProviderAdapterProtocolError({
+                driver: CLAUDE_PROVIDER,
+                detail: "Send /recover by itself, without attachments or another task.",
+              });
             const startedAt = yield* DateTime.now;
             const nativeThreadId = yield* getNativeThreadId(turnInput.providerThread);
             const nativeTurnId = `turn:${turnInput.attemptId}`;
@@ -8672,6 +8763,72 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                 }),
               });
             });
+            const recoveryNotice = (pending: boolean) =>
+              Effect.gen(function* () {
+                const nativeItemId = `cloud-recovery:${context.nativeTurnId}`;
+                const now = yield* DateTime.now;
+                yield* emitProviderEvent({
+                  type: "turn_item.updated",
+                  driver: CLAUDE_PROVIDER,
+                  turnItem: {
+                    id: idAllocator.derive.turnItemFromProviderItem({
+                      driver: CLAUDE_PROVIDER,
+                      nativeItemId,
+                    }),
+                    threadId: context.input.threadId,
+                    runId: context.input.runId,
+                    nodeId: context.input.rootNodeId,
+                    providerThreadId: context.input.providerThread.id,
+                    providerTurnId: context.providerTurnId,
+                    nativeItemRef: {
+                      driver: CLAUDE_PROVIDER,
+                      nativeId: nativeItemId,
+                      strength: "strong",
+                    },
+                    parentItemId: null,
+                    ordinal: yield* resolveItemOrdinal(context, nativeItemId),
+                    type: "system_notice",
+                    status: "completed",
+                    title: pending ? "Recovering cloud turn" : "Cloud conversation synchronized",
+                    message: pending
+                      ? "Recovering the previous cloud turn in this thread. No new prompt was sent."
+                      : "There is no pending cloud turn to recover. No new prompt was sent.",
+                    startedAt: now,
+                    completedAt: now,
+                    updatedAt: now,
+                  },
+                });
+              });
+            if (querySession.query.pendingCloudTurn !== undefined) {
+              if (
+                (turnInput.restartContinuationOfRunId === undefined && !cloudRecoveryCommand) ||
+                querySession.query.resumePendingCloudTurn === undefined
+              )
+                return yield* new ProviderAdapter.ProviderAdapterProtocolError({
+                  driver: CLAUDE_PROVIDER,
+                  detail: "Recover the interrupted cloud turn before sending a new task.",
+                });
+              context.promptUuid = querySession.query.pendingCloudTurn.promptUuid;
+              context.promptEcho = "confirmed";
+              cloudRecoveryRuns.add(context.input.runId);
+              yield* sdkMessageLock.withPermits(1)(
+                attachTurn.pipe(
+                  Effect.andThen(recoveryNotice(true)),
+                  Effect.andThen(querySession.query.resumePendingCloudTurn),
+                ),
+              );
+              return;
+            }
+            if (cloudRecoveryCommand) {
+              yield* attachTurn;
+              yield* recoveryNotice(false);
+              yield* finalizeActiveTurn({
+                context,
+                status: "completed",
+                completedAt: yield* DateTime.now,
+              });
+              return;
+            }
             if (userMessage !== null) {
               yield* attachTurn;
               yield* startUserTurnForWakeReports(nativeThreadId);

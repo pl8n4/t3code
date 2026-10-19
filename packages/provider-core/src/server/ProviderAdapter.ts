@@ -103,6 +103,7 @@ export const ProviderAdapterV2Event = Schema.Union([
     type: Schema.Literal("node.updated"),
     driver: ProviderDriverKind,
     node: OrchestrationV2ExecutionNode,
+    preserveExistingArtifactOwnership: Schema.optional(Schema.Literal(true)),
   }),
   Schema.Struct({
     type: Schema.Literal("subagent.updated"),
@@ -113,11 +114,13 @@ export const ProviderAdapterV2Event = Schema.Union([
     type: Schema.Literal("message.updated"),
     driver: ProviderDriverKind,
     message: OrchestrationV2ConversationMessage,
+    preserveExistingArtifactOwnership: Schema.optional(Schema.Literal(true)),
   }),
   Schema.Struct({
     type: Schema.Literal("turn_item.updated"),
     driver: ProviderDriverKind,
     turnItem: OrchestrationV2TurnItem,
+    preserveExistingArtifactOwnership: Schema.optional(Schema.Literal(true)),
   }),
   /**
    * Raw output from a running command. Never persisted: the session manager
@@ -544,6 +547,11 @@ export interface ProviderAdapterV2SessionRuntime {
    * Adapter runtimes may omit this and expose only their single-consumer event stream.
    */
   readonly subscribeEvents?: Effect.Effect<ProviderAdapterV2EventSubscription>;
+  /** Register and verify a thread against the actual runtime's subscription route. */
+  readonly guardSubscriptionThread?: (input: {
+    readonly threadId: ThreadId;
+    readonly cwd: string | null;
+  }) => Effect.Effect<void, ProviderAdapterV2Error>;
   readonly hasPendingBackgroundWork?: Effect.Effect<boolean>;
   /**
    * When present, RunExecutionService uses only this probe (never the

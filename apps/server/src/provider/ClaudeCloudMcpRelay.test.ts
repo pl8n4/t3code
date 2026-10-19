@@ -83,19 +83,16 @@ describe("cloud MCP protocol relay", () => {
       expect(JSON.stringify([handshake, tools])).not.toContain("local-only-secret");
     }),
   );
-  it.effect("hides and blocks tools that could launch billed work or change its provider", () =>
+  it.effect("forwards guarded automation while hiding unreviewed model and settings routes", () =>
     Effect.gen(function* () {
       let calls = 0;
-      let foreignProviderWakeups = 0;
+      const forwarded: string[] = [];
       const client = HttpClient.make((request) => {
         calls++;
         if (request.body._tag !== "Uint8Array") throw new Error("Expected JSON");
         const rpc = decodeJson(new TextDecoder().decode(request.body.body));
-        if (
-          rpc.method === "tools/call" &&
-          (rpc.params as { name?: string })?.name === "watch_pull_request"
-        )
-          foreignProviderWakeups++;
+        if (rpc.method === "tools/call")
+          forwarded.push(String((rpc.params as { name?: string })?.name));
         return Effect.succeed(
           HttpClientResponse.fromWeb(
             request,
@@ -115,7 +112,6 @@ describe("cloud MCP protocol relay", () => {
                             { name: "write_pull_request_guides" },
                             { name: "t3_worktree_handoff" },
                             { name: "watch_pull_request" },
-                            { name: "t3_pending_request_respond" },
                             { name: "future_model_automation" },
                           ],
                         }
@@ -129,16 +125,20 @@ describe("cloud MCP protocol relay", () => {
       );
       if (!relay) throw new Error("Missing relay");
       expect(yield* relay({ jsonrpc: "2.0", id: 3, method: "tools/list" })).toMatchObject({
-        result: { tools: [{ name: "t3_workspace_exec" }, { name: "preview_snapshot" }] },
+        result: {
+          tools: [
+            { name: "t3_workspace_exec" },
+            { name: "preview_snapshot" },
+            { name: "delegate_task" },
+            { name: "watch_pull_request" },
+          ],
+        },
       });
       for (const name of [
-        "delegate_task",
         "create_threads",
         "t3_thread_launch",
         "t3_thread_send",
         "t3_thread_send_attachments",
-        "schedule_task",
-        "update_scheduled_task",
         "run_scheduled_task_now",
         "t3_thread_fork",
         "t3_thread_merge_back",
@@ -148,8 +148,6 @@ describe("cloud MCP protocol relay", () => {
         "t3_environment_preferences_update",
         "write_pull_request_guides",
         "t3_worktree_handoff",
-        "watch_pull_request",
-        "t3_pending_request_respond",
         "t3_thread_organize",
         "t3_queue_edit",
         "future_model_automation",
@@ -170,7 +168,36 @@ describe("cloud MCP protocol relay", () => {
         ).toMatchObject({ id: 4, result: { isError: true } });
       }
       expect(calls).toBe(3);
-      expect(foreignProviderWakeups).toBe(0);
+      for (const name of [
+        "delegate_task",
+        "task_status",
+        "task_cancel",
+        "t3_pending_request_respond",
+        "schedule_task",
+        "update_scheduled_task",
+        "delete_scheduled_task",
+        "watch_pull_request",
+        "unwatch_pull_request",
+        "t3_workspace_job_read",
+        "t3_workspace_job_cancel",
+        "t3_workspace_job_list",
+      ]) {
+        yield* relay({ jsonrpc: "2.0", id: 5, method: "tools/call", params: { name } });
+      }
+      expect(forwarded).toEqual([
+        "delegate_task",
+        "task_status",
+        "task_cancel",
+        "t3_pending_request_respond",
+        "schedule_task",
+        "update_scheduled_task",
+        "delete_scheduled_task",
+        "watch_pull_request",
+        "unwatch_pull_request",
+        "t3_workspace_job_read",
+        "t3_workspace_job_cancel",
+        "t3_workspace_job_list",
+      ]);
     }),
   );
   it.effect("never sends the local credential to an external endpoint", () =>

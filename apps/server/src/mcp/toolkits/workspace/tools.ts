@@ -58,6 +58,24 @@ export const WorkspaceToolkit = Toolkit.make(
     ...shared,
     parameters: Workspace.WorkspaceExec,
     description:
-      "Run a shell command in this T3 thread's actual local workspace, with Full access. Use for rg, git, tests, and patching project files. Cloud Bash executes on a different machine. Output is bounded; redirect large output to a workspace file and read it in chunks. Commands time out after 60 seconds.",
+      "Run a shell command in this T3 thread's actual local workspace, with Full access. Use for rg, git, tests, and patching project files. Cloud Bash executes on a different machine. Commands have no deadline unless timeoutMs is supplied. Short commands return output immediately; longer commands return a durable jobId. Use t3_workspace_job_read to wait for status and page output, and t3_workspace_job_cancel to stop a job. requestId makes retries return the same job instead of repeating the command. Jobs survive cloud and server reconnects.",
+  }).annotate(Tool.Destructive, true),
+  Tool.make("t3_workspace_job_read", {
+    ...shared,
+    parameters: Workspace.WorkspaceJobRead,
+    description:
+      "Read a command job's status and bounded stdout/stderr. Offsets are bytes; pass nextStdoutOffset/nextStderrOffset to read subsequent output. waitMs waits up to 30 seconds for completion. An interrupted job has uncertain outcome: inspect its logs and workspace before starting replacement work. Requires the same thread/workspace and Full access.",
+  }).annotate(Tool.Readonly, true),
+  Tool.make("t3_workspace_job_list", {
+    ...shared,
+    parameters: Workspace.WorkspaceJobList,
+    description:
+      "List retained command jobs for this exact thread and current workspace, newest first. Use after reconnecting or losing a command-start response. Requires Full access.",
+  }).annotate(Tool.Readonly, true),
+  Tool.make("t3_workspace_job_cancel", {
+    ...shared,
+    parameters: Workspace.WorkspaceJobId,
+    description:
+      "Request cancellation of a running command job and its process group. Read the job again to confirm its final status. Cancellation does not undo changes already made. Requires the same thread/workspace and Full access.",
   }).annotate(Tool.Destructive, true),
 );

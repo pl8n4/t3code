@@ -70,6 +70,7 @@ const instances = [
 const layerInstanceRegistry = Layer.succeed(ProviderInstanceRegistry.ProviderInstanceRegistry, {
   getInstance: (instanceId) =>
     Effect.succeed(instances.find((instance) => instance.instanceId === instanceId)),
+  getInstanceForConfig: () => Effect.succeed(undefined),
   listInstances: Effect.succeed(instances),
   listUnavailable: Effect.succeed([]),
   streamChanges: Stream.empty,
@@ -247,6 +248,7 @@ it.effect(
               Layer.mock(ProviderInstanceRegistry.ProviderInstanceRegistry)({
                 getInstance: (id) =>
                   Effect.succeed(related.find((instance) => instance.instanceId === id)),
+                getInstanceForConfig: () => Effect.succeed(undefined),
                 listInstances: Effect.succeed(related),
               }),
             ),
@@ -309,6 +311,7 @@ it.effect("interrupts admitted session startup when a shared peer signs out", ()
             Layer.mock(ProviderInstanceRegistry.ProviderInstanceRegistry)({
               getInstance: (id) =>
                 Effect.succeed(related.find((instance) => instance.instanceId === id)),
+              getInstanceForConfig: () => Effect.succeed(undefined),
               listInstances: Effect.succeed(related),
             }),
           ),
@@ -333,4 +336,38 @@ it.effect("interrupts admitted session startup when a shared peer signs out", ()
     yield* Deferred.await(stopped);
     assert.isTrue(Exit.isFailure(yield* Fiber.await(startup)));
   }).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.effect("preserves auth-wrapped adapter identity until the live instance changes", () =>
+  Effect.gen(function* () {
+    const unused = () => Effect.die("unused auth operation");
+    const auth: ProviderAuthController = {
+      isChangingCredentials: Effect.succeed(false),
+      start: unused,
+      complete: unused,
+      cancel: unused,
+      logout: unused,
+      subscribe: () => Stream.empty,
+    };
+    let current: ProviderInstance = { ...instances[0], auth };
+    const registry = yield* Effect.service(ProviderAdapterRegistry.ProviderAdapterRegistryV2).pipe(
+      Effect.provide(
+        ProviderAdapterRegistry.layerFromProviderInstanceRegistry.pipe(
+          Layer.provide(
+            Layer.mock(ProviderInstanceRegistry.ProviderInstanceRegistry)({
+              getInstance: () => Effect.sync(() => current),
+              getInstanceForConfig: () => Effect.succeed(undefined),
+              listInstances: Effect.sync(() => [current]),
+            }),
+          ),
+        ),
+      ),
+    );
+    const first = yield* registry.get(personalId);
+    assert.strictEqual(yield* registry.get(personalId), first);
+    current = { ...current, orchestrationAdapter: makeAdapter(personalId) };
+    const replacement = yield* registry.get(personalId);
+    assert.notStrictEqual(replacement, first);
+    assert.strictEqual(yield* registry.get(personalId), replacement);
+  }),
 );

@@ -40,6 +40,7 @@ import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
 import * as SqlClient from "effect/sql/SqlClient";
 
+import * as ClaudeCloudExecutionPolicy from "../provider/ClaudeCloudExecutionPolicy.ts";
 import * as ThreadLaunchService from "../orchestration-v2/ThreadLaunchService.ts";
 import * as Metrics from "../observability/Metrics.ts";
 import * as ThreadManagementService from "../orchestration-v2/ThreadManagementService.ts";
@@ -197,7 +198,12 @@ export class ScheduledTaskService extends Context.Service<
     readonly list: () => Effect.Effect<ScheduledTaskListResult, ScheduledTaskError>;
     readonly subscribeList: () => Stream.Stream<ScheduledTaskListResult, ScheduledTaskError>;
     readonly upsert: (
-      input: ScheduledTaskUpsertInput,
+      input: ScheduledTaskUpsertInput & {
+        readonly guardedSource?: {
+          readonly threadId: ThreadId;
+          readonly modelSelection: ScheduledTask["modelSelection"];
+        };
+      },
     ) => Effect.Effect<ScheduledTaskMutationResult, ScheduledTaskError>;
     readonly setEnabled: (
       input: ScheduledTaskSetEnabledInput,
@@ -361,6 +367,7 @@ export const layer = Layer.effect(
     const crypto = yield* Crypto.Crypto;
     const threadLaunch = yield* ThreadLaunchService.ThreadLaunchService;
     const threadManagement = yield* ThreadManagementService.ThreadManagementService;
+    const cloudExecutionPolicy = yield* ClaudeCloudExecutionPolicy.ClaudeCloudExecutionPolicy;
     const secretRequests = yield* SecretRequests.SecretRequests;
     const scheduler = yield* Scheduler.Scheduler;
     const readWebhookOrigin = yield* ScheduledTaskWebhookOrigin;
@@ -1037,6 +1044,10 @@ export const layer = Layer.effect(
           lastRunError: existingTask?.lastRunError ?? null,
           runCount: existingTask?.runCount ?? 0,
         };
+        if (input.guardedSource !== undefined)
+          yield* cloudExecutionPolicy
+            .bindSchedule(input.guardedSource, id)
+            .pipe(Effect.mapError((cause) => taskError(cause.message, { taskId: id })));
         yield* saveTask(task, input.requireExisting === true, webhook);
         yield* notifyChanged;
         return { task: (yield* findTask(id)) ?? task };

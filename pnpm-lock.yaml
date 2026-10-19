@@ -705,6 +705,9 @@ importers:
       proper-lockfile:
         specifier: 4.1.2
         version: 4.1.2
+      smol-toml:
+        specifier: 1.8.0
+        version: 1.8.0
       stream-chain:
         specifier: ^4.2.5
         version: 4.2.5

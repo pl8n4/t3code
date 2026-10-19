@@ -39,7 +39,7 @@ import {
 } from "../ClaudeProvider.ts";
 import { makeManagedServerProvider } from "@t3tools/provider-core/server/managedProvider";
 import * as ModelCatalog from "@t3tools/provider-core/server/ModelCatalog";
-import { resolveClaudeModelCatalog } from "../ClaudeModelCatalog.ts";
+import { resolveClaudeModelCatalog, scopeClaudeCloudModels } from "../ClaudeModelCatalog.ts";
 import {
   defaultProviderContinuationIdentity,
   type ProviderDriver,
@@ -66,7 +66,6 @@ import {
 } from "./ClaudeHome.ts";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import { makeClaudeCloudQueryRunner } from "../ClaudeCloudQueryRunner.ts";
-import { CLAUDE_CLOUD_MODELS } from "../ClaudeCloudPolicy.ts";
 import type { ServerProviderDraft } from "@t3tools/provider-core/server/snapshotProbe";
 const decodeClaudeSettings = Schema.decodeSync(ClaudeSettings);
 
@@ -174,9 +173,15 @@ export const ClaudeDriver: ProviderDriver<ClaudeSettings, ClaudeDriverEnv, Path.
         return config.cloudFreeCreditsOnly
           ? {
               ...stamped,
-              models: stamped.models.filter((model) =>
-                CLAUDE_CLOUD_MODELS.some((allowed) => allowed === model.slug),
-              ),
+              models: scopeClaudeCloudModels(stamped.models),
+              slashCommands: [
+                ...stamped.slashCommands.filter((command) => command.name !== "recover"),
+                {
+                  name: "recover",
+                  description:
+                    "Recover the previous interrupted cloud turn in this thread. Send alone without attachments.",
+                },
+              ],
             }
           : stamped;
       };

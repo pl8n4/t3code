@@ -29,6 +29,7 @@ export class ClaudeCloudGuardError extends Schema.TaggedError<ClaudeCloudGuardEr
       "locked_credit",
       "unsupported_model",
       "model_unavailable",
+      "reasoning_unavailable",
       "unsupported_policy",
       "api_configuration",
       "account_mismatch",
@@ -50,6 +51,8 @@ export class ClaudeCloudGuardError extends Schema.TaggedError<ClaudeCloudGuardEr
         "This free-credit prototype supports Haiku 5.5, Opus 5.5, and Fable 5.1. Select one before sending.",
       model_unavailable:
         "Claude Cloud could not select the requested model. It may be unavailable for this account or promotional balance. No coding prompt was sent and T3 did not enable paid usage.",
+      reasoning_unavailable:
+        "Claude Cloud did not confirm the selected reasoning effort. No new coding prompt was sent. Select a supported effort level or reconnect.",
       unsupported_policy:
         "This cloud prototype requires Full access. Remote tools cannot use local T3 permission callbacks.",
       api_configuration:
@@ -63,7 +66,7 @@ export class ClaudeCloudGuardError extends Schema.TaggedError<ClaudeCloudGuardEr
       session_missing:
         "The saved cloud session binding is missing. No replacement conversation was created. Restore the prototype's session data or start a new thread with the existing conversation as context.",
       delivery_pending:
-        "Unconfirmed cloud output was preserved in the prototype's recovery journal. Resume is blocked to avoid losing history or repeating local actions. Open the cloud conversation in this thread's Browser panel to recover it, then start a new thread with that context. No new prompt was sent.",
+        "The previous cloud turn has saved or unconfirmed output. Recover that turn in this thread before sending a new task. T3 did not send another prompt or repeat an uncertain action. If automatic recovery cannot resolve it, inspect the workspace and the cloud conversation in this thread's Browser panel.",
     };
     return messages[this.reason];
   }

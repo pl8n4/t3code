@@ -1,5 +1,10 @@
-import type { SDKMessage } from "@anthropic-ai/claude-agent-sdk";
-import { ProviderInstanceId, type ClaudeSettings, type PreviewTabId } from "@t3tools/contracts";
+import type { SDKMessage, SDKUserMessage, EffortLevel } from "@anthropic-ai/claude-agent-sdk";
+import {
+  DEFAULT_BROWSER_PROFILE_ID,
+  ProviderInstanceId,
+  type ClaudeSettings,
+  type PreviewTabId,
+} from "@t3tools/contracts";
 import type * as Cause from "effect/Cause";
 import * as Crypto from "effect/Crypto";
 import * as DateTime from "effect/DateTime";
@@ -8,6 +13,7 @@ import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
+import * as Hex from "effect/encoding/Hex";
 import * as Path from "effect/Path";
 import * as Option from "effect/Option";
 import * as Queue from "effect/Queue";
@@ -47,7 +53,11 @@ const Binding = Schema.Struct({
   cloudId: Schema.String,
   sequence: Schema.String,
   pendingTurn: Schema.optionalKey(
-    Schema.Struct({ resultSequence: Schema.optionalKey(Schema.String) }),
+    Schema.Struct({
+      promptUuid: Schema.optionalKey(Schema.String),
+      replayAfterSequence: Schema.optionalKey(Schema.String),
+      resultSequence: Schema.optionalKey(Schema.String),
+    }),
   ),
   inbox: Schema.optionalKey(Schema.Array(ClaudeCloudEvent)),
   toolRequests: Schema.optionalKey(
@@ -55,6 +65,9 @@ const Binding = Schema.Struct({
       Schema.String,
       Schema.Struct({
         state: Schema.Literals(["started", "completed"]),
+        commandRequestId: Schema.optionalKey(
+          Schema.String.check(Schema.isNonEmpty(), Schema.isMaxLength(200)),
+        ),
         response: Schema.optionalKey(Schema.Record(Schema.String, Schema.Unknown)),
       }),
     ),
@@ -83,7 +96,25 @@ const decodeUnknownRecord = Schema.decodeUnknownEffect(
   Schema.Record(Schema.String, Schema.Unknown),
 );
 const decodeWorkspaceInfo = Schema.decodeUnknownEffect(WorkspaceInfo);
+const HttpFailure = Schema.Struct({ cloudHttpStatus: Schema.Number });
+const isHttpFailure = Schema.is(HttpFailure);
+class ClaudeCloudHttpError extends Schema.TaggedError<ClaudeCloudHttpError>()(
+  "ClaudeCloudHttpError",
+  { status: Schema.Number },
+) {
+  override get message(): string {
+    return `Claude cloud returned HTTP ${this.status}.`;
+  }
+}
+const decodeAppliedReasoning = Schema.decodeUnknownEffect(
+  Schema.Struct({
+    applied: Schema.Struct({
+      effort: Schema.NullOr(Schema.Literals(["low", "medium", "high", "xhigh", "max"])),
+    }),
+  }),
+);
 
+const isClaudeCloudHttpError = Schema.is(ClaudeCloudHttpError);
 const relayedTypes = new Set([
   "assistant",
   "user",
@@ -123,7 +154,7 @@ export const makeClaudeCloudQueryRunner = Effect.fn("makeClaudeCloudQueryRunner"
       ? path.join(configDir, ".claude.json")
       : path.join(configDir, "..", ".claude.json");
   const bindingDir = path.join(server.stateDir, "claude-cloud-sessions");
-  yield* fs.makeDirectory(bindingDir, { recursive: true });
+  yield* fs.makeDirectory(bindingDir, { recursive: true, mode: 0o700 });
 
   const wrap = (method: string) => (cause: unknown) =>
     new ClaudeAgentSdkQueryRunnerError({ method, cause });
@@ -145,6 +176,11 @@ export const makeClaudeCloudQueryRunner = Effect.fn("makeClaudeCloudQueryRunner"
         const queryScope = yield* Scope.fork(ownerScope);
         return yield* Effect.gen(function* () {
           let selectedModel = yield* Effect.try(() => verifyClaudeCloudModel(input.options.model));
+          let selectedEffort: EffortLevel | null = input.options.effort ?? null;
+          const initialSettings =
+            typeof input.options.settings === "object" ? input.options.settings : undefined;
+          let showThinkingSummaries =
+            initialSettings?.showThinkingSummaries ?? input.options.thinking?.type !== "disabled";
           yield* Effect.try(() => {
             verifyClaudeCloudEnvironment(environment);
             if (input.options.permissionMode !== "bypassPermissions") {
@@ -152,6 +188,8 @@ export const makeClaudeCloudQueryRunner = Effect.fn("makeClaudeCloudQueryRunner"
             }
             if (config.launchArgs.trim())
               throw new ClaudeCloudGuardError({ reason: "api_configuration" });
+            if (initialSettings?.fastMode || initialSettings?.ultracode)
+              throw new ClaudeCloudGuardError({ reason: "unsupported_policy" });
           });
           const account = yield* fs
             .readFileString(accountPath)
@@ -172,11 +210,18 @@ export const makeClaudeCloudQueryRunner = Effect.fn("makeClaudeCloudQueryRunner"
           const opened = yield* broker.invoke<{ tabId: PreviewTabId | null }>({
             scope,
             operation: "open",
-            input: { url: "https://claude.ai/new", open: false, reuseExistingTab: false },
+            // Startup recovery can run before any client reports browser profiles. An
+            // implicit profile would create throwaway storage and lose the Claude login.
+            input: {
+              url: "https://claude.ai/new",
+              open: false,
+              reuseExistingTab: false,
+              profileId: DEFAULT_BROWSER_PROFILE_ID,
+            },
           });
           if (!opened.tabId)
             return yield* new ClaudeCloudGuardError({ reason: "account_mismatch" });
-          const tabId = opened.tabId;
+          let tabId = opened.tabId;
 
           const browser = (expression: string) =>
             broker.invoke<unknown>({
@@ -209,7 +254,7 @@ export const makeClaudeCloudQueryRunner = Effect.fn("makeClaudeCloudQueryRunner"
               ${encoded === undefined ? "" : `body:${inlineBody ? json(encoded) : `buffers[${json(key)}].join('')`},`}
               signal: AbortSignal.timeout(15000)
             });}finally{delete buffers[${json(key)}]}
-            if (!r.ok) throw new Error('Claude cloud HTTP ' + r.status);
+            if (!r.ok) return {cloudHttpStatus:r.status};
             if(r.status===204)return null;
             const data=await r.json();
             if (${json(endpoint)}.endsWith('/events') && Array.isArray(data.data)) {
@@ -229,6 +274,8 @@ export const makeClaudeCloudQueryRunner = Effect.fn("makeClaudeCloudQueryRunner"
               return {response_shape:{id:session.id,config:{model:session.config?.model}}};
             return data;
           })()`);
+              if (isHttpFailure(result))
+                return yield* new ClaudeCloudHttpError({ status: result.cloudHttpStatus });
               if (
                 typeof result === "object" &&
                 result !== null &&
@@ -252,8 +299,58 @@ export const makeClaudeCloudQueryRunner = Effect.fn("makeClaudeCloudQueryRunner"
             });
           const request = (endpoint: string, body?: unknown, afterSequence = 0n) => {
             const call = requestOnce(endpoint, body, afterSequence);
+            let reopenedForRequest = false;
             return body === undefined
-              ? call.pipe(Effect.retry({ times: 2, schedule: Schedule.exponential("250 millis") }))
+              ? call.pipe(
+                  Effect.retry({
+                    times: 2,
+                    schedule: Schedule.exponential("250 millis"),
+                    while: (error) => !isClaudeCloudHttpError(error) || error.status >= 500,
+                  }),
+                  Effect.tapError(() =>
+                    Effect.suspend(() => {
+                      if (reopenedForRequest) return Effect.void;
+                      reopenedForRequest = true;
+                      return broker
+                        .invoke<{ tabId: PreviewTabId | null }>({
+                          scope,
+                          operation: "open",
+                          input: {
+                            url: "https://claude.ai/new",
+                            open: false,
+                            tabId,
+                            reuseExistingTab: true,
+                            profileId: DEFAULT_BROWSER_PROFILE_ID,
+                          },
+                        })
+                        .pipe(
+                          Effect.catch(() =>
+                            broker.invoke<{ tabId: PreviewTabId | null }>({
+                              scope,
+                              operation: "open",
+                              input: {
+                                url: "https://claude.ai/new",
+                                open: false,
+                                reuseExistingTab: false,
+                                profileId: DEFAULT_BROWSER_PROFILE_ID,
+                              },
+                            }),
+                          ),
+                          Effect.tap((reopened) =>
+                            Effect.sync(() => {
+                              if (reopened.tabId !== null) tabId = reopened.tabId;
+                            }),
+                          ),
+                          Effect.ignore,
+                        );
+                    }),
+                  ),
+                  Effect.retry({
+                    times: 20,
+                    schedule: Schedule.spaced("2 seconds"),
+                    while: (error) => !isClaudeCloudHttpError(error) || error.status >= 500,
+                  }),
+                )
               : call;
           };
           const relay = yield* makeClaudeCloudMcpRelay(input.options.mcpServers);
@@ -275,7 +372,7 @@ export const makeClaudeCloudQueryRunner = Effect.fn("makeClaudeCloudQueryRunner"
           const bindingPath = path.join(bindingDir, `${nativeId}.json`);
           const writeBinding = (value: typeof Binding.Type) =>
             fs
-              .writeFileString(`${bindingPath}.tmp`, json(value))
+              .writeFileString(`${bindingPath}.tmp`, json(value), { mode: 0o600 })
               .pipe(
                 Effect.andThen(fs.rename(`${bindingPath}.tmp`, bindingPath)),
                 Effect.uninterruptible,
@@ -315,7 +412,7 @@ export const makeClaudeCloudQueryRunner = Effect.fn("makeClaudeCloudQueryRunner"
                 outcomes: [],
                 append_system_prompt: CLAUDE_CLOUD_WORKSPACE_INSTRUCTIONS,
                 model: selectedModel,
-                effort_level: "low",
+                ...(selectedEffort === null ? {} : { effort_level: selectedEffort }),
                 permission_mode: "bypassPermissions",
               },
               events: [],
@@ -347,15 +444,21 @@ export const makeClaudeCloudQueryRunner = Effect.fn("makeClaudeCloudQueryRunner"
                 return yield* new ClaudeCloudGuardError({ reason: "remote_failed" });
               yield* updateBinding((current) => {
                 const { pendingTurn, ...rest } = current;
+                const unresolved =
+                  pendingTurn !== undefined &&
+                  (pendingTurn.resultSequence === undefined ||
+                    BigInt(pendingTurn.resultSequence) > cursor);
+                // Rebuild incomplete turns from their beginning after a process restart. An
+                // artifact checkpoint alone cannot reconstruct stream and tool adapter state.
+                const pruneThrough =
+                  unresolved && pendingTurn.replayAfterSequence !== undefined
+                    ? BigInt(pendingTurn.replayAfterSequence)
+                    : cursor;
                 return {
                   ...rest,
-                  ...(pendingTurn !== undefined &&
-                  (pendingTurn.resultSequence === undefined ||
-                    BigInt(pendingTurn.resultSequence) > cursor)
-                    ? { pendingTurn }
-                    : {}),
+                  ...(unresolved ? { pendingTurn } : {}),
                   inbox: (current.inbox ?? []).filter(
-                    (event) => BigInt(event.sequence_num) > cursor,
+                    (event) => BigInt(event.sequence_num) > pruneThrough,
                   ),
                 };
               });
@@ -371,6 +474,12 @@ export const makeClaudeCloudQueryRunner = Effect.fn("makeClaudeCloudQueryRunner"
             ),
           );
           yield* checkModel;
+          const recoveringTurn =
+            input.recoverPendingCloudTurn === true &&
+            binding.pendingTurn?.promptUuid !== undefined &&
+            binding.pendingTurn.replayAfterSequence !== undefined
+              ? { promptUuid: binding.pendingTurn.promptUuid }
+              : undefined;
           let usable = true;
           let recoveryPending = false;
           const requireRecovery = Effect.gen(function* () {
@@ -401,10 +510,13 @@ export const makeClaudeCloudQueryRunner = Effect.fn("makeClaudeCloudQueryRunner"
             return yield* new ClaudeCloudGuardError({ reason: "delivery_pending" });
           });
           if (
-            binding.pendingTurn !== undefined ||
-            (binding.inbox ?? []).some((event) =>
-              ["assistant", "user", "result", "stream_event"].includes(String(event.payload.type)),
-            )
+            (binding.pendingTurn !== undefined && recoveringTurn === undefined) ||
+            (recoveringTurn === undefined &&
+              (binding.inbox ?? []).some((event) =>
+                ["assistant", "user", "result", "stream_event"].includes(
+                  String(event.payload.type),
+                ),
+              ))
           )
             return yield* requireRecovery;
           const queue = yield* Queue.unbounded<
@@ -412,12 +524,14 @@ export const makeClaudeCloudQueryRunner = Effect.fn("makeClaudeCloudQueryRunner"
             ClaudeAgentSdkQueryRunnerError | Cause.Done
           >();
           let active = false;
+          let recoveryPaused = recoveringTurn !== undefined;
           let closed = false;
           let connecting = relay !== undefined;
           let lastBillingCheck = 0;
           let sequence = BigInt(binding.sequence);
           const sdkSequences = new WeakMap<SDKMessage, string>();
           let replay = binding.inbox ?? [];
+          const recoveryBacklog: Array<typeof ClaudeCloudEvent.Type> = [];
           const pendingControls = new Map<
             string,
             Deferred.Deferred<unknown, ClaudeCloudGuardError>
@@ -428,6 +542,7 @@ export const makeClaudeCloudQueryRunner = Effect.fn("makeClaudeCloudQueryRunner"
           const mcpReady = yield* Deferred.make<void, ClaudeCloudGuardError>();
           const initialPoll = yield* Deferred.make<void, ClaudeCloudGuardError>();
           const admission = yield* Semaphore.make(1);
+          const replayLock = yield* Semaphore.make(1);
           const control = (subtype: string, fields: Record<string, unknown> = {}, wait = false) =>
             Effect.gen(function* () {
               const requestId = yield* crypto.randomUUIDv4();
@@ -466,12 +581,69 @@ export const makeClaudeCloudQueryRunner = Effect.fn("makeClaudeCloudQueryRunner"
               )
                 return;
               const saved = binding.toolRequests?.[requestId];
-              const method =
-                typeof decoded.message === "object" &&
-                decoded.message !== null &&
-                "method" in decoded.message
-                  ? decoded.message.method
+              const mcpMessage =
+                typeof decoded.message === "object" && decoded.message !== null
+                  ? decoded.message
                   : undefined;
+              const method =
+                mcpMessage !== undefined && "method" in mcpMessage ? mcpMessage.method : undefined;
+              const params =
+                mcpMessage !== undefined &&
+                "params" in mcpMessage &&
+                typeof mcpMessage.params === "object" &&
+                mcpMessage.params !== null
+                  ? mcpMessage.params
+                  : undefined;
+              const resumableCommand =
+                method === "tools/call" &&
+                params !== undefined &&
+                "name" in params &&
+                params.name === "t3_workspace_exec";
+              const toolArguments =
+                params !== undefined &&
+                "arguments" in params &&
+                typeof params.arguments === "object" &&
+                params.arguments !== null
+                  ? params.arguments
+                  : {};
+              let commandRequestId: string | undefined;
+              if (resumableCommand) {
+                const clientKey =
+                  "requestId" in toolArguments ? toolArguments.requestId : undefined;
+                const legacyKey = `cloud:${binding.cloudId}:${requestId}`;
+                // Older started receipts already used the literal control key. Preserve it
+                // so upgrading cannot turn recovery into a second execution of that command.
+                commandRequestId =
+                  saved?.commandRequestId ??
+                  (saved?.state === "started" && legacyKey.length <= 200
+                    ? legacyKey
+                    : `cloud:${Hex.encode(
+                        yield* crypto.digest(
+                          "SHA-256",
+                          new TextEncoder().encode(
+                            json([
+                              binding.cloudId,
+                              typeof clientKey === "string" ? "client" : "control",
+                              typeof clientKey === "string" ? clientKey : requestId,
+                            ]),
+                          ),
+                        ),
+                      )}`);
+              }
+              const relayedMessage = resumableCommand
+                ? {
+                    ...mcpMessage,
+                    params: {
+                      ...params,
+                      arguments: {
+                        ...toolArguments,
+                        // The local job service rejects mismatched reuse and returns the
+                        // original job instead of launching a command twice.
+                        requestId: commandRequestId,
+                      },
+                    },
+                  }
+                : decoded.message;
               if (
                 !active &&
                 !saved &&
@@ -482,7 +654,7 @@ export const makeClaudeCloudQueryRunner = Effect.fn("makeClaudeCloudQueryRunner"
               const job = yield* Effect.gen(function* () {
                 const saved = binding.toolRequests?.[requestId];
                 if (saved?.state === "completed" && saved.response) return saved.response;
-                if (saved)
+                if (saved && !resumableCommand)
                   return {
                     subtype: "error",
                     request_id: requestId,
@@ -493,10 +665,13 @@ export const makeClaudeCloudQueryRunner = Effect.fn("makeClaudeCloudQueryRunner"
                   ...current,
                   toolRequests: {
                     ...current.toolRequests,
-                    [requestId]: { state: "started" },
+                    [requestId]: {
+                      state: "started",
+                      ...(commandRequestId === undefined ? {} : { commandRequestId }),
+                    },
                   },
                 }));
-                const response = yield* relay(decoded.message).pipe(
+                const response = yield* relay(relayedMessage).pipe(
                   Effect.match({
                     onSuccess: (mcp_response) => ({
                       subtype: "success",
@@ -515,7 +690,11 @@ export const makeClaudeCloudQueryRunner = Effect.fn("makeClaudeCloudQueryRunner"
                   ...current,
                   toolRequests: {
                     ...current.toolRequests,
-                    [requestId]: { state: "completed", response },
+                    [requestId]: {
+                      state: "completed",
+                      response,
+                      ...(commandRequestId === undefined ? {} : { commandRequestId }),
+                    },
                   },
                 }));
                 return response;
@@ -585,6 +764,28 @@ export const makeClaudeCloudQueryRunner = Effect.fn("makeClaudeCloudQueryRunner"
             if (nextSequence !== undefined) sequence = nextSequence;
             for (const event of events) {
               const payload = event.payload;
+              const remoteRequest =
+                typeof payload.request === "object" && payload.request !== null
+                  ? payload.request
+                  : undefined;
+              const remoteMessage =
+                remoteRequest !== undefined &&
+                "message" in remoteRequest &&
+                typeof remoteRequest.message === "object" &&
+                remoteRequest.message !== null
+                  ? remoteRequest.message
+                  : undefined;
+              const initializationRequest =
+                payload.type === "control_request" &&
+                remoteMessage !== undefined &&
+                "method" in remoteMessage &&
+                ["initialize", "notifications/initialized", "tools/list"].includes(
+                  String(remoteMessage.method),
+                );
+              if (recoveryPaused && payload.type !== "control_response" && !initializationRequest) {
+                recoveryBacklog.push(event);
+                continue;
+              }
               if (
                 !active &&
                 ["assistant", "user", "result", "stream_event"].includes(String(payload.type))
@@ -631,7 +832,7 @@ export const makeClaudeCloudQueryRunner = Effect.fn("makeClaudeCloudQueryRunner"
               if (payload.type === "result") {
                 yield* updateBinding((current) => ({
                   ...current,
-                  pendingTurn: { resultSequence: event.sequence_num },
+                  pendingTurn: { ...current.pendingTurn, resultSequence: event.sequence_num },
                 }));
                 active = false;
               }
@@ -640,7 +841,7 @@ export const makeClaudeCloudQueryRunner = Effect.fn("makeClaudeCloudQueryRunner"
               sdkSequences.set(message, event.sequence_num);
               yield* Queue.offer(queue, message);
             }
-          });
+          }).pipe(replayLock.withPermits(1));
           const fiber = yield* Effect.gen(function* () {
             yield* poll;
             yield* Deferred.succeed(initialPoll, undefined);
@@ -722,9 +923,61 @@ export const makeClaudeCloudQueryRunner = Effect.fn("makeClaudeCloudQueryRunner"
             return yield* new ClaudeCloudGuardError({
               reason: recoveryPending ? "delivery_pending" : "remote_failed",
             });
+          const applyReasoning = Effect.gen(function* () {
+            yield* control(
+              "apply_flag_settings",
+              { settings: { effortLevel: selectedEffort, showThinkingSummaries } },
+              true,
+            );
+            const applied = yield* control("get_settings", {}, true).pipe(
+              Effect.flatMap(decodeAppliedReasoning),
+            );
+            if (selectedEffort !== null && applied.applied.effort !== selectedEffort)
+              return yield* new ClaudeCloudGuardError({ reason: "reasoning_unavailable" });
+          }).pipe(
+            Effect.mapError(
+              () =>
+                new ClaudeCloudGuardError({
+                  reason: recoveryPending ? "delivery_pending" : "reasoning_unavailable",
+                }),
+            ),
+          );
           const runtime: ClaudeAgentSdkQuerySession = {
             messages: Stream.fromQueue(queue),
             cloudEventSequence: (message) => sdkSequences.get(message),
+            get pendingCloudTurn() {
+              return recoveryPaused ? recoveringTurn : undefined;
+            },
+            cloudEventWasDurable: (message) => {
+              const cursor = sdkSequences.get(message);
+              return (
+                recoveringTurn !== undefined &&
+                input.durableCloudSequence !== undefined &&
+                cursor !== undefined &&
+                BigInt(cursor) <= BigInt(input.durableCloudSequence)
+              );
+            },
+            ...(recoveringTurn === undefined
+              ? {}
+              : {
+                  resumePendingCloudTurn: Effect.gen(function* () {
+                    if (closed || !usable || recoveryPending || !recoveryPaused)
+                      return yield* new ClaudeCloudGuardError({ reason: "delivery_pending" });
+                    yield* Effect.all([guard, checkModel], { concurrency: "unbounded" });
+                    lastBillingCheck = DateTime.toEpochMillis(yield* DateTime.now);
+                    yield* replayLock.withPermits(1)(
+                      Effect.gen(function* () {
+                        if (closed || !usable || recoveryPending || !recoveryPaused)
+                          return yield* new ClaudeCloudGuardError({ reason: "delivery_pending" });
+                        recoveryPaused = false;
+                        active = true;
+                        replay = [...recoveryBacklog, ...replay];
+                        recoveryBacklog.length = 0;
+                      }),
+                    );
+                    yield* Queue.offer(pollWake, undefined);
+                  }).pipe(admission.withPermits(1), Effect.mapError(wrap("recover"))),
+                }),
             offer: (message, durableCloudSequence) =>
               Effect.gen(function* () {
                 if (closed || !usable || recoveryPending)
@@ -744,6 +997,7 @@ export const makeClaudeCloudQueryRunner = Effect.fn("makeClaudeCloudQueryRunner"
                       }),
                   ),
                 );
+                yield* applyReasoning;
                 if (relay) {
                   yield* control(
                     "apply_flag_settings",
@@ -823,7 +1077,15 @@ export const makeClaudeCloudQueryRunner = Effect.fn("makeClaudeCloudQueryRunner"
                 }
                 lastBillingCheck = DateTime.toEpochMillis(yield* DateTime.now);
                 // Persist admission before the POST: a disconnect can precede the first event poll.
-                yield* updateBinding((current) => ({ ...current, pendingTurn: {} }));
+                const promptUuid = message.uuid ?? (yield* crypto.randomUUIDv4());
+                forwarded = {
+                  ...forwarded,
+                  uuid: promptUuid as NonNullable<SDKUserMessage["uuid"]>,
+                };
+                yield* updateBinding((current) => ({
+                  ...current,
+                  pendingTurn: { promptUuid, replayAfterSequence: sequence.toString() },
+                }));
                 if (closed || !usable || recoveryPending)
                   return yield* new ClaudeCloudGuardError({
                     reason: recoveryPending ? "delivery_pending" : "remote_failed",
@@ -831,7 +1093,23 @@ export const makeClaudeCloudQueryRunner = Effect.fn("makeClaudeCloudQueryRunner"
                 active = true;
                 yield* request(`${sessionPath}/events`, {
                   events: [{ payload: { ...forwarded, session_id: binding.cloudId } }],
-                }).pipe(Effect.tapError(() => control("interrupt").pipe(Effect.ignore)));
+                }).pipe(
+                  // A failed response does not prove the prompt was rejected. Keep reading
+                  // this conversation instead of interrupting it or posting the prompt twice.
+                  Effect.catchIf(
+                    (error) => !isClaudeCloudHttpError(error),
+                    () =>
+                      Effect.logWarning(
+                        "Claude cloud prompt delivery is uncertain; awaiting existing session events.",
+                      ),
+                  ),
+                  Effect.tapError(() =>
+                    Effect.gen(function* () {
+                      active = false;
+                      yield* control("interrupt").pipe(Effect.ignore);
+                    }),
+                  ),
+                );
                 yield* Queue.offer(pollWake, undefined);
               }).pipe(admission.withPermits(1), Effect.mapError(wrap("offer"))),
             setModel: (model) =>
@@ -857,7 +1135,22 @@ export const makeClaudeCloudQueryRunner = Effect.fn("makeClaudeCloudQueryRunner"
                 selectedModel = nextModel;
               }).pipe(admission.withPermits(1), Effect.mapError(wrap("setModel"))),
             applyFlagSettings: (settings) =>
-              settings.fastMode ? unsupported("fastMode") : Effect.void,
+              Effect.gen(function* () {
+                if (settings.fastMode || settings.ultracode)
+                  return yield* unsupported("applyFlagSettings");
+                if (closed || !usable || recoveryPending || active)
+                  return yield* new ClaudeCloudGuardError({
+                    reason: recoveryPending ? "delivery_pending" : "unsupported_policy",
+                  });
+                if (settings.effortLevel !== undefined) selectedEffort = settings.effortLevel;
+                if (
+                  settings.showThinkingSummaries !== undefined &&
+                  settings.showThinkingSummaries !== null
+                )
+                  showThinkingSummaries = settings.showThinkingSummaries;
+                yield* guard;
+                yield* applyReasoning;
+              }).pipe(admission.withPermits(1), Effect.mapError(wrap("applyFlagSettings"))),
             setPermissionMode: (mode) =>
               mode === "bypassPermissions" ? Effect.void : unsupported("setPermissionMode"),
             stopTask: () =>

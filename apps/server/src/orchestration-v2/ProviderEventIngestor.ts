@@ -310,6 +310,13 @@ export const layer: Layer.Layer<
     const agentScope = yield* AgentScope;
     const completedTurnAnalytics = new Set<string>();
 
+    const artifactNode = (threadId: ThreadId, nodeId: NodeId | null) =>
+      nodeId === null
+        ? Effect.succeed(undefined)
+        : projections
+            .getThreadRecords(threadId, ["nodes"], { nodeIds: [nodeId] })
+            .pipe(Effect.map((records) => records.nodes[0]));
+
     const makeDomainEvent = (
       input: ProviderEventIngestInput,
       payloadInput: {
@@ -594,19 +601,36 @@ export const layer: Layer.Layer<
                 nodeId: input.event.providerTurn.nodeId,
               }),
             ];
-          case "node.updated":
+          case "node.updated": {
+            let node = input.event.node;
+            if (input.event.preserveExistingArtifactOwnership) {
+              const saved = yield* artifactNode(node.threadId, node.id);
+              if (saved !== undefined && saved.runId !== node.runId) {
+                if (saved.status === "completed") return [];
+                node = {
+                  ...node,
+                  runId: saved.runId,
+                  parentNodeId: saved.parentNodeId,
+                  rootNodeId: saved.rootNodeId,
+                  providerThreadId: saved.providerThreadId,
+                  providerTurnId: saved.providerTurnId,
+                  startedAt: saved.startedAt,
+                };
+              }
+            }
             // Adapters send an unchanged node again with each text delta. Compare with the
             // stored node, not the last one sent, because the server also writes nodes.
-            if (yield* projections.isNodeStored(input.event.node)) return [];
+            if (yield* projections.isNodeStored(node)) return [];
             return [
               yield* makeDomainEvent(input, {
                 type: "node.updated",
-                threadId: input.event.node.threadId,
-                payload: input.event.node,
-                runId: input.event.node.runId,
-                nodeId: input.event.node.id,
+                threadId: node.threadId,
+                payload: node,
+                runId: node.runId,
+                nodeId: node.id,
               }),
             ];
+          }
           case "subagent.updated":
             return [
               yield* makeDomainEvent(input, {
@@ -617,28 +641,83 @@ export const layer: Layer.Layer<
                 nodeId: input.event.subagent.id,
               }),
             ];
-          case "message.updated":
+          case "message.updated": {
+            let message = input.event.message;
+            if (input.event.preserveExistingArtifactOwnership) {
+              const saved = (yield* projections.getThreadRecords(message.threadId, ["messages"], {
+                messageIds: [message.id],
+              })).messages[0];
+              if (saved !== undefined && saved.runId !== message.runId && !saved.streaming)
+                return [];
+              // Nodes precede messages and tool rows. They are also authoritative when a
+              // crash committed the node but not the rest of its artifact family.
+              const node = yield* artifactNode(message.threadId, saved?.nodeId ?? message.nodeId);
+              const owner = saved ?? node;
+              if (owner !== undefined && owner.runId !== message.runId)
+                message = {
+                  ...message,
+                  runId: owner.runId,
+                  nodeId: saved === undefined ? (node?.id ?? message.nodeId) : saved.nodeId,
+                  createdAt: saved?.createdAt ?? node?.startedAt ?? message.createdAt,
+                };
+            }
             return [
               yield* makeDomainEvent(input, {
                 type: "message.updated",
-                threadId: input.event.message.threadId,
-                payload: input.event.message,
-                runId: input.event.message.runId,
-                nodeId: input.event.message.nodeId,
+                threadId: message.threadId,
+                payload: message,
+                runId: message.runId,
+                nodeId: message.nodeId,
               }),
             ];
-          case "turn_item.updated":
+          }
+          case "turn_item.updated": {
+            let item = input.event.turnItem;
+            if (input.event.preserveExistingArtifactOwnership) {
+              const saved = yield* projections.getTurnItem({
+                threadId: item.threadId,
+                itemId: item.id,
+              });
+              if (saved !== null && saved.runId !== item.runId && saved.status === "completed")
+                return [];
+              const node = yield* artifactNode(item.threadId, saved?.nodeId ?? item.nodeId);
+              const owner = saved ?? node;
+              if (owner !== undefined && owner.runId !== item.runId) {
+                const ownership = {
+                  runId: owner.runId,
+                  nodeId: saved === null ? (node?.id ?? item.nodeId) : saved.nodeId,
+                  providerTurnId: owner.providerTurnId ?? null,
+                  ordinal: saved?.ordinal ?? item.ordinal,
+                  parentItemId: saved === null ? item.parentItemId : saved.parentItemId,
+                  startedAt: owner.startedAt,
+                };
+                if (item.type === "fork") {
+                  const { providerThreadId: _providerThreadId, ...fork } = item;
+                  item = {
+                    ...fork,
+                    ...ownership,
+                    ...(owner.providerThreadId == null
+                      ? {}
+                      : { providerThreadId: owner.providerThreadId }),
+                  };
+                } else
+                  item = {
+                    ...item,
+                    ...ownership,
+                    providerThreadId: owner.providerThreadId ?? null,
+                  };
+              }
+            }
             return [
               yield* makeDomainEvent(input, {
                 type: "turn-item.updated",
-                threadId: input.event.turnItem.threadId,
-                payload: boundFileChangeForStorage(
-                  stripUnservedToolOutputImageBytes(input.event.turnItem),
-                ),
-                runId: input.event.turnItem.runId,
-                nodeId: input.event.turnItem.nodeId,
+                threadId: item.threadId,
+                payload: boundFileChangeForStorage(stripUnservedToolOutputImageBytes(item)),
+                runId: item.runId,
+                nodeId: item.nodeId,
               }),
             ];
+          }
           case "runtime_request.updated":
             return [
               yield* makeDomainEvent(input, {
@@ -849,7 +928,10 @@ export const layer: Layer.Layer<
           (effect) =>
             input.event.type === "app_thread.created"
               ? threadCommands.withLock(input.event.appThread.id, effect)
-              : effect,
+              : "preserveExistingArtifactOwnership" in input.event &&
+                  input.event.preserveExistingArtifactOwnership
+                ? threadCommands.withLock(input.threadId, effect)
+                : effect,
         ),
     });
   }),

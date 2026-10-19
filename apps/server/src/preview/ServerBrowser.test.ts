@@ -1587,6 +1587,34 @@ it.live("an agent tab keeps throwaway storage when no client reported profiles",
   ).pipe(Effect.provide(layer)),
 );
 
+it.live(
+  "an explicitly selected default profile uses persistent storage before any client reports profiles",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        yield* ServerBrowser.ServerBrowser;
+        const broker = yield* Broker.PreviewAutomationBroker;
+        yield* Effect.yieldNow;
+        const opened = yield* broker.invoke<PreviewAutomationStatus>({
+          scope,
+          operation: "open",
+          input: { profileId: "default", reuseExistingTab: false, show: false },
+        });
+        expect(contextRequests).toEqual([{ profileId: "default", isolated: false }]);
+        const status = yield* broker.invoke<PreviewAutomationStatus>({
+          scope,
+          operation: "status",
+          input: {},
+        });
+        expect(status.tabs).toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({ tabId: opened.tabId, profileId: "default" }),
+          ]),
+        );
+      }),
+    ).pipe(Effect.provide(layer)),
+);
+
 it.live("a desktop page that comes back reconnects without waiting for a viewer", () =>
   Effect.scoped(
     Effect.gen(function* () {

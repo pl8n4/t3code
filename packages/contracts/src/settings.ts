@@ -614,6 +614,15 @@ const CLAUDE_AUTO_COMPACT_WINDOW_PATTERN = /^(?:|[1-9]\d{5}|1000000)$/;
 
 export const ClaudeSettings = makeProviderSettingsSchema(
   {
+    cloudCodexDelegationEnabled: Schema.Boolean.pipe(
+      Schema.withDecodingDefault(Effect.succeed(false)),
+      Schema.annotateKey({
+        title: "Allow requested Codex delegation",
+        description:
+          "For promotional-credit cloud workflows: allow explicitly requested Codex children using verified ChatGPT subscription sign-in. API credentials and custom providers remain blocked.",
+        providerSettingsForm: { control: "switch" },
+      }),
+    ),
     cloudFallbackOnLimit: Schema.Boolean.pipe(
       Schema.withDecodingDefault(Effect.succeed(false)),
       Schema.annotateKey({
@@ -685,6 +694,7 @@ export const ClaudeSettings = makeProviderSettingsSchema(
   {
     order: [
       "cloudFreeCreditsOnly",
+      "cloudCodexDelegationEnabled",
       "cloudFallbackOnLimit",
       "binaryPath",
       "homePath",

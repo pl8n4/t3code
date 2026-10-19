@@ -95,6 +95,7 @@ const makeCodexConfig = (overrides: Partial<CodexSettings>): CodexSettings => ({
 });
 
 const makeClaudeConfig = (overrides: Partial<ClaudeSettings>): ClaudeSettings => ({
+  cloudCodexDelegationEnabled: false,
   cloudFreeCreditsOnly: false,
   cloudFallbackOnLimit: false,
   enabled: false,
@@ -260,6 +261,15 @@ describe("ProviderInstanceRegistry — multi-instance codex slice", () => {
 
       const personal = yield* registry.getInstance(personalId);
       const work = yield* registry.getInstance(workId);
+      expect(yield* registry.getInstanceForConfig(personalId, configMap[personalId]!)).toBe(
+        personal,
+      );
+      expect(
+        yield* registry.getInstanceForConfig(personalId, {
+          ...configMap[personalId]!,
+          config: makeCodexConfig({ launchArgs: '-c model_provider="other"' }),
+        }),
+      ).toBeUndefined();
       expect(personal).toBeDefined();
       expect(work).toBeDefined();
       expect(personal!.orchestrationAdapter).not.toBe(work!.orchestrationAdapter);

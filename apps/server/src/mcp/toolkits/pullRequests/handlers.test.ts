@@ -1,3 +1,4 @@
+import * as ClaudeCloudExecutionPolicyTestkit from "../../../provider/ClaudeCloudExecutionPolicy.testkit.ts";
 import {
   EnvironmentId,
   ProjectId,
@@ -201,9 +202,9 @@ const makeHarness = Effect.fn("makePullRequestsToolkitHarness")(function* (
   );
   const toolkit = yield* PullRequestsToolkit.pipe(
     Effect.provide(
-      McpToolAccess.HandlersLayer.layer(PullRequestsHandlers.layer).pipe(
-        Layer.provide(layerDependencies),
-      ),
+      McpToolAccess.HandlersLayer.layer(PullRequestsHandlers.layer)
+        .pipe(Layer.provide(ClaudeCloudExecutionPolicyTestkit.layer))
+        .pipe(Layer.provide(layerDependencies)),
     ),
   );
   const call = <Name extends keyof typeof PullRequestsToolkit.tools>(

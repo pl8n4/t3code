@@ -23,6 +23,7 @@ import {
 } from "./ClaudeModelManifest.ts";
 import * as ModelCatalog from "@t3tools/provider-core/server/ModelCatalog";
 import { BUNDLED_MODEL_MANIFEST, resolveProviderCatalog } from "./ModelManifest.ts";
+import { CLAUDE_CLOUD_MODELS } from "./ClaudeCloudPolicy.ts";
 
 const CLAUDE = ProviderDriverKind.make("claudeAgent");
 const EMPTY_CAPABILITIES: ModelCapabilities = { optionDescriptors: [] };
@@ -76,6 +77,27 @@ export function resolveClaudeModelCatalog(
 export const BUNDLED_CLAUDE_MODEL_CATALOG = resolveClaudeModelCatalog(
   BUNDLED_CLAUDE_PROVIDER_CATALOG,
 );
+
+export function scopeClaudeCloudModels(models: ReadonlyArray<ServerProviderModel>) {
+  return models
+    .filter((model) => CLAUDE_CLOUD_MODELS.some((allowed) => allowed === model.slug))
+    .map((model) => ({
+      ...model,
+      capabilities: {
+        ...model.capabilities,
+        optionDescriptors: (model.capabilities?.optionDescriptors ?? [])
+          .filter((descriptor) => descriptor.id !== "fastMode")
+          .map((descriptor) =>
+            descriptor.type === "select" && descriptor.id === "effort"
+              ? {
+                  ...descriptor,
+                  options: descriptor.options.filter((option) => option.id !== "ultracode"),
+                }
+              : descriptor,
+          ),
+      },
+    }));
+}
 
 export function scopeClaudeModelCatalog(
   catalog: ClaudeModelCatalog,

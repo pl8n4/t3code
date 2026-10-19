@@ -2,6 +2,10 @@ import { revertCodexThread } from "../../provider/CodexThreadRevert.ts";
 import { historyResponseItems } from "@t3tools/provider-core/server/handoffBudget";
 import { makeProviderTextDeltaCoalescer } from "./ProviderTextDeltaCoalescer.ts";
 import {
+  codexSubscriptionConfigError,
+  codexSubscriptionNativeRouteError,
+} from "./CodexSubscriptionRoute.ts";
+import {
   mcpToolPresentation,
   type McpToolPresentation,
 } from "../../provider/CodexToolPresentation.ts";
@@ -1300,17 +1304,21 @@ export function codexThreadRuntimeParams(input: {
   readonly mcpSession: McpProviderSession.McpProviderSessionConfig | undefined;
   readonly modelSelection?: { readonly model: string };
   readonly runtimePolicy?: ProviderAdapter.ProviderAdapterV2RuntimePolicy;
+  readonly subscriptionOnly?: boolean;
 }): {
   readonly cwd?: string;
   readonly model?: string;
+  readonly modelProvider?: string;
   readonly config: Readonly<Record<string, Schema.Json>>;
 } {
   const { mcpSession } = input;
   return {
     ...(input.runtimePolicy?.cwd == null ? {} : { cwd: input.runtimePolicy.cwd }),
     ...(input.modelSelection === undefined ? {} : { model: input.modelSelection.model }),
+    ...(input.subscriptionOnly === true ? { modelProvider: "openai" } : {}),
     config: {
       ...CODEX_THREAD_CONFIG,
+      ...(input.subscriptionOnly === true ? { forced_login_method: "chatgpt" } : {}),
       ...(mcpSession === undefined
         ? {}
         : {
@@ -1440,7 +1448,7 @@ export function makeCodexAppServerProtocolLogger(input: {
           protocol: "codex.app-server",
           kind: "protocol",
           providerSessionId: input.providerSessionId,
-          event: redactCodexProtocolValue(boundProviderEventForLogging(event)),
+          event: boundProviderEventForLogging(redactCodexProtocolValue(event)),
         },
         input.threadId,
       )
@@ -1470,12 +1478,23 @@ function redactCodexProtocolValue(value: unknown): unknown {
     }
     try {
       return JSON.stringify(
-        redactCodexProtocolValue(boundProviderEventForLogging(JSON.parse(trimmed) as unknown)),
+        boundProviderEventForLogging(redactCodexProtocolValue(JSON.parse(trimmed) as unknown)),
       );
     } catch {
       return value;
     }
   }
+  // config/read can contain arbitrary MCP environment secrets in both the
+  // merged config and its source layers; key-name redaction cannot cover them.
+  if ("config" in value && ("layers" in value || "origins" in value))
+    return Object.fromEntries(
+      Object.entries(value).map(([key, nested]) => [
+        key,
+        key === "config" || key === "layers" || key === "origins"
+          ? "[REDACTED]"
+          : redactCodexProtocolValue(nested),
+      ]),
+    );
   return Object.fromEntries(
     Object.entries(value).map(([key, nested]) => [
       key,
@@ -1783,6 +1802,76 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             yield* Ref.set(initialized, true);
           }),
         );
+        const subscriptionThreads = new Map<ThreadId, string | null>();
+        const subscriptionNativeThreads = new Set<string>();
+        const verifySubscription = (threadId: ThreadId, cwd?: string | null) =>
+          Effect.gen(function* () {
+            if (!subscriptionThreads.has(threadId)) return;
+            if (cwd !== undefined) subscriptionThreads.set(threadId, cwd);
+            yield* ensureInitialized;
+            const config = yield* client.request("config/read", {
+              cwd: subscriptionThreads.get(threadId) ?? null,
+              includeLayers: true,
+            });
+            const problem = codexSubscriptionConfigError(config);
+            if (problem !== undefined) return yield* toProtocolError(problem);
+            const { account } = yield* client.request("account/read", { refreshToken: false });
+            if (account?.type !== "chatgpt")
+              return yield* toProtocolError(
+                "Codex subscription-only delegation requires the running provider to be signed in with ChatGPT. API-key and unknown authentication are blocked.",
+              );
+          }).pipe(
+            Effect.timeout("10 seconds"),
+            Effect.mapError((cause) =>
+              cause._tag === "ProviderAdapterProtocolError"
+                ? cause
+                : toProtocolError("Could not verify the running Codex subscription route.", cause),
+            ),
+          );
+        const verifyNativeResponse = (threadId: ThreadId | null, response: unknown) =>
+          Effect.gen(function* () {
+            if (threadId === null || !subscriptionThreads.has(threadId)) return;
+            const problem = codexSubscriptionNativeRouteError(response);
+            if (problem !== undefined) return yield* toProtocolError(problem);
+            const decoded = yield* decodeCodexResumeMetadata(response);
+            subscriptionNativeThreads.add(decoded.thread.id);
+          });
+        const verifySavedNativeThread = (
+          threadId: ThreadId | null,
+          nativeThreadId: string,
+          cwd?: string | null,
+        ) =>
+          Effect.gen(function* () {
+            if (threadId === null || !subscriptionThreads.has(threadId)) return;
+            yield* verifySubscription(threadId, cwd);
+            const { thread } = yield* client.request("thread/read", {
+              threadId: nativeThreadId,
+              includeTurns: false,
+            });
+            if (thread.modelProvider !== "openai")
+              return yield* toProtocolError(
+                "This saved Codex thread does not have verified built-in OpenAI provenance. Use a new subscription-backed Codex thread for guarded delegation.",
+              );
+            const { goal } = yield* client.request("thread/goal/get", { threadId: nativeThreadId });
+            if (goal?.status === "active")
+              return yield* toProtocolError(
+                "This Codex thread has an active native goal. Pause it through its original connection before using subscription-only delegation; T3 schedules and PR watches remain available.",
+              );
+          }).pipe(Effect.timeout("10 seconds"));
+        const verifyGuardedTurn = (
+          threadId: ThreadId,
+          providerThread: OrchestrationV2ProviderThread,
+          cwd?: string | null,
+        ) =>
+          Effect.gen(function* () {
+            if (!subscriptionThreads.has(threadId)) return;
+            yield* verifySubscription(threadId, cwd);
+            const nativeThreadId = yield* getNativeThreadId(providerThread);
+            if (!subscriptionNativeThreads.has(nativeThreadId))
+              return yield* toProtocolError(
+                "This Codex native thread has not confirmed its subscription-only route. Reopen the guarded thread before sending work.",
+              );
+          });
         const now = yield* DateTime.now;
         const session = providerSession({
           providerSessionId: input.providerSessionId,
@@ -4377,11 +4466,18 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
         );
 
         yield* client.handleServerNotification("thread/settings/updated", (payload) =>
-          updateSubagentSelection(
-            payload.threadId,
-            payload.threadSettings.model,
-            payload.threadSettings.effort,
-            payload.threadSettings.serviceTier,
+          Effect.sync(() => {
+            if (payload.threadSettings.modelProvider !== "openai")
+              subscriptionNativeThreads.delete(payload.threadId);
+          }).pipe(
+            Effect.andThen(
+              updateSubagentSelection(
+                payload.threadId,
+                payload.threadSettings.model,
+                payload.threadSettings.effort,
+                payload.threadSettings.serviceTier,
+              ),
+            ),
           ),
         );
         yield* client.handleServerNotification("model/rerouted", (payload) =>
@@ -6183,6 +6279,11 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
           codexInput: ReadonlyArray<CodexSchema.V2TurnStartParams__UserInput>,
         ) =>
           Effect.gen(function* () {
+            yield* verifyGuardedTurn(
+              turnInput.threadId,
+              turnInput.providerThread,
+              turnInput.runtimePolicy.cwd,
+            );
             const threadId = yield* getNativeThreadId(turnInput.providerThread);
             const mcpSession = yield* mcpSessions.read(turnInput.threadId);
             const turnStartParams = yield* buildCodexTurnStartParams({
@@ -6406,6 +6507,10 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
           providerSessionId: input.providerSessionId,
           providerSession: session,
           events: Stream.fromEffectRepeat(Queue.take(events)),
+          guardSubscriptionThread: (threadInput) =>
+            Effect.sync(() => {
+              subscriptionThreads.set(threadInput.threadId, threadInput.cwd);
+            }).pipe(Effect.andThen(verifySubscription(threadInput.threadId))),
           canReuseContextUsage: canReuseCodexContextUsage,
           // Known gap: a subagent that Codex resumes later reads as completed
           // (not pending) between turns, so idle release can win the race
@@ -6454,7 +6559,8 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               return false;
             }),
           ensureThread: (threadInput) =>
-            ensureInitialized.pipe(
+            verifySubscription(threadInput.threadId, threadInput.runtimePolicy.cwd).pipe(
+              Effect.andThen(ensureInitialized),
               Effect.andThen(mcpSessions.read(threadInput.threadId)),
               Effect.flatMap((mcpSession) =>
                 client.request(
@@ -6463,9 +6569,11 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                     mcpSession,
                     modelSelection: threadInput.modelSelection,
                     runtimePolicy: threadInput.runtimePolicy,
+                    subscriptionOnly: subscriptionThreads.has(threadInput.threadId),
                   }),
                 ),
               ),
+              Effect.tap((response) => verifyNativeResponse(threadInput.threadId, response)),
               Effect.map((response): OrchestrationV2ProviderThread =>
                 providerThreadFromCodexThread({
                   appThreadId: threadInput.threadId,
@@ -6488,6 +6596,12 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
           resumeThread: (threadInput) =>
             Effect.gen(function* () {
               const nativeThreadId = yield* getNativeThreadId(threadInput.providerThread);
+              const appThreadId = threadInput.threadId ?? threadInput.providerThread.appThreadId;
+              yield* verifySavedNativeThread(
+                appThreadId,
+                nativeThreadId,
+                threadInput.runtimePolicy?.cwd,
+              );
               // excludeTurns is not in the generated request schema yet.
               const resume = client.raw.request("thread/resume", {
                 threadId: nativeThreadId,
@@ -6502,6 +6616,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                   ...(threadInput.runtimePolicy === undefined
                     ? {}
                     : { runtimePolicy: threadInput.runtimePolicy }),
+                  subscriptionOnly: appThreadId !== null && subscriptionThreads.has(appThreadId),
                 }),
               });
               const response = yield* ensureInitialized.pipe(
@@ -6523,6 +6638,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                     }),
                   ),
                 ),
+                Effect.tap((response) => verifyNativeResponse(appThreadId, response)),
                 Effect.flatMap(decodeCodexResumeMetadata),
               );
               return {
@@ -6551,6 +6667,11 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             ),
           compactThread: (turnInput) =>
             Effect.gen(function* () {
+              yield* verifyGuardedTurn(
+                turnInput.threadId,
+                turnInput.providerThread,
+                turnInput.runtimePolicy.cwd,
+              );
               const threadId = yield* getNativeThreadId(turnInput.providerThread);
               yield* Ref.update(pendingRootTurns, (current) =>
                 new Map(current).set(threadId, turnInput),
@@ -6612,7 +6733,14 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               turnInput.restartContinuationOfRunId === undefined
                 ? parseCodexGoalCommand(turnInput.message.text)
                 : null;
-            if (goalCommand !== null) return runGoalCommand(turnInput, goalCommand);
+            if (goalCommand !== null)
+              return subscriptionThreads.has(turnInput.threadId)
+                ? Effect.fail(
+                    toProtocolError(
+                      "Native Codex /goal is unavailable for subscription-only delegation because its automatic turns bypass route checks. Use T3 schedules or PR watches instead.",
+                    ),
+                  )
+                : runGoalCommand(turnInput, goalCommand);
             return Effect.gen(function* () {
               yield* startNativeTurn(
                 turnInput,
@@ -6635,6 +6763,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
           },
           steerTurn: (turnInput) =>
             Effect.gen(function* () {
+              yield* verifyGuardedTurn(turnInput.threadId, turnInput.providerThread);
               const threadId = yield* getNativeThreadId(turnInput.providerThread);
               const latestTurnId = latestGoalTurnId(turnInput.providerTurnId);
               const held = heldGoalTurn(turnInput.providerThread, latestTurnId);
@@ -7208,15 +7337,19 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               // process. After a restart or idle release, load it the same way
               // the next turn would before reverting.
               if (!loaded) {
-                yield* client.raw.request("thread/resume", {
+                const appThreadId = threadInput.providerThread.appThreadId;
+                yield* verifySavedNativeThread(appThreadId, threadId);
+                const resumed = yield* client.raw.request("thread/resume", {
                   threadId,
                   excludeTurns: true,
                   ...codexThreadRuntimeParams({
                     mcpSession: yield* readMcpSession(threadInput.providerThread.appThreadId),
                     modelSelection: input.modelSelection,
                     runtimePolicy: input.runtimePolicy,
+                    subscriptionOnly: appThreadId !== null && subscriptionThreads.has(appThreadId),
                   }),
                 });
+                yield* verifyNativeResponse(appThreadId, resumed);
               }
               const response = yield* ensureInitialized.pipe(
                 Effect.andThen(revertCodexThread(client, threadId, numTurns)),
@@ -7252,6 +7385,13 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
           forkThread: (threadInput) =>
             Effect.gen(function* () {
               const threadId = yield* getNativeThreadId(threadInput.sourceProviderThread);
+              const sourceThreadId = threadInput.sourceProviderThread.appThreadId;
+              if (sourceThreadId !== null && subscriptionThreads.has(sourceThreadId))
+                subscriptionThreads.set(
+                  threadInput.targetThreadId,
+                  threadInput.runtimePolicy?.cwd ?? subscriptionThreads.get(sourceThreadId) ?? null,
+                );
+              yield* verifySubscription(threadInput.targetThreadId, threadInput.runtimePolicy?.cwd);
               const boundary = yield* resolveCodexForkBoundary(threadInput);
               const response = yield* ensureInitialized.pipe(
                 Effect.andThen(
@@ -7268,8 +7408,12 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                       ...(threadInput.runtimePolicy === undefined
                         ? {}
                         : { runtimePolicy: threadInput.runtimePolicy }),
+                      subscriptionOnly: subscriptionThreads.has(threadInput.targetThreadId),
                     }),
                   }),
+                ),
+                Effect.tap((response) =>
+                  verifyNativeResponse(threadInput.targetThreadId, response),
                 ),
                 Effect.mapError(
                   (cause) =>

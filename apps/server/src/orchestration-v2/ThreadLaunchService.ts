@@ -40,6 +40,7 @@ import * as GitWorkflow from "../git/GitWorkflowService.ts";
 import * as ProjectService from "../project/ProjectService.ts";
 import * as ProjectSetupScriptRunner from "../project/ProjectSetupScriptRunner.ts";
 import * as ManagedProjectFolders from "../project/ManagedProjectFolders.ts";
+import * as ClaudeCloudExecutionPolicy from "../provider/ClaudeCloudExecutionPolicy.ts";
 import * as ProviderRegistry from "../provider/ProviderRegistry.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import * as TextGeneration from "../textGeneration/TextGeneration.ts";
@@ -204,6 +205,7 @@ const make = Effect.gen(function* () {
   const providerRegistry = yield* ProviderRegistry.ProviderRegistry;
   const serverSettings = yield* ServerSettings.ServerSettingsService;
   const textGeneration = yield* TextGeneration.TextGeneration;
+  const cloudExecutionPolicy = yield* ClaudeCloudExecutionPolicy.ClaudeCloudExecutionPolicy;
   const receipts = yield* CommandReceiptStore.CommandReceiptStoreV2;
   const ids = yield* IdAllocator.IdAllocatorV2;
   const threads = yield* ThreadManagement.ThreadManagementService;
@@ -326,6 +328,15 @@ const make = Effect.gen(function* () {
     }
     yield* Effect.gen(function* () {
       const initialMessage = input.initialMessage;
+      const shell = yield* threads
+        .getThreadShell(threadId)
+        .pipe(Effect.mapError(mapError(input, "read-receipt", threadId)));
+      const guarded = yield* cloudExecutionPolicy
+        .isGuarded({
+          threadId,
+          ...(shell === null ? {} : { modelSelection: shell.modelSelection }),
+        })
+        .pipe(Effect.mapError(mapError(input, "generate-metadata", threadId)));
       const generateBranchNameFor = (cwd: string, message: ThreadLaunchInitialMessage) =>
         Effect.gen(function* () {
           const settings = resolveProjectSettings(
@@ -478,6 +489,7 @@ const make = Effect.gen(function* () {
       workspaceRecorded = true;
 
       if (
+        !guarded &&
         reused === undefined &&
         worktreePath !== null &&
         branch !== null &&

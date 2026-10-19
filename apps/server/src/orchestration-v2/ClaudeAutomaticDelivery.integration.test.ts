@@ -1,3 +1,4 @@
+import * as ClaudeCloudExecutionPolicyTestkit from "../provider/ClaudeCloudExecutionPolicy.testkit.ts";
 import type { SDKMessage, SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
 import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as NodeServices from "@effect/platform-node/NodeServices";
@@ -320,28 +321,34 @@ it.effect.each(deliveries)(
               assert.equal(ran.task.lastRunStatus, "succeeded");
             }).pipe(
               Effect.provide(
-                ScheduledTaskService.layer.pipe(
-                  Layer.provide(ThreadManagementService.layer),
-                  Layer.provide(ServerSettings.layerTest()),
-                  Layer.provide(
-                    Layer.mock(LegacyV1ThreadImporter.LegacyV1ThreadImporter)({
-                      ensureTranscript: () =>
-                        Effect.succeed({ importedThreadCount: 0, importedMessageCount: 0 }),
-                    }),
-                  ),
-                  Layer.provide(Layer.mock(ThreadLaunchService.ThreadLaunchService)({})),
-                  Layer.provide(Layer.mock(SecretRequests.SecretRequests)({})),
-                  Layer.provide(
-                    CommandReceiptStore.layer.pipe(Layer.provide(SqlitePersistence.layerMemory)),
-                  ),
-                  Layer.provide(
-                    Layer.mergeAll(
-                      NodeCrypto.layer,
-                      Scheduler.layer,
-                      SqlitePersistence.layerMemory,
+                ScheduledTaskService.layer
+                  .pipe(Layer.provide(ClaudeCloudExecutionPolicyTestkit.layer))
+                  .pipe(
+                    Layer.provide(
+                      ThreadManagementService.layer.pipe(
+                        Layer.provide(ClaudeCloudExecutionPolicyTestkit.layer),
+                      ),
+                    ),
+                    Layer.provide(ServerSettings.layerTest()),
+                    Layer.provide(
+                      Layer.mock(LegacyV1ThreadImporter.LegacyV1ThreadImporter)({
+                        ensureTranscript: () =>
+                          Effect.succeed({ importedThreadCount: 0, importedMessageCount: 0 }),
+                      }),
+                    ),
+                    Layer.provide(Layer.mock(ThreadLaunchService.ThreadLaunchService)({})),
+                    Layer.provide(Layer.mock(SecretRequests.SecretRequests)({})),
+                    Layer.provide(
+                      CommandReceiptStore.layer.pipe(Layer.provide(SqlitePersistence.layerMemory)),
+                    ),
+                    Layer.provide(
+                      Layer.mergeAll(
+                        NodeCrypto.layer,
+                        Scheduler.layer,
+                        SqlitePersistence.layerMemory,
+                      ),
                     ),
                   ),
-                ),
               ),
             );
           } else if (delivery === "user steering") {

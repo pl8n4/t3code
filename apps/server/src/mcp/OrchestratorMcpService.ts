@@ -88,6 +88,7 @@ import * as ThreadLaunchService from "../orchestration-v2/ThreadLaunchService.ts
 import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
 import { isSnoozed } from "../orchestration-v2/ThreadSettlementService.ts";
 import * as ProjectService from "../project/ProjectService.ts";
+import * as ClaudeCloudExecutionPolicy from "../provider/ClaudeCloudExecutionPolicy.ts";
 import * as ProviderRegistry from "../provider/ProviderRegistry.ts";
 import * as ScheduledTaskService from "../scheduledTasks/ScheduledTaskService.ts";
 import * as ServerSettings from "../serverSettings.ts";
@@ -908,6 +909,7 @@ const make = Effect.gen(function* () {
   const threadLaunch = yield* ThreadLaunchService.ThreadLaunchService;
   const gitDriver = yield* GitVcsDriver.GitVcsDriver;
   const serverSettings = yield* ServerSettings.ServerSettingsService;
+  const cloudExecutionPolicy = yield* ClaudeCloudExecutionPolicy.ClaudeCloudExecutionPolicy;
 
   const requireProject = (projectId: ProjectId) =>
     projects.getById(projectId).pipe(
@@ -1659,7 +1661,17 @@ const make = Effect.gen(function* () {
               }),
         };
         const { task } = yield* scheduledTasks
-          .upsert(upsertInput)
+          .upsert({
+            ...upsertInput,
+            ...(parent === undefined
+              ? {}
+              : {
+                  guardedSource: {
+                    threadId: parent.thread.id,
+                    modelSelection: parent.thread.modelSelection,
+                  },
+                }),
+          })
           .pipe(
             Effect.mapError((error) =>
               failure("orchestration_error", `Could not schedule task: ${error.message}`),
@@ -1689,6 +1701,13 @@ const make = Effect.gen(function* () {
       Effect.gen(function* () {
         const { parent, limits } = yield* loadCaller(scope);
         const existing = yield* loadScheduledTask(input.scheduledTaskId, limits);
+        if (parent !== undefined)
+          yield* cloudExecutionPolicy
+            .assertScheduleRelated(
+              { threadId: parent.thread.id, modelSelection: parent.thread.modelSelection },
+              existing.id,
+            )
+            .pipe(Effect.mapError((cause) => failure("invalid_request", cause.message)));
         yield* assertLiveCallerForOtherProject(scope, parent, existing.projectId);
         if (
           input.bindToCurrentThread === true &&
@@ -1730,7 +1749,17 @@ const make = Effect.gen(function* () {
           creationSource: existing.creationSource,
         };
         const { task } = yield* scheduledTasks
-          .upsert(upsertInput)
+          .upsert({
+            ...upsertInput,
+            ...(parent === undefined
+              ? {}
+              : {
+                  guardedSource: {
+                    threadId: parent.thread.id,
+                    modelSelection: parent.thread.modelSelection,
+                  },
+                }),
+          })
           .pipe(
             Effect.mapError((error) =>
               failure("orchestration_error", `Could not update scheduled task: ${error.message}`),
@@ -1742,6 +1771,13 @@ const make = Effect.gen(function* () {
       Effect.gen(function* () {
         const { parent, limits } = yield* loadCaller(scope);
         const existing = yield* loadScheduledTask(input.scheduledTaskId, limits);
+        if (parent !== undefined)
+          yield* cloudExecutionPolicy
+            .assertScheduleRelated(
+              { threadId: parent.thread.id, modelSelection: parent.thread.modelSelection },
+              existing.id,
+            )
+            .pipe(Effect.mapError((cause) => failure("invalid_request", cause.message)));
         yield* assertLiveCallerForOtherProject(scope, parent, existing.projectId);
         yield* scheduledTasks
           .delete({ id: existing.id })
@@ -2304,6 +2340,12 @@ const make = Effect.gen(function* () {
                 stableCommandId({ scope, requestKey: key, operation: "create-thread", index }),
                 target,
               );
+              yield* cloudExecutionPolicy
+                .inherit(
+                  { threadId: parent.thread.id, modelSelection: parent.thread.modelSelection },
+                  { threadId, modelSelection: target.modelSelection },
+                )
+                .pipe(Effect.mapError((cause) => failure("invalid_request", cause.message)));
               const title = threadTitle({
                 parentTitle: parent.thread.title,
                 prompt: request.prompt,
@@ -2683,4 +2725,5 @@ export const layer: Layer.Layer<
   | ProjectService.ProjectService
   | SecretRequests.SecretRequests
   | ServerSettings.ServerSettingsService
+  | ClaudeCloudExecutionPolicy.ClaudeCloudExecutionPolicy
 > = Layer.effect(OrchestratorMcpService, make);

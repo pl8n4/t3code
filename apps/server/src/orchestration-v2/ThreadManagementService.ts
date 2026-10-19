@@ -45,6 +45,7 @@ import * as Option from "effect/Option";
 import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
+import * as Semaphore from "effect/Semaphore";
 
 import * as CommandReceiptStore from "./CommandReceiptStore.ts";
 import * as Orchestrator from "./Orchestrator.ts";
@@ -56,6 +57,8 @@ import { DispatchModeLimit, exceededDispatchModeLimit } from "./DispatchModeLimi
 import { projectTurnItemForDetail } from "./WireProjection.ts";
 import * as LegacyV1ThreadImporter from "./legacy/LegacyV1ThreadImporter.ts";
 import * as ServerSettings from "../serverSettings.ts";
+import * as ClaudeCloudExecutionPolicy from "../provider/ClaudeCloudExecutionPolicy.ts";
+import { derive } from "@t3tools/provider-core/server/IdAllocator";
 
 export type ThreadManagementSendMode = "auto" | "queue" | "steer" | "restart";
 
@@ -514,6 +517,8 @@ const make = Effect.gen(function* () {
   const legacyImporter = yield* LegacyV1ThreadImporter.LegacyV1ThreadImporter;
   const serverSettings = yield* ServerSettings.ServerSettingsService;
   const receipts = yield* CommandReceiptStore.CommandReceiptStoreV2;
+  const cloudExecutionPolicy = yield* ClaudeCloudExecutionPolicy.ClaudeCloudExecutionPolicy;
+  const delegationAdmission = yield* Semaphore.make(1);
 
   const assertProviderInstanceEnabled: ThreadManagementServiceShape["assertProviderInstanceEnabled"] =
     (input) =>
@@ -669,11 +674,113 @@ const make = Effect.gen(function* () {
     }
   };
 
-  const dispatch: ThreadManagementServiceShape["dispatch"] = (command) =>
-    ensureCommandTranscripts(command).pipe(
+  const assertGuardedDispatch = Effect.fnUntraced(function* (
+    command: OrchestrationV2ServerCommand,
+  ) {
+    if (
+      command.type !== "message.dispatch" &&
+      command.type !== "delegated_task.request" &&
+      command.type !== "thread.fork" &&
+      command.type !== "thread.merge_back"
+    )
+      return;
+    if (Option.isSome(yield* receipts.getByCommandId(command.commandId))) return;
+    const target = (
+      thread: OrchestrationV2ThreadProjection["thread"],
+      modelSelection = thread.modelSelection,
+    ) => ({
+      threadId: thread.id,
+      modelSelection,
+      ...(thread.worktreePath === null ? {} : { cwd: thread.worktreePath }),
+    });
+    if (command.type === "delegated_task.request") {
+      const parent = yield* orchestrator.getThreadRecords(command.parentThreadId, ["subagents"]);
+      const guarded = yield* cloudExecutionPolicy.admit(target(parent.thread));
+      if (
+        guarded !== undefined &&
+        parent.subagents.filter(
+          (task) =>
+            task.origin === "app_owned" &&
+            task.status !== "completed" &&
+            task.status !== "failed" &&
+            task.status !== "cancelled" &&
+            task.status !== "interrupted",
+        ).length >= 4
+      )
+        return yield* new ClaudeCloudExecutionPolicy.ClaudeCloudExecutionPolicyError({
+          detail:
+            "This guarded thread already has four active delegated tasks. Wait for one to finish before starting another.",
+        });
+      yield* cloudExecutionPolicy.inherit(target(parent.thread), {
+        threadId: derive.delegatedTaskThread({ commandId: command.commandId }),
+        modelSelection: command.modelSelection,
+        ...(parent.thread.worktreePath === null ? {} : { cwd: parent.thread.worktreePath }),
+      });
+    } else if (command.type === "message.dispatch") {
+      const projection = yield* orchestrator.getThreadRecords(command.threadId, []);
+      const destination = target(
+        projection.thread,
+        command.modelSelection ?? projection.thread.modelSelection,
+      );
+      if (command.scheduledTaskId !== undefined)
+        yield* cloudExecutionPolicy.prepareScheduled(command.scheduledTaskId, destination);
+      if (
+        command.senderThreadId !== undefined &&
+        command.senderThreadId !== command.threadId &&
+        (yield* cloudExecutionPolicy.isGuarded({ threadId: command.senderThreadId }))
+      ) {
+        const source = yield* orchestrator.getThreadRecords(command.senderThreadId, []);
+        const history = yield* orchestrator.getThreadRecords(command.threadId, ["runs"]);
+        if (history.runs.length === 0)
+          yield* cloudExecutionPolicy.inherit(target(source.thread), destination);
+        else yield* cloudExecutionPolicy.assertRelated(target(source.thread), destination);
+      }
+      yield* cloudExecutionPolicy.admit(destination);
+      if (
+        command.dispatchMode.type === "steer_active" ||
+        command.dispatchMode.type === "restart_active"
+      ) {
+        const active = yield* orchestrator.getThreadRecords(command.threadId, ["runs"]);
+        const targetRunId = command.dispatchMode.targetRunId;
+        const run = active.runs.find((run) => run.id === targetRunId);
+        if (run !== undefined)
+          yield* cloudExecutionPolicy.admit(target(active.thread, run.modelSelection));
+      }
+    } else if (command.type === "thread.fork" || command.type === "thread.merge_back") {
+      const source = yield* orchestrator.getThreadRecords(command.sourceThreadId, []);
+      const destination =
+        command.type === "thread.fork"
+          ? {
+              threadId: command.targetThreadId,
+              modelSelection: source.thread.modelSelection,
+              ...(source.thread.worktreePath === null ? {} : { cwd: source.thread.worktreePath }),
+            }
+          : target((yield* orchestrator.getThreadRecords(command.targetThreadId, [])).thread);
+      yield* cloudExecutionPolicy.inherit(target(source.thread), destination);
+    }
+  });
+
+  const dispatch: ThreadManagementServiceShape["dispatch"] = (command) => {
+    const execute = ensureCommandTranscripts(command).pipe(
       Effect.andThen(assertDispatchTargetEnabled(command)),
+      Effect.andThen(
+        assertGuardedDispatch(command).pipe(
+          Effect.mapError(
+            (cause) =>
+              new Orchestrator.OrchestratorDispatchError({
+                commandId: command.commandId,
+                commandType: command.type,
+                cause: cause.message,
+              }),
+          ),
+        ),
+      ),
       Effect.andThen(orchestrator.dispatch(command)),
     );
+    return command.type === "delegated_task.request"
+      ? delegationAdmission.withPermit(execute)
+      : execute;
+  };
 
   const getProjectThread: ThreadManagementServiceShape["getProjectThread"] = (input) =>
     getThreadProjection(input.threadId).pipe(
@@ -1201,6 +1308,7 @@ export const layer: Layer.Layer<
   | ProviderSessionManager.ProviderSessionManagerV2
   | ServerSettings.ServerSettingsService
   | CommandReceiptStore.CommandReceiptStoreV2
+  | ClaudeCloudExecutionPolicy.ClaudeCloudExecutionPolicy
 > = Layer.effect(ThreadManagementService, make).pipe(
   Layer.provide(layerLegacyV1ThreadImporterNoop),
   Layer.provide(ThreadCommandExecutor.layer),
@@ -1214,4 +1322,5 @@ export const layerWithLegacyImporter: Layer.Layer<
   | ProviderSessionManager.ProviderSessionManagerV2
   | ServerSettings.ServerSettingsService
   | CommandReceiptStore.CommandReceiptStoreV2
+  | ClaudeCloudExecutionPolicy.ClaudeCloudExecutionPolicy
 > = Layer.effect(ThreadManagementService, make).pipe(Layer.provide(ThreadCommandExecutor.layer));

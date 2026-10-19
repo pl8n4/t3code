@@ -1243,6 +1243,7 @@ it.layer(
             {
               getInstance: (id) =>
                 Effect.succeed(id === instance.instanceId ? instance : undefined),
+              getInstanceForConfig: () => Effect.succeed(undefined),
               listInstances: Effect.succeed([instance]),
               listUnavailable: Effect.succeed([]),
               streamChanges: Stream.empty,
@@ -1618,6 +1619,7 @@ it.layer(
           {
             getInstance: (instanceId) =>
               Effect.succeed(instanceId === codexInstanceId ? instance : undefined),
+            getInstanceForConfig: () => Effect.succeed(undefined),
             listInstances: Effect.succeed([instance]),
             listUnavailable: Effect.succeed([]),
             streamChanges: Stream.empty,
@@ -1755,6 +1757,7 @@ it.layer(
                   instances.find((instance) => instance.instanceId === requestedId),
                 ),
               ),
+            getInstanceForConfig: () => Effect.succeed(undefined),
             listInstances: Ref.get(instancesRef),
             listUnavailable: Effect.succeed([]),
             streamChanges: Stream.fromPubSub(registryChanges),
@@ -2017,6 +2020,7 @@ it.layer(
           {
             getInstance: (instanceId) =>
               Effect.succeed(instances.find((instance) => instance.instanceId === instanceId)),
+            getInstanceForConfig: () => Effect.succeed(undefined),
             listInstances: Effect.succeed(instances),
             listUnavailable: Effect.succeed([]),
             streamChanges: Stream.empty,
@@ -2193,6 +2197,7 @@ it.layer(
           {
             getInstance: (requestedId) =>
               Effect.succeed(instances.find((instance) => instance.instanceId === requestedId)),
+            getInstanceForConfig: () => Effect.succeed(undefined),
             listInstances: Effect.succeed(instances),
             listUnavailable: Effect.succeed([]),
             streamChanges: Stream.empty,
@@ -2297,6 +2302,7 @@ it.layer(
           {
             getInstance: (instanceId) =>
               Effect.succeed(instanceId === cursorInstanceId ? instance : undefined),
+            getInstanceForConfig: () => Effect.succeed(undefined),
             listInstances: Effect.succeed([instance]),
             listUnavailable: Effect.succeed([]),
             streamChanges: Stream.empty,
@@ -2425,6 +2431,7 @@ it.layer(
             {
               getInstance: (instanceId) =>
                 Effect.succeed(instanceId === openCodeInstanceId ? instance : undefined),
+              getInstanceForConfig: () => Effect.succeed(undefined),
               listInstances: Effect.succeed([instance]),
               listUnavailable: Effect.succeed([]),
               streamChanges: Stream.empty,
@@ -2528,6 +2535,7 @@ it.layer(
           {
             getInstance: (instanceId) =>
               Effect.succeed(instanceId === codexInstanceId ? instance : undefined),
+            getInstanceForConfig: () => Effect.succeed(undefined),
             listInstances: Effect.succeed([instance]),
             listUnavailable: Effect.succeed([]),
             streamChanges: Stream.empty,
@@ -2639,6 +2647,7 @@ it.layer(
                   instances.find((instance) => instance.instanceId === instanceId),
                 ),
               ),
+            getInstanceForConfig: () => Effect.succeed(undefined),
             listInstances: Effect.gen(function* () {
               const shouldFail = yield* Ref.get(failNextList);
               if (shouldFail) {

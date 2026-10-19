@@ -1,3 +1,4 @@
+import * as ClaudeCloudExecutionPolicyTestkit from "../provider/ClaudeCloudExecutionPolicy.testkit.ts";
 import { expect, it } from "@effect/vitest";
 import {
   EnvironmentId,
@@ -189,6 +190,7 @@ const probeServer = (threads: Layer.Layer<ThreadManagement.ThreadManagementServi
   McpHttpServer.toolkitRegistration(ProbeToolkit, layerProbeHandlers).pipe(
     Layer.provideMerge(McpServer.McpServer.layer),
     Layer.provideMerge(threads),
+    Layer.provide(ClaudeCloudExecutionPolicyTestkit.layer),
   );
 
 const decodeOutcome = Schema.decodeUnknownEffect(

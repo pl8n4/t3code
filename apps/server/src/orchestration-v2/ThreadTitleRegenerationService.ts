@@ -14,6 +14,7 @@ import * as Option from "effect/Option";
 import * as Schedule from "effect/Schedule";
 
 import * as ServerSettings from "../serverSettings.ts";
+import * as ClaudeCloudExecutionPolicy from "../provider/ClaudeCloudExecutionPolicy.ts";
 import * as TextGeneration from "../textGeneration/TextGeneration.ts";
 import type { OrchestratorV2Error } from "./Orchestrator.ts";
 import * as ProjectStore from "./ProjectStore.ts";
@@ -46,6 +47,7 @@ const make = Effect.gen(function* () {
   const projects = yield* ProjectStore.ProjectStoreV2;
   const serverSettings = yield* ServerSettings.ServerSettingsService;
   const textGeneration = yield* TextGeneration.TextGeneration;
+  const cloudExecutionPolicy = yield* ClaudeCloudExecutionPolicy.ClaudeCloudExecutionPolicy;
 
   const complete = (input: {
     readonly threadId: ThreadId;
@@ -78,6 +80,16 @@ const make = Effect.gen(function* () {
       if (projection.thread.titleRegeneration?.requestId !== input.requestId) {
         return { type: "stale" as const };
       }
+
+      if (
+        yield* cloudExecutionPolicy
+          .isGuarded({
+            threadId: input.threadId,
+            modelSelection: projection.thread.modelSelection,
+          })
+          .pipe(Effect.catch(() => Effect.succeed(true)))
+      )
+        return { type: "complete" as const };
 
       const project = yield* projects.get(projection.thread.projectId);
       if (Option.isNone(project)) {

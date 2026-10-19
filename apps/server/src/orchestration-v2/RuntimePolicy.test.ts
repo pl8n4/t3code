@@ -78,6 +78,7 @@ const layerTest = RuntimePolicy.layerFromProjectStore.pipe(
   Layer.provide(
     Layer.succeed(ProviderInstanceRegistry.ProviderInstanceRegistry, {
       getInstance: (instanceId) => Effect.succeed(providerInstanceFor(instanceId)),
+      getInstanceForConfig: () => Effect.succeed(undefined),
       listInstances: Effect.succeed([]),
       listUnavailable: Effect.succeed([]),
       streamChanges: Stream.empty,

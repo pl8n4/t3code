@@ -3,13 +3,11 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import { EnvironmentId, IsoDateTime, ThreadId } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
-import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Config from "../config.ts";
 import * as Threads from "../orchestration-v2/ThreadManagementService.ts";
 import * as Project from "../project/ProjectService.ts";
-import * as Processes from "../processRunner.ts";
 import * as PullRequests from "../pullRequest/PullRequestService.ts";
 import * as Known from "../workspace/KnownWorkspaces.ts";
 import * as Files from "../workspace/WorkspaceFileSystem.ts";
@@ -65,7 +63,6 @@ const fixture = Effect.gen(function* () {
     updatedAt: date,
     deletedAt: null,
   };
-  const commands: string[] = [];
   const prCalls: unknown[] = [];
   const scope: McpInvocationScope = {
     environmentId: EnvironmentId.make("test-env"),
@@ -114,23 +111,6 @@ const fixture = Effect.gen(function* () {
     Layer.provide(
       Layer.mock(Threads.ThreadManagementService)({ getThreadShell: () => Effect.succeed(shell) }),
     ),
-    Layer.provide(
-      Layer.mock(Processes.ProcessRunner)({
-        run: (input) => {
-          commands.push(input.cwd ?? "");
-          return Effect.succeed({
-            stdout: "OK",
-            stderr: "",
-            code: ChildProcessSpawner.ExitCode(0),
-            timedOut: false,
-            stdoutTruncated: false,
-            stderrTruncated: false,
-            stdoutInvalidUtf8: false,
-            stderrInvalidUtf8: false,
-          });
-        },
-      }),
-    ),
     Layer.provide(Vcs.layer.pipe(Layer.provide(VcsProcess.layer))),
     Layer.provide(Git.layer.pipe(Layer.provide(VcsProcess.layer))),
     Layer.provide(Config.ServerConfig.layerTest(dir, `${dir}/state`)),
@@ -141,7 +121,6 @@ const fixture = Effect.gen(function* () {
     scope,
     fs,
     dir,
-    commands,
     prCalls,
     git,
     setShell: (patch: Partial<typeof shell>) => {
@@ -178,7 +157,9 @@ describe("agent local workspace", () => {
             (yield* f.service.exec(f.scope, { command: "must not execute" }).pipe(Effect.result))
               ._tag,
           ).toBe("Failure");
-          expect(f.commands).toEqual([]);
+          expect(
+            yield* f.fs.readDirectory(`${f.dir}/state/userdata/workspace-command-jobs`),
+          ).toEqual([]);
         }),
       ),
   );
@@ -302,11 +283,31 @@ describe("agent local workspace", () => {
             .write(f.scope, { path: "file", contents: "bad", expectedVersion: null })
             .pipe(Effect.result))._tag,
         ).toBe("Failure");
-        expect(f.commands).toEqual([]);
+        expect(yield* f.fs.readDirectory(`${f.dir}/state/userdata/workspace-command-jobs`)).toEqual(
+          [],
+        );
       }),
     ),
   );
-  it.effect("pages files consistently and runs commands in the thread's workspace", () =>
+  it.live("revalidates job reads, lists, and cancellation after a mode downgrade", () =>
+    withServices(
+      Effect.gen(function* () {
+        const f = yield* fixture;
+        const job = yield* f.service.exec(f.scope, { command: "printf allowed", yieldMs: 10000 });
+        expect((yield* f.service.jobList(f.scope, {})).map((entry) => entry.jobId)).toEqual([
+          job.jobId,
+        ]);
+        f.setShell({ runtimeMode: "approval-required" });
+        for (const effect of [
+          f.service.jobRead(f.scope, { jobId: job.jobId }).pipe(Effect.asVoid),
+          f.service.jobList(f.scope, {}).pipe(Effect.asVoid),
+          f.service.jobCancel(f.scope, { jobId: job.jobId }).pipe(Effect.asVoid),
+        ])
+          expect((yield* effect.pipe(Effect.result))._tag).toBe("Failure");
+      }),
+    ),
+  );
+  it.live("pages files consistently and runs commands in the thread's workspace", () =>
     withServices(
       Effect.gen(function* () {
         const f = yield* fixture;
@@ -319,8 +320,9 @@ describe("agent local workspace", () => {
         });
         expect([one.contents, two.contents]).toEqual(["abc", "def"]);
         expect(two.version).toBe(one.version);
-        expect((yield* f.service.exec(f.scope, { command: "test" })).exitCode).toBe(0);
-        expect(f.commands).toEqual([f.dir]);
+        const command = yield* f.service.exec(f.scope, { command: "pwd", yieldMs: 10000 });
+        expect(command.exitCode).toBe(0);
+        expect(command.stdout.trim()).toBe(f.dir);
       }),
     ),
   );

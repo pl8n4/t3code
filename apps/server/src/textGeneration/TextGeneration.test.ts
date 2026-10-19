@@ -52,6 +52,7 @@ const makeStubRegistry = (
   const byId = new Map(instances.map((instance) => [instance.instanceId, instance] as const));
   return {
     getInstance: (id) => Effect.succeed(byId.get(id)),
+    getInstanceForConfig: () => Effect.succeed(undefined),
     listInstances: Effect.succeed(instances),
     listUnavailable: Effect.succeed([]),
     streamChanges: Stream.empty,

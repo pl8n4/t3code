@@ -42,6 +42,21 @@ export const layer = Access.toLayer(
           return yield* workspace.write(scope, input);
         }),
       ),
+      t3_workspace_job_read: Access.readsAsCaller((input) =>
+        Effect.gen(function* () {
+          return yield* workspace.jobRead(yield* Invocation.McpInvocationContext, input);
+        }),
+      ),
+      t3_workspace_job_list: Access.readsAsCaller((input) =>
+        Effect.gen(function* () {
+          return yield* workspace.jobList(yield* Invocation.McpInvocationContext, input);
+        }),
+      ),
+      t3_workspace_job_cancel: Access.actsAsCaller((input) =>
+        Effect.gen(function* () {
+          return yield* workspace.jobCancel(yield* Invocation.McpInvocationContext, input);
+        }),
+      ),
       t3_workspace_exec: Access.actsAsCaller((input) =>
         Effect.gen(function* () {
           const scope = yield* Invocation.McpInvocationContext;

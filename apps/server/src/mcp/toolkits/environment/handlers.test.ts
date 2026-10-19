@@ -1,3 +1,4 @@
+import * as ClaudeCloudExecutionPolicyTestkit from "../../../provider/ClaudeCloudExecutionPolicy.testkit.ts";
 import { expect, it } from "@effect/vitest";
 import {
   DEFAULT_SERVER_SETTINGS,
@@ -79,16 +80,18 @@ it.effect("updates preferences for a thread caller through the /mcp registration
     expect(result.structuredContent).toMatchObject({ newWorktreesStartFromOrigin: true });
   }).pipe(
     Effect.provide(
-      McpHttpServer.layerEnvironmentToolkit.pipe(
-        Layer.provideMerge(McpServer.McpServer.layer),
-        Layer.provide(
-          Layer.mock(ThreadManagement.ThreadManagementService)({
-            getThreadShell: (id) => Effect.succeed(liveThreadShell(id)),
-          }),
+      McpHttpServer.layerEnvironmentToolkit
+        .pipe(Layer.provide(ClaudeCloudExecutionPolicyTestkit.layer))
+        .pipe(
+          Layer.provideMerge(McpServer.McpServer.layer),
+          Layer.provide(
+            Layer.mock(ThreadManagement.ThreadManagementService)({
+              getThreadShell: (id) => Effect.succeed(liveThreadShell(id)),
+            }),
+          ),
+          Layer.provide(layerEnvironment),
+          Layer.provide(Settings.layerTest()),
         ),
-        Layer.provide(layerEnvironment),
-        Layer.provide(Settings.layerTest()),
-      ),
     ),
   ),
 );
@@ -99,6 +102,7 @@ it.effect("refuses a preferences update when the caller's turn ends while it wai
     const updates = yield* Ref.make(0);
     const checked = yield* Deferred.make<void>();
     const layerDependencies = Layer.mergeAll(
+      ClaudeCloudExecutionPolicyTestkit.layer,
       ThreadCommandExecutor.layer,
       Layer.succeed(McpInvocationContext.McpInvocationContext, {
         environmentId,

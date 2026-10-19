@@ -24,6 +24,7 @@ import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 
+import * as ClaudeCloudExecutionPolicy from "../../../provider/ClaudeCloudExecutionPolicy.ts";
 import * as Orchestrator from "../../../orchestration-v2/Orchestrator.ts";
 import * as ProjectService from "../../../project/ProjectService.ts";
 import * as PullRequestReviewGuideService from "../../../pullRequest/PullRequestReviewGuideService.ts";
@@ -185,6 +186,7 @@ function projectForPullRequest(
 
 const make = Effect.gen(function* () {
   const engine = yield* Orchestrator.OrchestratorV2;
+  const cloudExecutionPolicy = yield* ClaudeCloudExecutionPolicy.ClaudeCloudExecutionPolicy;
   const reviewGuides = yield* PullRequestReviewGuideService.PullRequestReviewGuideService;
 
   const projects = yield* ProjectService.ProjectService;
@@ -253,6 +255,18 @@ const make = Effect.gen(function* () {
     watching: boolean,
   ) {
     const thread = yield* requireThread(PullRequestWatchFailedError, input.threadId);
+    if (watching) {
+      const scope = yield* McpInvocationContext.requireMcpCapability("pull-requests");
+      if (scope.thread !== undefined) {
+        const caller = yield* requireThread(PullRequestWatchFailedError, scope.thread.threadId);
+        yield* cloudExecutionPolicy
+          .assertRelated(
+            { threadId: caller.id, modelSelection: caller.modelSelection },
+            { threadId: thread.id, modelSelection: thread.modelSelection },
+          )
+          .pipe(Effect.mapError((cause) => new PullRequestWatchFailedError({ cause })));
+      }
+    }
     const project = yield* projectOf(thread, PullRequestWatchFailedError);
     const target = yield* resolveTarget(input, project);
     const watchedLink = (shell: OrchestrationV2ThreadShell) =>

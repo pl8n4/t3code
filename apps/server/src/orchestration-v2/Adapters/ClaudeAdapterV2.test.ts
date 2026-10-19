@@ -83,6 +83,15 @@ import { WorktreeToolkit } from "../../mcp/toolkits/worktree/tools.ts";
 import { ThreadToolkit } from "../../mcp/toolkits/thread/tools.ts";
 import { OrchestratorToolkit } from "../../mcp/toolkits/orchestrator/tools.ts";
 import { ClaudeExecutableFileCheck } from "../../provider/Drivers/ClaudeExecutable.ts";
+import * as ClaudeCloudExecutionPolicyTestkit from "../../provider/ClaudeCloudExecutionPolicy.testkit.ts";
+import * as RunExecutionService from "../RunExecutionService.ts";
+import * as SqlitePersistence from "../../persistence/Sqlite.ts";
+import * as GitVcsDriver from "../../vcs/GitVcsDriver.ts";
+import * as EventSink from "../EventSink.ts";
+import * as EventStore from "../EventStore.ts";
+import * as ProjectionStore from "../ProjectionStore.ts";
+import * as ProviderEventIngestor from "../ProviderEventIngestor.ts";
+import * as ThreadCommandExecutor from "../ThreadCommandExecutor.ts";
 import * as ProviderEventLoggers from "@t3tools/provider-core/server/ProviderEventLoggers";
 import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import type * as ProviderContinuationRequests from "@t3tools/provider-core/server/ProviderContinuationRequests";
@@ -102,9 +111,37 @@ import {
 } from "../testkit/fixtures/shared.ts";
 
 const DEFAULT_CLAUDE_SETTINGS = Schema.decodeSync(ClaudeSettings)({});
+const CLOUD_CLAUDE_SETTINGS = Schema.decodeSync(ClaudeSettings)({ cloudFreeCreditsOnly: true });
 const AUTO_COMPACT_CLAUDE_SETTINGS = Schema.decodeSync(ClaudeSettings)({
   autoCompactWindow: "300000",
 });
+const recoveryDatabase = SqlitePersistence.layerMemory;
+const recoveryStores = Layer.merge(EventStore.layer, ProjectionStore.layer).pipe(
+  Layer.provide(recoveryDatabase),
+);
+const recoverySink = EventSink.layer.pipe(
+  Layer.provide(Layer.mergeAll(recoveryStores, recoveryDatabase)),
+);
+const recoveryGit = GitVcsDriver.layer.pipe(
+  Layer.provide(ServerConfig.layerTest(process.cwd(), { prefix: "cloud-recovery-ingestor-" })),
+  Layer.provideMerge(NodeServices.layer),
+);
+const recoveryPersistence = Layer.mergeAll(
+  recoveryDatabase,
+  recoveryStores,
+  recoverySink,
+  ProviderEventIngestor.layer.pipe(
+    Layer.provide(
+      Layer.mergeAll(
+        recoveryStores,
+        recoverySink,
+        IdAllocator.layer,
+        ThreadCommandExecutor.layer,
+        recoveryGit,
+      ),
+    ),
+  ),
+);
 const CUSTOM_MODEL_CLAUDE_SETTINGS = Schema.decodeSync(ClaudeSettings)({
   customModels: [
     "opus",
@@ -2346,6 +2383,8 @@ describe("ClaudeAdapterV2 background wake turns", () => {
     readonly settings?: ClaudeSettings;
     readonly freshQueueOnReopen?: boolean;
     readonly cloudEventSequence?: (message: SDKMessage) => string | undefined;
+    readonly cloudEventWasDurable?: (message: SDKMessage) => boolean;
+    readonly pendingCloudTurn?: { readonly promptUuid: string };
   }) =>
     Effect.gen(function* () {
       const fileSystem = yield* FileSystem.FileSystem;
@@ -2368,6 +2407,9 @@ describe("ClaudeAdapterV2 background wake turns", () => {
       });
       const offeredMessages: Array<SDKUserMessage> = [];
       const openedCloudCheckpoints: Array<string | undefined> = [];
+      const recoveryAdmissions: Array<boolean | undefined> = [];
+      let pendingCloudTurn = options?.pendingCloudTurn;
+      let recoveredTurns = 0;
       const offeredCloudCheckpoints: Array<string | undefined> = [];
       const permissionModeChanges: Array<string> = [];
       const liveSelectionChanges: Array<unknown> = [];
@@ -2379,6 +2421,7 @@ describe("ClaudeAdapterV2 background wake turns", () => {
         yield* Queue.unbounded<
           Extract<ProviderAdapter.ProviderAdapterV2Event, { type: "turn.terminal" }>
         >();
+      const cloudCheckpointReceipts = yield* Queue.unbounded<string>();
       const subagentReceipts =
         yield* Queue.unbounded<
           Extract<ProviderAdapter.ProviderAdapterV2Event, { type: "subagent.updated" }>
@@ -2412,6 +2455,7 @@ describe("ClaudeAdapterV2 background wake turns", () => {
             Effect.gen(function* () {
               openedOptions = input.options;
               openedCloudCheckpoints.push(input.durableCloudSequence);
+              recoveryAdmissions.push(input.recoverPendingCloudTurn);
               if (options?.freshQueueOnReopen === true && processQueues.length > 0) {
                 const processMessages = yield* Queue.unbounded<SDKMessage>();
                 processQueues.push(processMessages);
@@ -2435,6 +2479,16 @@ describe("ClaudeAdapterV2 background wake turns", () => {
                 ...(options?.cloudEventSequence === undefined
                   ? {}
                   : { cloudEventSequence: options.cloudEventSequence }),
+                ...(options?.cloudEventWasDurable === undefined
+                  ? {}
+                  : { cloudEventWasDurable: options.cloudEventWasDurable }),
+                get pendingCloudTurn() {
+                  return pendingCloudTurn;
+                },
+                resumePendingCloudTurn: Effect.sync(() => {
+                  recoveredTurns++;
+                  pendingCloudTurn = undefined;
+                }),
                 messages: Stream.fromQueue(sdkMessages).pipe(
                   Stream.flatMap((message) =>
                     Stream.make(message).pipe(
@@ -2496,6 +2550,15 @@ describe("ClaudeAdapterV2 background wake turns", () => {
         Stream.runForEach((event) =>
           Effect.gen(function* () {
             events.push(event);
+            if (
+              event.type === "provider_thread.updated" &&
+              event.providerThread.nativeMetadata?.cloudEventSequence !== undefined
+            ) {
+              yield* Queue.offer(
+                cloudCheckpointReceipts,
+                event.providerThread.nativeMetadata.cloudEventSequence,
+              );
+            }
             if (event.type === "subagent.updated") {
               yield* Queue.offer(subagentReceipts, event);
             }
@@ -2530,6 +2593,8 @@ describe("ClaudeAdapterV2 background wake turns", () => {
         offeredMessages,
         openedCloudCheckpoints,
         offeredCloudCheckpoints,
+        recoveryAdmissions,
+        recoveredTurns: () => recoveredTurns,
         promptUuid: (index: number) => {
           const uuid = offeredMessages[index]?.uuid;
           if (uuid === undefined) throw new Error(`No prompt offered at index ${index}.`);
@@ -2541,6 +2606,7 @@ describe("ClaudeAdapterV2 background wake turns", () => {
         continuationReceipts,
         events,
         terminalReceipts,
+        cloudCheckpointReceipts,
         subagentReceipts,
         systemNoticeReceipts,
         getOpenedOptions: () => openedOptions,
@@ -2549,6 +2615,544 @@ describe("ClaudeAdapterV2 background wake turns", () => {
       };
     });
   const makeWakeHarness = makeWakeHarnessWithOptions();
+
+  it.effect(
+    "recovers a cloud turn into its same-thread continuation without replaying durable artifacts or sending a prompt",
+    () =>
+      Effect.gen(function* () {
+        const f = yield* makeWakeHarnessWithOptions({
+          pendingCloudTurn: { promptUuid: "00000000-0000-4000-8000-000000000210" },
+          cloudEventWasDurable: (message) =>
+            message.uuid === "00000000-0000-4000-8000-000000000213",
+          cloudEventSequence: (message) =>
+            message.uuid === "00000000-0000-4000-8000-000000000213"
+              ? "10"
+              : message.type === "result"
+                ? "12"
+                : "11",
+        });
+        const turn = {
+          ...makeClaudeTestTurnInput({
+            threadId: f.threadId,
+            providerThread: { ...f.providerThread, nativeMetadata: { cloudEventSequence: "10" } },
+            now: yield* DateTime.now,
+            attemptId: RunAttemptId.make("cloud-recovery-continuation"),
+            text: "Continue where you left off.",
+            attachments: [],
+            providerTurnOrdinal: 2,
+          }),
+          restartContinuationOfRunId: RunId.make("run-before-restart"),
+        };
+        yield* f.runtime.startTurn(turn);
+        assert.deepEqual(f.recoveryAdmissions, [true]);
+        assert.equal(f.recoveredTurns(), 1);
+        assert.lengthOf(f.offeredMessages, 0);
+        yield* f.offerAndWait(
+          makeAssistantTextFrame({
+            uuid: "00000000-0000-4000-8000-000000000213",
+            text: "Saved before restart",
+          }),
+        );
+        assert.isFalse(
+          f.events.some(
+            (event) =>
+              event.type === "message.updated" && event.message.text === "Saved before restart",
+          ),
+        );
+        yield* f.offerAndWait(
+          makeAssistantTextFrame({
+            uuid: "cloud-recovered-reply",
+            text: "Recovered after restart",
+          }),
+        );
+        assert.equal(yield* Queue.take(f.cloudCheckpointReceipts), "11");
+        const replyIndex = f.events.findIndex(
+          (event) =>
+            event.type === "message.updated" && event.message.text === "Recovered after restart",
+        );
+        const checkpointIndex = f.events.findIndex(
+          (event) =>
+            event.type === "provider_thread.updated" &&
+            event.providerThread.nativeMetadata?.cloudEventSequence === "11",
+        );
+        assert.isAtLeast(replyIndex, 0);
+        assert.isAbove(checkpointIndex, replyIndex);
+        yield* Queue.offer(
+          f.sdkMessages,
+          makeResultFrame({ uuid: "cloud-recovered-result", result: "Recovered after restart" }),
+        );
+        yield* Queue.take(f.terminalReceipts);
+        const routeIdentity = {
+          threadId: f.threadId,
+          runId: turn.runId,
+          attemptId: turn.attemptId,
+          providerThreadId: f.providerThread.id,
+        };
+        let routing = RunExecutionService.makeProviderEventRoutingState({
+          identity: routeIdentity,
+          providerTurnId: null,
+        });
+        let acceptedReply = false;
+        for (const event of f.events) {
+          const [accepted, next] = RunExecutionService.routeProviderEvent(
+            event,
+            routeIdentity,
+            routing,
+          );
+          routing = next;
+          if (
+            event.type === "message.updated" &&
+            event.message.text === "Recovered after restart"
+          ) {
+            acceptedReply = accepted;
+            assert.equal(event.message.runId, turn.runId);
+            assert.equal(event.message.threadId, f.threadId);
+          }
+        }
+        assert.isTrue(acceptedReply);
+        assert.lengthOf(f.terminalEvents(), 1);
+        assert.lengthOf(f.offeredMessages, 0);
+      }).pipe(
+        Effect.scoped,
+        Effect.provide(
+          Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+        ),
+      ),
+  );
+
+  it.effect("does not consume a new user task as recovery of an older cloud turn", () =>
+    Effect.gen(function* () {
+      const f = yield* makeWakeHarnessWithOptions({
+        pendingCloudTurn: { promptUuid: "00000000-0000-4000-8000-000000000211" },
+      });
+      const rejected = yield* f.runtime
+        .startTurn(
+          makeClaudeTestTurnInput({
+            threadId: f.threadId,
+            providerThread: f.providerThread,
+            now: yield* DateTime.now,
+            attemptId: RunAttemptId.make("cloud-new-task-before-recovery"),
+            text: "A different new task",
+            attachments: [],
+          }),
+        )
+        .pipe(Effect.result);
+      assert.equal(rejected._tag, "Failure");
+      assert.equal(f.recoveredTurns(), 0);
+      assert.lengthOf(f.offeredMessages, 0);
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(
+        Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+      ),
+    ),
+  );
+
+  it.effect("completes /recover locally when the cloud conversation has no pending turn", () =>
+    Effect.gen(function* () {
+      const f = yield* makeWakeHarnessWithOptions({ settings: CLOUD_CLAUDE_SETTINGS });
+      yield* f.runtime.startTurn(
+        makeClaudeTestTurnInput({
+          threadId: f.threadId,
+          providerThread: f.providerThread,
+          now: yield* DateTime.now,
+          attemptId: RunAttemptId.make("cloud-recover-no-pending"),
+          text: "/recover",
+          attachments: [],
+        }),
+      );
+      const terminal = yield* Queue.take(f.terminalReceipts);
+      assert.equal(terminal.status, "completed");
+      assert.deepEqual(f.recoveryAdmissions, [true]);
+      assert.equal(f.recoveredTurns(), 0);
+      assert.lengthOf(f.offeredMessages, 0);
+      assert.isTrue(
+        f.events.some(
+          (event) =>
+            event.type === "turn_item.updated" &&
+            event.turnItem.type === "system_notice" &&
+            event.turnItem.title === "Cloud conversation synchronized",
+        ),
+      );
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(
+        Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+      ),
+    ),
+  );
+
+  it.effect.each([
+    { text: "/recover and then change this file", attachments: [] },
+    {
+      text: "/recover",
+      attachments: [
+        ChatFileAttachment.make({
+          type: "file",
+          id: ChatAttachmentId.make("cloud-recovery-attachment"),
+          name: "context.txt",
+          mimeType: "text/plain",
+          sizeBytes: 4,
+        }),
+      ],
+    },
+  ])("refuses ambiguous cloud recovery command %j without opening or sending", (request) =>
+    Effect.gen(function* () {
+      const f = yield* makeWakeHarnessWithOptions({
+        settings: CLOUD_CLAUDE_SETTINGS,
+        pendingCloudTurn: { promptUuid: "00000000-0000-4000-8000-000000000215" },
+      });
+      const result = yield* f.runtime
+        .startTurn(
+          makeClaudeTestTurnInput({
+            threadId: f.threadId,
+            providerThread: f.providerThread,
+            now: yield* DateTime.now,
+            attemptId: RunAttemptId.make("cloud-recover-invalid"),
+            ...request,
+          }),
+        )
+        .pipe(Effect.result);
+      assert.equal(result._tag, "Failure");
+      assert.lengthOf(f.recoveryAdmissions, 0);
+      assert.equal(f.recoveredTurns(), 0);
+      assert.lengthOf(f.offeredMessages, 0);
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(
+        Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+      ),
+    ),
+  );
+
+  it.effect("leaves the local Claude /recover slash command untouched", () =>
+    Effect.gen(function* () {
+      const f = yield* makeWakeHarness;
+      yield* f.runtime.startTurn(
+        makeClaudeTestTurnInput({
+          threadId: f.threadId,
+          providerThread: f.providerThread,
+          now: yield* DateTime.now,
+          attemptId: RunAttemptId.make("local-recover-command"),
+          text: "/recover",
+          attachments: [],
+        }),
+      );
+      assert.deepEqual(f.recoveryAdmissions, [undefined]);
+      assert.equal(f.recoveredTurns(), 0);
+      assert.lengthOf(f.offeredMessages, 1);
+      assert.deepEqual(f.offeredMessages[0]?.message.content, "/recover");
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(
+        Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+      ),
+    ),
+  );
+
+  it.effect.each([
+    "checkpointed reply",
+    "reply before checkpoint",
+    "node before message",
+    "completed tool before checkpoint",
+    "unfinished tool before checkpoint",
+  ] as const)("preserves original artifact ownership through real cloud recovery: %s", (kind) =>
+    Effect.gen(function* () {
+      const now = yield* DateTime.now;
+      const tool = kind.includes("tool");
+      const savedFrame = tool
+        ? claudeSdkFrame({
+            type: "assistant",
+            uuid: "00000000-0000-4000-8000-000000000214",
+            session_id: WAKE_NATIVE_SESSION,
+            parent_tool_use_id: null,
+            message: {
+              id: "persistent-tool-message",
+              type: "message",
+              role: "assistant",
+              model: "claude-haiku-5-5",
+              content: [
+                {
+                  type: "tool_use",
+                  id: "persistent-recovery-tool",
+                  name: "mcp__t3-code__t3_workspace_exec",
+                  input: { command: "echo done" },
+                },
+              ],
+            },
+          })
+        : makeAssistantTextFrame({
+            uuid: "00000000-0000-4000-8000-000000000214",
+            text: "Saved before restart",
+          });
+      const toolResult = claudeSdkFrame({
+        type: "user",
+        uuid: "00000000-0000-4000-8000-000000000216",
+        session_id: WAKE_NATIVE_SESSION,
+        parent_tool_use_id: null,
+        message: {
+          role: "user",
+          content: [
+            {
+              type: "tool_result",
+              tool_use_id: "persistent-recovery-tool",
+              content: "done",
+              is_error: false,
+            },
+          ],
+        },
+      });
+      const prior = yield* makeWakeHarness;
+      const oldTurn = makeClaudeTestTurnInput({
+        threadId: prior.threadId,
+        providerThread: prior.providerThread,
+        now,
+        attemptId: RunAttemptId.make("cloud-persist-original"),
+        text: "Original task",
+        attachments: [],
+      });
+      yield* prior.runtime.startTurn(oldTurn);
+      yield* prior.offerAndWait(savedFrame);
+      if (tool) yield* prior.offerAndWait(toolResult);
+      yield* Queue.offer(
+        prior.sdkMessages,
+        makeResultFrame({
+          uuid: "cloud-persist-old-result",
+          result: tool ? "" : "Saved before restart",
+        }),
+      );
+      yield* Queue.take(prior.terminalReceipts);
+
+      const recovered = yield* makeWakeHarnessWithOptions({
+        settings: CLOUD_CLAUDE_SETTINGS,
+        pendingCloudTurn: { promptUuid: "00000000-0000-4000-8000-000000000212" },
+        cloudEventWasDurable: (message) =>
+          (kind === "checkpointed reply" || kind === "completed tool before checkpoint") &&
+          message.uuid === "00000000-0000-4000-8000-000000000214",
+        cloudEventSequence: (message) =>
+          message.uuid === "00000000-0000-4000-8000-000000000214"
+            ? "10"
+            : message.type === "user"
+              ? "11"
+              : message.type === "result"
+                ? tool
+                  ? "13"
+                  : "12"
+                : tool
+                  ? "12"
+                  : "11",
+      });
+      const turn = {
+        ...makeClaudeTestTurnInput({
+          threadId: recovered.threadId,
+          providerThread: {
+            ...recovered.providerThread,
+            nativeMetadata: {
+              cloudEventSequence:
+                kind === "checkpointed reply" || kind === "completed tool before checkpoint"
+                  ? "10"
+                  : "9",
+            },
+          },
+          now,
+          attemptId: RunAttemptId.make("cloud-persist-recovery"),
+          text: "/recover",
+          attachments: [],
+          providerTurnOrdinal: 3,
+        }),
+        runOrdinal: 3,
+      };
+      const failedContinuation = {
+        ...makeClaudeTestTurnInput({
+          threadId: recovered.threadId,
+          providerThread: recovered.providerThread,
+          now,
+          attemptId: RunAttemptId.make("cloud-persist-failed-continuation"),
+          text: "Continue where you left off.",
+          attachments: [],
+          providerTurnOrdinal: 2,
+        }),
+        runOrdinal: 2,
+        restartContinuationOfRunId: oldTurn.runId,
+      };
+      yield* recovered.runtime.startTurn(turn);
+      assert.deepEqual(recovered.recoveryAdmissions, [true]);
+      yield* recovered.offerAndWait(savedFrame);
+      if (tool) yield* recovered.offerAndWait(toolResult);
+      yield* recovered.offerAndWait(
+        makeAssistantTextFrame({ uuid: "cloud-persist-new", text: "Recovered after restart" }),
+      );
+      yield* Queue.offer(
+        recovered.sdkMessages,
+        makeResultFrame({ uuid: "cloud-persist-new-result", result: "Recovered after restart" }),
+      );
+      yield* Queue.take(recovered.terminalReceipts);
+
+      const sink = yield* EventSink.EventSinkV2;
+      const ingestor = yield* ProviderEventIngestor.ProviderEventIngestorV2;
+      const store = yield* ProjectionStore.ProjectionStoreV2;
+      const allocator = yield* IdAllocator.IdAllocatorV2;
+      yield* sink.write({
+        events: [
+          {
+            id: yield* allocator.allocate.event({ threadId: turn.threadId }),
+            type: "thread.created",
+            threadId: turn.threadId,
+            occurredAt: now,
+            payload: turn.appThread,
+          },
+        ],
+      });
+      for (const [input, status] of [
+        [oldTurn, "interrupted"],
+        [failedContinuation, "failed"],
+        [turn, "running"],
+      ] as const) {
+        yield* sink.write({
+          events: [
+            {
+              id: yield* allocator.allocate.event({ threadId: input.threadId }),
+              type: "run.created",
+              threadId: input.threadId,
+              occurredAt: now,
+              payload: {
+                id: input.runId,
+                threadId: input.threadId,
+                ordinal: input.runOrdinal,
+                providerInstanceId: input.modelSelection.instanceId,
+                modelSelection: input.modelSelection,
+                providerThreadId: input.providerThread.id,
+                userMessageId: input.message.messageId,
+                rootNodeId: input.rootNodeId,
+                activeAttemptId: input.attemptId,
+                status,
+                requestedAt: now,
+                startedAt: now,
+                completedAt: status === "running" ? null : now,
+                checkpointId: null,
+                contextHandoffId: null,
+                ...(input.restartContinuationOfRunId === undefined
+                  ? {}
+                  : { restartContinuationOfRunId: input.restartContinuationOfRunId }),
+              },
+            },
+          ],
+        });
+      }
+      for (const event of prior.events) {
+        if (!["node.updated", "message.updated", "turn_item.updated"].includes(event.type))
+          continue;
+        if (kind === "node before message" && event.type !== "node.updated") continue;
+        if (kind === "unfinished tool before checkpoint") {
+          const artifact =
+            event.type === "node.updated"
+              ? event.node
+              : event.type === "turn_item.updated"
+                ? event.turnItem
+                : undefined;
+          if (
+            artifact?.nativeItemRef?.nativeId !== "persistent-recovery-tool" ||
+            artifact.status !== "running"
+          )
+            continue;
+        }
+        yield* ingestor.ingestNormalized({
+          providerSessionId: oldTurn.providerThread.providerSessionId!,
+          providerInstanceId: oldTurn.modelSelection.instanceId,
+          threadId: oldTurn.threadId,
+          runId: oldTurn.runId,
+          nodeId: oldTurn.rootNodeId,
+          event,
+        });
+      }
+      const savedProjection = yield* store.getThreadProjection(turn.threadId);
+      const savedTool = savedProjection.turnItems.find(
+        (item) => item.nativeItemRef?.nativeId === "persistent-recovery-tool",
+      );
+      const identity = {
+        threadId: turn.threadId,
+        runId: turn.runId,
+        attemptId: turn.attemptId,
+        providerThreadId: turn.providerThread.id,
+      };
+      let routing = RunExecutionService.makeProviderEventRoutingState({
+        identity,
+        providerTurnId: null,
+      });
+      for (const event of recovered.events) {
+        const [accepted, next] = RunExecutionService.routeProviderEvent(event, identity, routing);
+        routing = next;
+        if (!accepted || event.type === "turn.terminal") continue;
+        yield* ingestor.ingestNormalized({
+          providerSessionId: turn.providerThread.providerSessionId!,
+          providerInstanceId: turn.modelSelection.instanceId,
+          threadId: turn.threadId,
+          runId: turn.runId,
+          nodeId: turn.rootNodeId,
+          event,
+          ...(event.type === "provider_thread.updated"
+            ? {
+                writeIfRunCurrent: {
+                  runId: turn.runId,
+                  activeAttemptId: turn.attemptId,
+                  expectedStatus: "running" as const,
+                },
+              }
+            : {}),
+        });
+      }
+      const projection = yield* store.getThreadProjection(turn.threadId);
+      assert.deepEqual(
+        projection.messages
+          .filter((message) => message.role === "assistant")
+          .map((message) => [message.text, message.runId]),
+        tool
+          ? [["Recovered after restart", turn.runId]]
+          : [
+              ["Saved before restart", oldTurn.runId],
+              ["Recovered after restart", turn.runId],
+            ],
+      );
+      assert.equal(
+        projection.providerThreads.find((thread) => thread.id === turn.providerThread.id)
+          ?.nativeMetadata?.cloudEventSequence,
+        tool ? "13" : "12",
+      );
+      if (tool) {
+        const recoveredTool = projection.turnItems.find(
+          (item) => item.nativeItemRef?.nativeId === "persistent-recovery-tool",
+        );
+        assert.isDefined(savedTool);
+        assert.isDefined(recoveredTool);
+        assert.equal(recoveredTool!.runId, oldTurn.runId);
+        assert.equal(recoveredTool!.providerTurnId, savedTool!.providerTurnId);
+        assert.equal(recoveredTool!.ordinal, savedTool!.ordinal);
+        assert.equal(recoveredTool!.status, "completed");
+        if (kind === "completed tool before checkpoint") assert.deepEqual(recoveredTool, savedTool);
+        const recoveredNode = projection.nodes.find(
+          (node) => node.nativeItemRef?.nativeId === "persistent-recovery-tool",
+        );
+        assert.equal(recoveredNode?.runId, oldTurn.runId);
+        assert.equal(recoveredNode?.rootNodeId, oldTurn.rootNodeId);
+        assert.equal(recoveredNode?.status, "completed");
+      }
+      assert.equal(
+        projection.runs.find((run) => run.id === failedContinuation.runId)?.status,
+        "failed",
+      );
+      assert.lengthOf(recovered.offeredMessages, 0);
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(
+        Layer.mergeAll(
+          recoveryPersistence,
+          IdAllocator.layer,
+          McpProviderSessions.layer,
+          NodeServices.layer,
+        ),
+      ),
+    ),
+  );
 
   it.effect(
     "emits the cloud delivery checkpoint after reply artifacts and restores it from persisted thread state",
@@ -4379,6 +4983,7 @@ describe("ClaudeAdapterV2 background wake turns", () => {
         );
       }).pipe(
         Effect.provide(layerProviderReplay(scenario, ClaudeOrchestratorReplayHarness)),
+        Effect.provide(ClaudeCloudExecutionPolicyTestkit.layer),
         provideDeterministicTestRuntime,
         Effect.scoped,
       );

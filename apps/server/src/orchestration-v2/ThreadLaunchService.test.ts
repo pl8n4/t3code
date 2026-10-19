@@ -1,3 +1,5 @@
+import * as ClaudeCloudExecutionPolicy from "../provider/ClaudeCloudExecutionPolicy.ts";
+import * as ClaudeCloudExecutionPolicyTestkit from "../provider/ClaudeCloudExecutionPolicy.testkit.ts";
 import * as Scheduler from "../scheduling/Scheduler.ts";
 import * as WorktreeSetupTracker from "../project/WorktreeSetupTracker.ts";
 import * as ProjectCloneTracker from "../project/ProjectCloneTracker.ts";
@@ -101,6 +103,7 @@ const adapter = {
 } as ProviderAdapter.ProviderAdapterV2["Service"];
 
 interface HarnessOptions {
+  readonly guarded?: boolean;
   readonly closeTerminal?: TerminalManager.TerminalManager["Service"]["close"];
   readonly adapters?: ReadonlyArray<ProviderAdapter.ProviderAdapterV2["Service"]>;
   readonly managedFolders?: Layer.Layer<ManagedProjectFolders.ManagedProjectFolders>;
@@ -126,11 +129,13 @@ function makeHarness(options: HarnessOptions = {}) {
   );
   const layerServerSettings = ServerSettings.layerTest(options.serverSettings);
   const layerReceipts = CommandReceiptStore.layer.pipe(Layer.provide(layerDatabase));
-  const layerThreadManagement = ThreadManagement.layer.pipe(
-    Layer.provide(layerOrchestrator),
-    Layer.provide(layerServerSettings),
-    Layer.provide(layerReceipts),
-  );
+  const layerThreadManagement = ThreadManagement.layer
+    .pipe(Layer.provide(ClaudeCloudExecutionPolicyTestkit.layer))
+    .pipe(
+      Layer.provide(layerOrchestrator),
+      Layer.provide(layerServerSettings),
+      Layer.provide(layerReceipts),
+    );
   const layerOutbox = EffectOutbox.layer.pipe(Layer.provide(layerDatabase));
   const createWorktree = vi.fn(
     options.createWorktree ??
@@ -157,6 +162,16 @@ function makeHarness(options: HarnessOptions = {}) {
     options.generateTitle ?? (() => Effect.succeed({ title: "Generated title" })),
   );
   const layerExternalServices = Layer.mergeAll(
+    Layer.effect(
+      ClaudeCloudExecutionPolicy.ClaudeCloudExecutionPolicy,
+      ClaudeCloudExecutionPolicy.ClaudeCloudExecutionPolicy.pipe(
+        Effect.provide(ClaudeCloudExecutionPolicyTestkit.layer),
+        Effect.map((base) => ({
+          ...base,
+          isGuarded: () => Effect.succeed(options.guarded ?? false),
+        })),
+      ),
+    ),
     WorktreeSetupTracker.layer,
     Layer.mock(ProjectCloneTracker.ProjectCloneTracker)({ get: () => Effect.succeed(null) }),
     Layer.mock(TerminalManager.TerminalManager)({ close: closeTerminal }),
@@ -313,16 +328,18 @@ it.effect.each(
   "attributes $createdBy-configured automations in $target threads without changing their prompt",
   ({ target, createdBy }) => {
     const harness = makeHarness();
-    const layerScheduledTasks = ScheduledTasks.layer.pipe(
-      Layer.provide(
-        Layer.mergeAll(
-          harness.layer,
-          NodeCrypto.layer,
-          Scheduler.layer,
-          Layer.mock(SecretRequests.SecretRequests)({}),
+    const layerScheduledTasks = ScheduledTasks.layer
+      .pipe(Layer.provide(ClaudeCloudExecutionPolicyTestkit.layer))
+      .pipe(
+        Layer.provide(
+          Layer.mergeAll(
+            harness.layer,
+            NodeCrypto.layer,
+            Scheduler.layer,
+            Layer.mock(SecretRequests.SecretRequests)({}),
+          ),
         ),
-      ),
-    );
+      );
     return Effect.gen(function* () {
       const tasks = yield* ScheduledTasks.ScheduledTaskService;
       const launches = yield* ThreadLaunch.ThreadLaunchService;
@@ -2928,13 +2945,15 @@ it.effect.each(
                 ),
               ),
       });
-      const layerService = OrchestratorMcpService.layer.pipe(
-        Layer.provide(NodeCrypto.layer),
-        Layer.provide(harness.layer),
-        Layer.provide(Layer.mock(GitVcsDriver.GitVcsDriver)({ resolveCommit })),
-        Layer.provide(Layer.mock(ScheduledTasks.ScheduledTaskService)({})),
-        Layer.provide(Layer.mock(SecretRequests.SecretRequests)({})),
-      );
+      const layerService = OrchestratorMcpService.layer
+        .pipe(Layer.provide(ClaudeCloudExecutionPolicyTestkit.layer))
+        .pipe(
+          Layer.provide(NodeCrypto.layer),
+          Layer.provide(harness.layer),
+          Layer.provide(Layer.mock(GitVcsDriver.GitVcsDriver)({ resolveCommit })),
+          Layer.provide(Layer.mock(ScheduledTasks.ScheduledTaskService)({})),
+          Layer.provide(Layer.mock(SecretRequests.SecretRequests)({})),
+        );
       yield* Effect.gen(function* () {
         const service = yield* OrchestratorMcpService.OrchestratorMcpService;
         const threads = yield* ThreadManagement.ThreadManagementService;
@@ -3064,4 +3083,36 @@ it.effect.each(
         }
       }).pipe(Effect.provide(Layer.merge(harness.layer, layerService)));
     }),
+);
+
+it.effect("skips implicit paid branch naming for a guarded worktree", () =>
+  Effect.gen(function* () {
+    const harness = makeHarness({
+      guarded: true,
+      generateBranchName: () => Effect.die("A paid helper must never be invoked"),
+    });
+    yield* Effect.gen(function* () {
+      const launches = yield* ThreadLaunch.ThreadLaunchService;
+      const threads = yield* ThreadManagement.ThreadManagementService;
+      const launched = yield* launches.launch(
+        launchInput({
+          command: "command:launch:guarded-no-helper",
+          thread: "thread:launch:guarded-no-helper",
+          message: "Build the feature",
+          workspace: { type: "worktree", baseRef: "main", branch: "t3/abcd1234" },
+        }),
+      );
+      yield* waitUntil(() =>
+        threads
+          .getThreadProjection(launched.threadId)
+          .pipe(Effect.map((projection) => projection.runs[0]?.status === "starting")),
+      );
+      assert.equal(harness.generateBranchName.mock.calls.length, 0);
+      assert.equal(harness.renameBranch.mock.calls.length, 0);
+      assert.equal(
+        (yield* threads.getThreadProjection(launched.threadId)).thread.branch,
+        "t3/abcd1234",
+      );
+    }).pipe(Effect.provide(harness.layer));
+  }),
 );

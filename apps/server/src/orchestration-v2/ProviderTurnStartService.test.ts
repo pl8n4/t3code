@@ -3,6 +3,7 @@ import { expect, it, vi } from "vite-plus/test";
 import { it as effectIt } from "@effect/vitest";
 import {
   CheckpointScopeId,
+  ContextHandoffId,
   MessageId,
   NodeId,
   ProviderSessionId,
@@ -42,6 +43,8 @@ import { CodexProviderCapabilitiesV2 } from "./Adapters/CodexAdapterV2.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
 import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import * as ProviderSessionManager from "./ProviderSessionManager.ts";
+import * as ClaudeCloudExecutionPolicy from "../provider/ClaudeCloudExecutionPolicy.ts";
+import * as ClaudeCloudExecutionPolicyTestkit from "../provider/ClaudeCloudExecutionPolicy.testkit.ts";
 import * as ProviderTurnStart from "./ProviderTurnStartService.ts";
 import * as RunExecutionService from "./RunExecutionService.ts";
 import * as RuntimePolicy from "./RuntimePolicy.ts";
@@ -122,6 +125,7 @@ function startWithMissingWorktree(
   const pruneWorktrees = vi.fn(() => Effect.void);
   const createWorktree = vi.fn(() => Effect.succeed({} as never));
   const layer = ProviderTurnStart.layer.pipe(
+    Layer.provide(ClaudeCloudExecutionPolicyTestkit.layer),
     Layer.provide(
       Layer.mergeAll(
         Layer.mock(ContextHandoffService.ContextHandoffServiceV2)({}),
@@ -275,6 +279,8 @@ it.each([
 
 function makeLocalCommandHarness(input: {
   readonly text: string;
+  readonly policyFailure?: string;
+  readonly cloudRecovery?: boolean;
   readonly worktreePath?: string;
   readonly worktreesDir?: string;
   readonly fileSystem?: FileSystem.FileSystem;
@@ -511,6 +517,7 @@ function makeLocalCommandHarness(input: {
       ),
     ensureThread: () => Effect.succeed(providerThread),
   };
+  const sdkStartTurn = vi.fn((_input: ProviderAdapter.ProviderAdapterV2TurnInput) => Effect.void);
   const open = vi.fn(() =>
     input.interruptOpen === true
       ? Effect.interrupt
@@ -532,7 +539,7 @@ function makeLocalCommandHarness(input: {
                   ),
                 ),
               )
-            : input.failReadsAfterRunning === true
+            : input.failReadsAfterRunning === true || input.cloudRecovery === true
               ? Effect.succeed({
                   driver: providerThread.driver,
                   providerSession: {
@@ -548,13 +555,14 @@ function makeLocalCommandHarness(input: {
                     lastError: null,
                   },
                   ensureThread: () => Effect.succeed(providerThread),
+                  startTurn: sdkStartTurn,
                 } as never)
               : Effect.die("A local command must not open a native session."),
   );
   const startRootRun = vi.fn<
     (input: RunExecutionService.RunExecutionServiceV2StartRootRunInput) => Effect.Effect<void>
   >(() =>
-    input.failReadsAfterRunning === true
+    input.failReadsAfterRunning === true || input.cloudRecovery === true
       ? Effect.void
       : Effect.die("A local command must not start a native turn."),
   );
@@ -567,15 +575,17 @@ function makeLocalCommandHarness(input: {
       : Effect.void,
   );
   const tryHandlePromptCommand = vi.fn(() =>
-    input.logoutFailure === undefined
-      ? Effect.succeed(true)
-      : Effect.fail(
-          new ProviderSetupError({
-            instanceId: oldInstanceId,
-            operation: "logout",
-            detail: input.logoutFailure,
-          }),
-        ),
+    input.cloudRecovery === true
+      ? Effect.succeed(false)
+      : input.logoutFailure === undefined
+        ? Effect.succeed(true)
+        : Effect.fail(
+            new ProviderSetupError({
+              instanceId: oldInstanceId,
+              operation: "logout",
+              detail: input.logoutFailure,
+            }),
+          ),
   );
   const writeIfRunCurrent = vi.fn(({ events: incoming, activeAttemptId, expectedStatus }) =>
     "writeFailure" in input
@@ -619,7 +629,40 @@ function makeLocalCommandHarness(input: {
       ),
     }),
   );
+  const layerPolicy = Layer.effect(
+    ClaudeCloudExecutionPolicy.ClaudeCloudExecutionPolicy,
+    ClaudeCloudExecutionPolicy.ClaudeCloudExecutionPolicy.pipe(
+      Effect.map((base) => ({
+        ...base,
+        admit:
+          input.policyFailure === undefined
+            ? base.admit
+            : () =>
+                Effect.fail(
+                  new ClaudeCloudExecutionPolicy.ClaudeCloudExecutionPolicyError({
+                    detail: input.policyFailure!,
+                  }),
+                ),
+      })),
+      Effect.provide(ClaudeCloudExecutionPolicyTestkit.layer),
+    ),
+  );
   const layer = ProviderTurnStart.layer.pipe(
+    Layer.provide(layerPolicy),
+    Layer.provide(
+      ServerSettings.layerTest(
+        input.cloudRecovery === true
+          ? {
+              providerInstances: {
+                [newInstanceId]: {
+                  driver: ProviderDriverKind.make("claudeAgent"),
+                  config: { cloudFreeCreditsOnly: true },
+                },
+              },
+            }
+          : {},
+      ),
+    ),
     Layer.provide(
       Layer.mergeAll(
         Layer.mock(ContextHandoffService.ContextHandoffServiceV2)({
@@ -677,6 +720,7 @@ function makeLocalCommandHarness(input: {
     resolveRuntimePolicy,
     createWorktree,
     open,
+    sdkStartTurn,
     writeIfRunCurrent,
     startRootRun,
     tryHandlePromptCommand,
@@ -1154,3 +1198,68 @@ for (const previousMessages of [[], ["/compact", " /COMPACT "]]) {
       }),
   );
 }
+
+effectIt.effect("rejects a delayed or notification wake before opening a changed provider", () => {
+  const harness = makeLocalCommandHarness({
+    text: "A delegated task finished",
+    policyFailure: "The guarded provider changed",
+  });
+  return Effect.gen(function* () {
+    yield* harness.start;
+    expect(harness.open).not.toHaveBeenCalled();
+    expect(harness.startRootRun).not.toHaveBeenCalled();
+    expect(harness.projection().runs.at(-1)?.status).toBe("failed");
+    expect(
+      harness.events.some(
+        (event) => event.type === "turn-item.updated" && event.payload.type === "error",
+      ),
+    ).toBe(true);
+  });
+});
+
+effectIt.effect("preserves exact cloud /recover when the run has pending context handoffs", () =>
+  Effect.gen(function* () {
+    const harness = makeLocalCommandHarness({ text: "/recover", cloudRecovery: true });
+    const before = harness.projection();
+    harness.setProjection({
+      ...before,
+      contextHandoffs: [
+        {
+          id: ContextHandoffId.make("recover-handoff"),
+          threadId: before.thread.id,
+          targetRunId: before.runs[0]!.id,
+          fromProviderThreadIds: [],
+          toProviderThreadId: before.providerThreads[0]!.id,
+          coveredRunOrdinals: { from: 1, to: 1 },
+          strategy: "full_thread_summary",
+          status: "ready",
+          summaryMessageId: null,
+          summaryText: "Context that must not wrap a recovery command",
+          delivery: { nativeThreadId: "old-cloud", status: "pending", itemIds: [] },
+          createdByProviderInstanceId: null,
+          createdAt: before.thread.createdAt,
+          updatedAt: before.thread.updatedAt,
+        },
+      ],
+    });
+    yield* harness.start;
+    const controls = harness.startRootRun.mock.calls[0]?.[0];
+    expect(controls).toBeDefined();
+    if (controls === undefined) return;
+    yield* controls.session.startTurn({
+      appThread: controls.appThread,
+      threadId: controls.appThread.id,
+      runId: controls.run.id,
+      runOrdinal: controls.run.ordinal,
+      providerTurnOrdinal: controls.providerTurnOrdinal,
+      attemptId: controls.attemptId,
+      rootNodeId: controls.rootNode.id,
+      providerThread: controls.providerThread,
+      message: controls.message,
+      modelSelection: controls.modelSelection,
+      runtimePolicy: controls.runtimePolicy,
+    });
+    expect(harness.sdkStartTurn).toHaveBeenCalledOnce();
+    expect(harness.sdkStartTurn.mock.calls[0]?.[0]?.message.text).toBe("/recover");
+  }),
+);

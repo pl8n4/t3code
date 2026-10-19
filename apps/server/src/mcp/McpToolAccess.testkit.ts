@@ -12,6 +12,7 @@ import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 
+import * as ClaudeCloudExecutionPolicyTestkit from "../provider/ClaudeCloudExecutionPolicy.testkit.ts";
 import * as ThreadManagement from "../orchestration-v2/ThreadManagementService.ts";
 
 const EPOCH = DateTime.makeUnsafe("2026-01-01T00:00:00.000Z");
@@ -59,9 +60,12 @@ export const liveThreadShell = (
   };
 };
 
-export const liveThreadsLayer = Layer.mock(ThreadManagement.ThreadManagementService)({
-  getThreadShell: (threadId) => Effect.succeed(liveThreadShell(threadId)),
-});
+export const liveThreadsLayer = Layer.merge(
+  ClaudeCloudExecutionPolicyTestkit.layer,
+  Layer.mock(ThreadManagement.ThreadManagementService)({
+    getThreadShell: (threadId) => Effect.succeed(liveThreadShell(threadId)),
+  }),
+);
 
 export const idleThreadProjection = (
   shell: OrchestrationV2ThreadShell,

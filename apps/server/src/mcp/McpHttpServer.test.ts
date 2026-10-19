@@ -1,3 +1,4 @@
+import * as ClaudeCloudExecutionPolicyTestkit from "../provider/ClaudeCloudExecutionPolicy.testkit.ts";
 import * as Orchestrator from "../orchestration-v2/Orchestrator.ts";
 import * as ProjectionStore from "../orchestration-v2/ProjectionStore.ts";
 import { expect, it } from "@effect/vitest";
@@ -65,26 +66,32 @@ const client = McpSchema.McpServerClient.of({
   },
   getClient: Effect.die("unused"),
 });
-const layerTest = McpHttpServer.layerPreviewToolkit.pipe(
-  Layer.provideMerge(McpServer.McpServer.layer),
-  Layer.provideMerge(McpToolAccessTestkit.liveThreadsLayer),
-  Layer.provideMerge(PreviewAutomationBroker.layer),
-  Layer.provideMerge(ServerConfig.layerTest(process.cwd(), { prefix: "t3-mcp-http-server-test-" })),
-  Layer.provideMerge(NodeServices.layer),
-);
-const layerPullRequestsTest = McpHttpServer.layerPullRequestsToolkit.pipe(
-  Layer.provideMerge(McpServer.McpServer.layer),
-  Layer.provideMerge(McpToolAccessTestkit.liveThreadsLayer),
-  Layer.provide(
-    Layer.mergeAll(
-      Layer.mock(ProjectService.ProjectService)({}),
-      Layer.mock(PullRequestReviewGuideService.PullRequestReviewGuideService)({}),
-      Layer.mock(Orchestrator.OrchestratorV2)({}),
-      Layer.mock(ProjectionStore.ProjectionStoreV2)({}),
-      NodeServices.layer,
+const layerTest = McpHttpServer.layerPreviewToolkit
+  .pipe(Layer.provide(ClaudeCloudExecutionPolicyTestkit.layer))
+  .pipe(
+    Layer.provideMerge(McpServer.McpServer.layer),
+    Layer.provideMerge(McpToolAccessTestkit.liveThreadsLayer),
+    Layer.provideMerge(PreviewAutomationBroker.layer),
+    Layer.provideMerge(
+      ServerConfig.layerTest(process.cwd(), { prefix: "t3-mcp-http-server-test-" }),
     ),
-  ),
-);
+    Layer.provideMerge(NodeServices.layer),
+  );
+const layerPullRequestsTest = McpHttpServer.layerPullRequestsToolkit
+  .pipe(Layer.provide(ClaudeCloudExecutionPolicyTestkit.layer))
+  .pipe(
+    Layer.provideMerge(McpServer.McpServer.layer),
+    Layer.provideMerge(McpToolAccessTestkit.liveThreadsLayer),
+    Layer.provide(
+      Layer.mergeAll(
+        Layer.mock(ProjectService.ProjectService)({}),
+        Layer.mock(PullRequestReviewGuideService.PullRequestReviewGuideService)({}),
+        Layer.mock(Orchestrator.OrchestratorV2)({}),
+        Layer.mock(ProjectionStore.ProjectionStoreV2)({}),
+        NodeServices.layer,
+      ),
+    ),
+  );
 
 const snapshotResult = {
   url: "http://example.test/",
@@ -757,18 +764,20 @@ it.effect("terminates HTTP MCP sessions with DELETE", () =>
         capabilities: new Set(["orchestration"]),
         issuedAt: 1,
       };
-      const layerServer = McpHttpServer.layerMcpTransport.pipe(
-        Layer.provide(
-          Layer.mock(McpSessionRegistry.McpSessionRegistry)({
-            resolve: (presented) =>
-              Effect.succeed(
-                presented === token
-                  ? (scope as McpInvocationContext.McpThreadInvocationScope)
-                  : undefined,
-              ),
-          }),
-        ),
-      );
+      const layerServer = McpHttpServer.layerMcpTransport
+        .pipe(Layer.provide(ClaudeCloudExecutionPolicyTestkit.layer))
+        .pipe(
+          Layer.provide(
+            Layer.mock(McpSessionRegistry.McpSessionRegistry)({
+              resolve: (presented) =>
+                Effect.succeed(
+                  presented === token
+                    ? (scope as McpInvocationContext.McpThreadInvocationScope)
+                    : undefined,
+                ),
+            }),
+          ),
+        );
       yield* HttpRouter.serve(layerServer, {
         disableListenLog: true,
         disableLogger: true,
@@ -1011,6 +1020,7 @@ it.effect("admits provider and OAuth client credentials and points only clients 
           ),
         }),
       ).pipe(
+        Layer.provide(ClaudeCloudExecutionPolicyTestkit.layer),
         Layer.provideMerge(McpHttpServer.layerMcpTransport),
         Layer.provide(
           Layer.mock(McpSessionRegistry.McpSessionRegistry)({

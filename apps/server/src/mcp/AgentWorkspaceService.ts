@@ -21,13 +21,27 @@ import * as Schema from "effect/Schema";
 
 import * as Threads from "../orchestration-v2/ThreadManagementService.ts";
 import * as Project from "../project/ProjectService.ts";
-import * as Processes from "../processRunner.ts";
 import * as PullRequests from "../pullRequest/PullRequestService.ts";
 import * as Files from "../workspace/WorkspaceFileSystem.ts";
 import * as Entries from "../workspace/WorkspaceEntries.ts";
 import * as Git from "../vcs/GitVcsDriver.ts";
 import * as Invocation from "./McpInvocationContext.ts";
-import { WorkspaceInfo } from "./AgentWorkspaceSchemas.ts";
+import {
+  WorkspaceInfo,
+  WorkspaceExec,
+  WorkspaceJobRead,
+  WorkspaceJobId,
+  WorkspaceJobList,
+  WorkspaceCommandJob,
+  WorkspaceCommandJobSummary,
+} from "./AgentWorkspaceSchemas.ts";
+import { makeCommandJobs } from "./AgentWorkspaceCommandJobs.ts";
+export {
+  WorkspaceExec,
+  WorkspaceJobRead,
+  WorkspaceJobId,
+  WorkspaceJobList,
+} from "./AgentWorkspaceSchemas.ts";
 import { assertFullAccess, assertLiveCaller, readCaller, unavailable } from "./threadAccess.ts";
 
 export const WorkspaceRead = Schema.Struct({
@@ -41,9 +55,6 @@ export const WorkspaceWrite = Schema.Struct({
   path: Schema.String.check(Schema.isNonEmpty()),
   contents: Schema.String.check(Schema.isMaxLength(1_000_000)),
   expectedVersion: Schema.NullOr(Schema.String),
-});
-export const WorkspaceExec = Schema.Struct({
-  command: Schema.String.check(Schema.isNonEmpty(), Schema.isMaxLength(20000)),
 });
 export const WorkspaceList = Schema.Struct({ path: Schema.optional(Schema.String) });
 export const WorkspacePullRequests = Schema.Struct({
@@ -104,13 +115,19 @@ export class AgentWorkspaceService extends Context.Service<
     readonly exec: (
       scope: Invocation.McpInvocationScope,
       input: typeof WorkspaceExec.Type,
-    ) => Request<{
-      stdout: string;
-      stderr: string;
-      exitCode: number | null;
-      timedOut: boolean;
-      truncated: boolean;
-    }>;
+    ) => Request<typeof WorkspaceCommandJob.Type>;
+    readonly jobRead: (
+      scope: Invocation.McpInvocationScope,
+      input: typeof WorkspaceJobRead.Type,
+    ) => Request<typeof WorkspaceCommandJob.Type>;
+    readonly jobCancel: (
+      scope: Invocation.McpInvocationScope,
+      input: typeof WorkspaceJobId.Type,
+    ) => Request<typeof WorkspaceCommandJob.Type>;
+    readonly jobList: (
+      scope: Invocation.McpInvocationScope,
+      input: typeof WorkspaceJobList.Type,
+    ) => Request<ReadonlyArray<typeof WorkspaceCommandJobSummary.Type>>;
   }
 >()("t3/mcp/AgentWorkspaceService") {}
 
@@ -122,7 +139,7 @@ const make = Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
   const crypto = yield* Crypto.Crypto;
-  const processes = yield* Processes.ProcessRunner;
+  const jobs = yield* makeCommandJobs;
   const pullRequests = yield* PullRequests.PullRequestService;
   const git = yield* Git.GitVcsDriver;
   const workspace = (scope: Invocation.McpInvocationScope, write = false) =>
@@ -194,6 +211,18 @@ const make = Effect.gen(function* () {
         repository: project.value.repositoryIdentity?.canonicalKey ?? null,
       };
     });
+  const jobOwner = Effect.fnUntraced(function* (scope: Invocation.McpInvocationScope) {
+    const current = yield* workspace(scope, true);
+    const cwd = yield* fs.realPath(current.cwd).pipe(Effect.mapError(unavailable));
+    const stat = yield* fs.stat(cwd).pipe(Effect.mapError(unavailable));
+    return {
+      environmentId: scope.environmentId,
+      threadId: scope.thread!.threadId,
+      projectId: current.projectId,
+      cwd,
+      workspaceIdentity: `${stat.dev}:${Option.getOrUndefined(stat.ino) ?? "unknown"}`,
+    };
+  });
   const root = (scope: Invocation.McpInvocationScope, write = false) =>
     workspace(scope, write).pipe(Effect.map((value) => value.cwd));
   const prWorkspace = (scope: Invocation.McpInvocationScope) =>
@@ -314,25 +343,16 @@ const make = Effect.gen(function* () {
       return { path: input.path, version: yield* version(input.contents) };
     }),
     exec: Effect.fn("AgentWorkspaceService.exec")(function* (scope, input) {
-      const cwd = yield* root(scope, true);
-      const result = yield* processes
-        .run({
-          command: "sh",
-          args: ["-lc", input.command],
-          cwd,
-          timeout: "60 seconds",
-          timeoutBehavior: "timedOutResult",
-          maxOutputBytes: 16000,
-          outputMode: "truncate",
-        })
-        .pipe(Effect.mapError(unavailable));
-      return {
-        stdout: result.stdout,
-        stderr: result.stderr,
-        exitCode: result.code,
-        timedOut: result.timedOut,
-        truncated: result.stdoutTruncated || result.stderrTruncated,
-      };
+      return yield* jobs.start(yield* jobOwner(scope), input);
+    }),
+    jobRead: Effect.fn("AgentWorkspaceService.jobRead")(function* (scope, input) {
+      return yield* jobs.read(yield* jobOwner(scope), input);
+    }),
+    jobCancel: Effect.fn("AgentWorkspaceService.jobCancel")(function* (scope, input) {
+      return yield* jobs.cancel(yield* jobOwner(scope), input.jobId);
+    }),
+    jobList: Effect.fn("AgentWorkspaceService.jobList")(function* (scope, input) {
+      return yield* jobs.list(yield* jobOwner(scope), input.limit ?? 25);
     }),
   });
 });

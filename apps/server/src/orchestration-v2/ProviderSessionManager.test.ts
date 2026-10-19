@@ -337,6 +337,9 @@ const makeProviderAdapter = Effect.fnUntraced(function* (
     readonly beforeUnload?: Effect.Effect<void>;
     readonly spawnBeforeOpen?: boolean;
     readonly scopeCloseReached?: Deferred.Deferred<void>;
+    readonly subscriptionGuard?:
+      | false
+      | NonNullable<ProviderAdapter.ProviderAdapterV2SessionRuntime["guardSubscriptionThread"]>;
   } = {},
 ) {
   const mcpSessions = yield* McpProviderSessions.McpProviderSessions;
@@ -412,6 +415,9 @@ const makeProviderAdapter = Effect.fnUntraced(function* (
                 }),
               )
             : Stream.fromQueue(events),
+          ...(options.subscriptionGuard === false
+            ? {}
+            : { guardSubscriptionThread: options.subscriptionGuard ?? (() => Effect.void) }),
           ...(options.backgroundTasksEndWithProcess === false
             ? {}
             : { backgroundTasksEndWithProcess: true as const }),
@@ -463,6 +469,11 @@ function layerTest(input: {
   readonly maxIdlePinMs?: number;
   readonly failEventStream?: boolean;
   readonly capabilities?: OrchestrationV2ProviderCapabilities;
+  readonly registryLayer?: Layer.Layer<
+    ProviderAdapterRegistry.ProviderAdapterRegistryV2,
+    never,
+    McpProviderSessions.McpProviderSessions
+  >;
   readonly mcpConfigs?: Ref.Ref<
     ReadonlyArray<McpProviderSession.McpProviderSessionConfig | undefined>
   >;
@@ -486,6 +497,9 @@ function layerTest(input: {
   readonly beforeUnload?: Effect.Effect<void>;
   readonly spawnBeforeOpen?: boolean;
   readonly scopeCloseReached?: Deferred.Deferred<void>;
+  readonly subscriptionGuard?:
+    | false
+    | NonNullable<ProviderAdapter.ProviderAdapterV2SessionRuntime["guardSubscriptionThread"]>;
   readonly serverSettingsLayer?: ReturnType<typeof ServerSettings.layerTest>;
   readonly projectServiceLayer?: Layer.Layer<ProjectService.ProjectService>;
 }) {
@@ -499,32 +513,37 @@ function layerTest(input: {
           : input.failReleaseEventWrites
             ? layerFailingReleaseEventSink
             : layerTestEventSink;
-  const layerRegistry = Layer.unwrap(
-    makeProviderAdapter(input.state, {
-      failEventStream: input.failEventStream ?? false,
-      ...(input.capabilities === undefined ? {} : { capabilities: input.capabilities }),
-      ...(input.mcpConfigs === undefined ? {} : { mcpConfigs: input.mcpConfigs }),
-      ...(input.beforeOpen === undefined ? {} : { beforeOpen: input.beforeOpen }),
-      ...(input.hasPendingBackgroundWork === undefined
-        ? {}
-        : { hasPendingBackgroundWork: input.hasPendingBackgroundWork }),
-      ...(input.hasPendingBackgroundWorkForThread === undefined
-        ? {}
-        : { hasPendingBackgroundWorkForThread: input.hasPendingBackgroundWorkForThread }),
-      ...(input.backgroundTasksEndWithProcess === undefined
-        ? {}
-        : { backgroundTasksEndWithProcess: input.backgroundTasksEndWithProcess }),
-      ...(input.hangSessionScopeClose === undefined
-        ? {}
-        : { hangSessionScopeClose: input.hangSessionScopeClose }),
-      ...(input.startTurn === undefined ? {} : { startTurn: input.startTurn }),
-      ...(input.beforeUnload === undefined ? {} : { beforeUnload: input.beforeUnload }),
-      ...(input.spawnBeforeOpen === undefined ? {} : { spawnBeforeOpen: input.spawnBeforeOpen }),
-      ...(input.scopeCloseReached === undefined
-        ? {}
-        : { scopeCloseReached: input.scopeCloseReached }),
-    }).pipe(Effect.map(ProviderAdapterRegistry.layerSingle)),
-  );
+  const layerRegistry =
+    input.registryLayer ??
+    Layer.unwrap(
+      makeProviderAdapter(input.state, {
+        failEventStream: input.failEventStream ?? false,
+        ...(input.capabilities === undefined ? {} : { capabilities: input.capabilities }),
+        ...(input.mcpConfigs === undefined ? {} : { mcpConfigs: input.mcpConfigs }),
+        ...(input.beforeOpen === undefined ? {} : { beforeOpen: input.beforeOpen }),
+        ...(input.hasPendingBackgroundWork === undefined
+          ? {}
+          : { hasPendingBackgroundWork: input.hasPendingBackgroundWork }),
+        ...(input.hasPendingBackgroundWorkForThread === undefined
+          ? {}
+          : { hasPendingBackgroundWorkForThread: input.hasPendingBackgroundWorkForThread }),
+        ...(input.backgroundTasksEndWithProcess === undefined
+          ? {}
+          : { backgroundTasksEndWithProcess: input.backgroundTasksEndWithProcess }),
+        ...(input.hangSessionScopeClose === undefined
+          ? {}
+          : { hangSessionScopeClose: input.hangSessionScopeClose }),
+        ...(input.startTurn === undefined ? {} : { startTurn: input.startTurn }),
+        ...(input.beforeUnload === undefined ? {} : { beforeUnload: input.beforeUnload }),
+        ...(input.spawnBeforeOpen === undefined ? {} : { spawnBeforeOpen: input.spawnBeforeOpen }),
+        ...(input.scopeCloseReached === undefined
+          ? {}
+          : { scopeCloseReached: input.scopeCloseReached }),
+        ...(input.subscriptionGuard === undefined
+          ? {}
+          : { subscriptionGuard: input.subscriptionGuard }),
+      }).pipe(Effect.map(ProviderAdapterRegistry.layerSingle)),
+    );
   const layerConfiguredMcpRegistry =
     input.pauseResolve === undefined
       ? layerTestMcpRegistry
@@ -4906,5 +4925,222 @@ it.effect(
         projectExists: false,
       });
       assert.isFalse(denied?.capabilities?.has("device"));
+    }),
+);
+
+it.effect(
+  "replaces a retained session after its provider adapter changes and rejects old runtime references",
+  () =>
+    Effect.gen(function* () {
+      const state = yield* Ref.make(emptyState);
+      let oldRouteStarts = 0;
+      let hydrated = false;
+      const registryLayer = Layer.effect(
+        ProviderAdapterRegistry.ProviderAdapterRegistryV2,
+        Effect.gen(function* () {
+          const oldAdapter = yield* makeProviderAdapter(state, {
+            startTurn: Effect.sync(() => {
+              oldRouteStarts++;
+            }),
+          });
+          const replacement = yield* makeProviderAdapter(state);
+          return ProviderAdapterRegistry.ProviderAdapterRegistryV2.of({
+            get: () => Effect.sync(() => (hydrated ? replacement : oldAdapter)),
+            list: () => Effect.succeed([modelSelection.instanceId]),
+          });
+        }),
+      );
+      yield* Effect.gen(function* () {
+        const manager = yield* ProviderSessionManager.ProviderSessionManagerV2;
+        const sink = yield* EventSink.EventSinkV2;
+        const allocator = yield* IdAllocator.IdAllocatorV2;
+        const store = yield* ProjectionStore.ProjectionStoreV2;
+        const threadId = ThreadId.make("thread:retained-route-change");
+        const now = yield* DateTime.now;
+        const providerSessionId = yield* allocator.allocate.providerSession({
+          threadId,
+          providerInstanceId: modelSelection.instanceId,
+        });
+        yield* sink.write({
+          events: [yield* makeThreadCreatedEvent({ idAllocator: allocator, threadId, now })],
+        });
+        const openInput = { threadId, providerSessionId, modelSelection, runtimePolicy };
+        const oldRuntime = yield* manager.open(openInput);
+        hydrated = true;
+        const runtime = yield* manager.open(openInput);
+        assert.notStrictEqual(runtime, oldRuntime);
+        assert.equal((yield* Ref.get(state)).openCount, 2);
+        assert.equal((yield* Ref.get(state)).closeCount, 1);
+        const runId = allocator.derive.run({ threadId, ordinal: 1 });
+        const turn = {
+          appThread: (yield* store.getThreadProjection(threadId)).thread,
+          threadId,
+          runId,
+          runOrdinal: 1,
+          providerTurnOrdinal: 1,
+          attemptId: allocator.derive.runAttempt({ runId, attemptOrdinal: 1 }),
+          rootNodeId: allocator.derive.rootNode({ runId }),
+          providerThread: makeProviderThread({
+            idAllocator: allocator,
+            threadId,
+            providerSessionId,
+            now,
+          }),
+          message: {
+            createdBy: "user" as const,
+            creationSource: "web" as const,
+            messageId: yield* allocator.allocate.message({ threadId, ordinal: 1 }),
+            text: "Continue safely",
+            attachments: [],
+          },
+          modelSelection,
+          runtimePolicy,
+        };
+        yield* runtime.startTurn(turn);
+        assert.equal(oldRouteStarts, 0);
+        const busyAdoption = yield* manager
+          .open({ ...openInput, guardedExecution: true })
+          .pipe(Effect.result);
+        assert.equal(busyAdoption._tag, "Failure");
+        assert.equal((yield* Ref.get(state)).closeCount, 1);
+        assert.strictEqual(yield* manager.open(openInput), runtime);
+        const stale = yield* oldRuntime.startTurn(turn).pipe(Effect.result);
+        assert.equal(stale._tag, "Failure");
+        assert.equal(oldRouteStarts, 0);
+      }).pipe(Effect.provide(layerTest({ state, idleTimeoutMs: 60_000, registryLayer })));
+    }),
+);
+
+it.effect("reopens an unguarded retained runtime once when adopting guarded execution", () =>
+  Effect.gen(function* () {
+    const state = yield* Ref.make(emptyState);
+    yield* Effect.gen(function* () {
+      const manager = yield* ProviderSessionManager.ProviderSessionManagerV2;
+      const sink = yield* EventSink.EventSinkV2;
+      const allocator = yield* IdAllocator.IdAllocatorV2;
+      const threadId = ThreadId.make("thread:guarded-session-adoption");
+      const now = yield* DateTime.now;
+      const providerSessionId = yield* allocator.allocate.providerSession({
+        threadId,
+        providerInstanceId: modelSelection.instanceId,
+      });
+      yield* sink.write({
+        events: [yield* makeThreadCreatedEvent({ idAllocator: allocator, threadId, now })],
+      });
+      const input = { threadId, providerSessionId, modelSelection, runtimePolicy };
+      const oldRuntime = yield* manager.open(input);
+      const guardedRuntime = yield* manager.open({ ...input, guardedExecution: true });
+      assert.notStrictEqual(guardedRuntime, oldRuntime);
+      assert.strictEqual(yield* manager.open({ ...input, guardedExecution: true }), guardedRuntime);
+      assert.equal((yield* Ref.get(state)).openCount, 2);
+      assert.equal((yield* Ref.get(state)).closeCount, 1);
+    }).pipe(Effect.provide(layerTest({ state, idleTimeoutMs: 60_000 })));
+  }),
+);
+
+it.effect.each(["missing", "refused"] as const)(
+  "rejects a guarded runtime whose actual subscription check is %s and closes it",
+  (mode) =>
+    Effect.gen(function* () {
+      const state = yield* Ref.make(emptyState);
+      const subscriptionGuard =
+        mode === "missing"
+          ? false
+          : () =>
+              Effect.fail(
+                new ProviderAdapter.ProviderAdapterProtocolError({
+                  driver: CODEX_DRIVER,
+                  detail: "actual runtime uses an API route",
+                }),
+              );
+      yield* Effect.gen(function* () {
+        const manager = yield* ProviderSessionManager.ProviderSessionManagerV2;
+        const sink = yield* EventSink.EventSinkV2;
+        const allocator = yield* IdAllocator.IdAllocatorV2;
+        const threadId = ThreadId.make(`thread:guard-${mode}`);
+        const providerSessionId = yield* allocator.allocate.providerSession({
+          threadId,
+          providerInstanceId: modelSelection.instanceId,
+        });
+        yield* sink.write({
+          events: [
+            yield* makeThreadCreatedEvent({
+              idAllocator: allocator,
+              threadId,
+              now: yield* DateTime.now,
+            }),
+          ],
+        });
+        const result = yield* manager
+          .open({
+            threadId,
+            providerSessionId,
+            modelSelection,
+            runtimePolicy,
+            guardedExecution: true,
+          })
+          .pipe(Effect.result);
+        assert.equal(result._tag, "Failure");
+        assert.equal((yield* Ref.get(state)).openCount, 1);
+        assert.equal((yield* Ref.get(state)).closeCount, 1);
+      }).pipe(Effect.provide(layerTest({ state, idleTimeoutMs: 60_000, subscriptionGuard })));
+    }),
+);
+
+it.effect(
+  "registers only explicitly guarded app threads in a shared Codex runtime and rechecks reuse",
+  () =>
+    Effect.gen(function* () {
+      const state = yield* Ref.make(emptyState);
+      const checked: ThreadId[] = [];
+      yield* Effect.gen(function* () {
+        const manager = yield* ProviderSessionManager.ProviderSessionManagerV2;
+        const sink = yield* EventSink.EventSinkV2;
+        const allocator = yield* IdAllocator.IdAllocatorV2;
+        const guarded = ThreadId.make("thread:guarded-owner");
+        const ordinary = ThreadId.make("thread:ordinary-sibling");
+        const providerSessionId = yield* allocator.allocate.providerSession({
+          threadId: guarded,
+          providerInstanceId: modelSelection.instanceId,
+        });
+        yield* sink.write({
+          events: [
+            yield* makeThreadCreatedEvent({
+              idAllocator: allocator,
+              threadId: guarded,
+              now: yield* DateTime.now,
+            }),
+            yield* makeThreadCreatedEvent({
+              idAllocator: allocator,
+              threadId: ordinary,
+              now: yield* DateTime.now,
+            }),
+          ],
+        });
+        const common = { providerSessionId, modelSelection, runtimePolicy };
+        const runtime = yield* manager.open({
+          ...common,
+          threadId: guarded,
+          guardedExecution: true,
+        });
+        assert.strictEqual(yield* manager.open({ ...common, threadId: ordinary }), runtime);
+        assert.strictEqual(
+          yield* manager.open({ ...common, threadId: guarded, guardedExecution: true }),
+          runtime,
+        );
+        assert.deepEqual(checked, [guarded, guarded]);
+        assert.equal((yield* Ref.get(state)).openCount, 1);
+      }).pipe(
+        Effect.provide(
+          layerTest({
+            state,
+            idleTimeoutMs: 60_000,
+            subscriptionGuard: ({ threadId }) =>
+              Effect.sync(() => {
+                checked.push(threadId);
+              }),
+          }),
+        ),
+      );
     }),
 );
