@@ -539,7 +539,7 @@ export const makeClaudeCloudQueryRunner = Effect.fn("makeClaudeCloudQueryRunner"
           const toolJobs = new Map<string, Fiber.Fiber<void, never>>();
           const completedControls = new Set<string>();
           const pollWake = yield* Queue.unbounded<void>();
-          const mcpReady = yield* Deferred.make<void, ClaudeCloudGuardError>();
+          let mcpReady = yield* Deferred.make<void, ClaudeCloudGuardError>();
           const initialPoll = yield* Deferred.make<void, ClaudeCloudGuardError>();
           const admission = yield* Semaphore.make(1);
           const replayLock = yield* Semaphore.make(1);
@@ -880,9 +880,11 @@ export const makeClaudeCloudQueryRunner = Effect.fn("makeClaudeCloudQueryRunner"
           );
           const close = Scope.close(queryScope, Exit.void);
           yield* Deferred.await(initialPoll);
-          if (relay) {
+          const ensureMcpConnected = Effect.gen(function* () {
+            if (!relay) return;
             const status = yield* control("mcp_status", {}, true);
             const servers: Record<string, unknown> = {};
+            let reconnect = false;
             if (
               typeof status === "object" &&
               status !== null &&
@@ -890,16 +892,27 @@ export const makeClaudeCloudQueryRunner = Effect.fn("makeClaudeCloudQueryRunner"
               Array.isArray(status.mcpServers)
             ) {
               for (const entry of status.mcpServers) {
+                if (entry?.name === "t3-code" && entry.source === "sdk") {
+                  if (entry.status === "connected") return;
+                  reconnect = entry.status === "failed" || entry.status === "disconnected";
+                }
                 if (
                   typeof entry?.name === "string" &&
                   entry.config &&
-                  (entry.scope === "dynamic" || entry.source === "sdk")
+                  (entry.scope === "dynamic" ||
+                    entry.source === "dynamic" ||
+                    entry.source === "sdk")
                 )
                   servers[entry.name] = entry.config;
               }
             }
+            // Cloud workers can be recycled while idle. Readiness from the old worker
+            // must never admit a prompt before this worker has its workspace tools.
+            mcpReady = yield* Deferred.make<void, ClaudeCloudGuardError>();
             servers["t3-code"] = { type: "sdk", name: "t3-code", timeout: 90000 };
-            const registered = yield* control("mcp_set_servers", { servers }, true);
+            const registered = reconnect
+              ? yield* control("mcp_reconnect", { serverName: "t3-code" }, true)
+              : yield* control("mcp_set_servers", { servers }, true);
             if (
               typeof registered === "object" &&
               registered !== null &&
@@ -915,9 +928,25 @@ export const makeClaudeCloudQueryRunner = Effect.fn("makeClaudeCloudQueryRunner"
               liveStatus !== null &&
               "mcpServers" in liveStatus &&
               Array.isArray(liveStatus.mcpServers) &&
-              liveStatus.mcpServers.some((s) => s.name === "t3-code" && s.status === "connected");
-            if (!connected) yield* Deferred.await(mcpReady).pipe(Effect.timeout("90 seconds"));
-          }
+              liveStatus.mcpServers.some(
+                (s) => s.name === "t3-code" && s.source === "sdk" && s.status === "connected",
+              );
+            if (!connected) {
+              yield* Deferred.await(mcpReady).pipe(Effect.timeout("90 seconds"));
+              const verified = yield* control("mcp_status", {}, true);
+              if (
+                typeof verified !== "object" ||
+                verified === null ||
+                !("mcpServers" in verified) ||
+                !Array.isArray(verified.mcpServers) ||
+                !verified.mcpServers.some(
+                  (s) => s.name === "t3-code" && s.source === "sdk" && s.status === "connected",
+                )
+              )
+                return yield* new ClaudeCloudGuardError({ reason: "tools_unavailable" });
+            }
+          });
+          yield* ensureMcpConnected;
           connecting = false;
           if (!usable || recoveryPending)
             return yield* new ClaudeCloudGuardError({
@@ -998,6 +1027,7 @@ export const makeClaudeCloudQueryRunner = Effect.fn("makeClaudeCloudQueryRunner"
                   ),
                 );
                 yield* applyReasoning;
+                yield* ensureMcpConnected;
                 if (relay) {
                   yield* control(
                     "apply_flag_settings",

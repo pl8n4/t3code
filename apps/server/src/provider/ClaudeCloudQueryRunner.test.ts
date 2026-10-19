@@ -78,6 +78,10 @@ function fixture(input?: {
   const controlReplies: unknown[] = [];
   let sequence = 0;
   let setupFailures = input?.setupFails ? 1 : 0;
+  let mcpStatus: "missing" | "connected" | "failed" | "pending" = "missing";
+  let reconnectFails = false;
+  let holdMcpSetup = false;
+  const pendingMcpStatus = Promise.withResolvers<void>();
   let eventPolls = 0;
   let eventFailures = 0;
   let openedTabs = 0;
@@ -131,13 +135,24 @@ function fixture(input?: {
             }>;
           }
         ).events[0]?.payload;
-        if (payload?.type === "control_request" && payload.request.subtype === "mcp_set_servers")
-          for (const event of input?.initializationEvents ?? [])
+        const setupFailed =
+          payload?.type === "control_request" &&
+          payload.request.subtype === "mcp_set_servers" &&
+          setupFailures-- > 0;
+        if (
+          payload?.type === "control_request" &&
+          ["mcp_set_servers", "mcp_reconnect"].includes(payload.request.subtype) &&
+          !setupFailed &&
+          !(payload.request.subtype === "mcp_reconnect" && reconnectFails)
+        ) {
+          mcpStatus = holdMcpSetup ? "pending" : "connected";
+          for (const event of holdMcpSetup ? [] : (input?.initializationEvents ?? []))
             controlReplies.push({
               event_id: `initialization:${++sequence}`,
               sequence_num: String(sequence),
               payload: event,
             });
+        }
         if (
           payload?.type === "control_request" &&
           payload.request.subtype === "set_model" &&
@@ -150,6 +165,8 @@ function fixture(input?: {
           payload.request.settings?.effortLevel !== undefined
         )
           runtimeEffort = payload.request.settings.effortLevel ?? "medium";
+        if (payload?.request?.subtype === "mcp_status" && mcpStatus === "pending")
+          pendingMcpStatus.resolve();
         if (payload?.type === "control_request")
           controlReplies.push({
             event_id: `reply:${++sequence}`,
@@ -159,27 +176,36 @@ function fixture(input?: {
               response: {
                 subtype:
                   (payload.request.subtype === "set_model" && input?.modelSwitchFails) ||
-                  (payload.request.subtype === "apply_flag_settings" && input?.reasoningFails)
+                  (payload.request.subtype === "apply_flag_settings" && input?.reasoningFails) ||
+                  (payload.request.subtype === "mcp_reconnect" && reconnectFails)
                     ? "error"
                     : "success",
                 request_id: payload.request_id,
-                response:
-                  payload.request.subtype === "mcp_set_servers" && setupFailures-- > 0
-                    ? { errors: { "t3-code": "injected failure" } }
-                    : payload.request.subtype === "get_settings"
-                      ? { applied: { effort: input?.appliedEffortOverride ?? runtimeEffort } }
-                      : payload.request.subtype === "mcp_status"
-                        ? {
-                            mcpServers: [
-                              {
-                                name: "t3-code",
-                                status: "connected",
-                                source: "sdk",
-                                config: { type: "sdk", name: "t3-code" },
-                              },
-                            ],
-                          }
-                        : {},
+                response: setupFailed
+                  ? { errors: { "t3-code": "injected failure" } }
+                  : payload.request.subtype === "get_settings"
+                    ? { applied: { effort: input?.appliedEffortOverride ?? runtimeEffort } }
+                    : payload.request.subtype === "mcp_status"
+                      ? {
+                          mcpServers: [
+                            {
+                              name: "existing-cloud-tools",
+                              source: "dynamic",
+                              config: { type: "http", url: "https://example.test/mcp" },
+                            },
+                            ...(mcpStatus === "missing"
+                              ? []
+                              : [
+                                  {
+                                    name: "t3-code",
+                                    status: mcpStatus,
+                                    source: "sdk",
+                                    config: { type: "sdk", name: "t3-code" },
+                                  },
+                                ]),
+                          ],
+                        }
+                      : {},
               },
             },
           });
@@ -442,6 +468,34 @@ function fixture(input?: {
       eventPolls: () => eventPolls,
       openedTabs: () => openedTabs,
       openedProfiles,
+      recycleCloudWorker: (hold = false) => {
+        mcpStatus = "missing";
+        holdMcpSetup = hold;
+      },
+      waitPendingMcp: Effect.promise(() => pendingMcpStatus.promise),
+      completeMcpSetup: (connected: boolean) => {
+        mcpStatus = connected ? "connected" : "failed";
+        controlReplies.push({
+          event_id: `new-handshake:${++sequence}`,
+          sequence_num: String(sequence),
+          payload: {
+            type: "control_request",
+            request_id: "new-handshake",
+            request: {
+              subtype: "mcp_message",
+              server_name: "t3-code",
+              message: { jsonrpc: "2.0", id: 302, method: "tools/list" },
+            },
+          },
+        });
+      },
+      disconnectMcp: (fail = false) => {
+        mcpStatus = "failed";
+        reconnectFails = fail;
+      },
+      failMcpSetup: () => {
+        setupFailures = 1;
+      },
       failEventPolls: (count: number) => {
         eventFailures = count;
       },
@@ -511,6 +565,130 @@ const run = <A, E>(
 ) => effect.pipe(Effect.scoped, Effect.provide(NodeServices.layer));
 
 describe("Claude cloud guarded transport", () => {
+  it.effect.each([false, true])(
+    "reconnects workspace tools before a new turn after idle worker recycling (setup failure: %s)",
+    (failSetup) =>
+      run(
+        Effect.gen(function* () {
+          const f = yield* fixture({ workspace: true });
+          const session = yield* f.open();
+          yield* session.offer({
+            type: "user",
+            session_id: "",
+            parent_tool_use_id: null,
+            message: { role: "user", content: "First task" },
+          });
+          f.pushEvent({ type: "result", subtype: "success", result: "Done" });
+          const result = yield* session.messages.pipe(
+            Stream.filter((m) => m.type === "result"),
+            Stream.runHead,
+          );
+          if (result._tag !== "Some") throw new Error("Missing first result");
+          const checkpoint = session.cloudEventSequence?.(result.value);
+          if (checkpoint === undefined) throw new Error("Missing checkpoint");
+          f.recycleCloudWorker();
+          if (failSetup) f.failMcpSetup();
+          const offered = yield* session
+            .offer(
+              {
+                type: "user",
+                session_id: "",
+                parent_tool_use_id: null,
+                message: { role: "user", content: "PR check failed; inspect the logs" },
+              },
+              checkpoint,
+            )
+            .pipe(Effect.result);
+          expect(offered._tag).toBe(failSetup ? "Failure" : "Success");
+          expect(f.sentModels).toHaveLength(failSetup ? 1 : 2);
+          const posts = f.calls.flatMap(
+            (c) =>
+              (
+                c.body as {
+                  events?: Array<{ payload: { type: string; request?: { subtype: string } } }>;
+                }
+              )?.events ?? [],
+          );
+          expect(
+            posts.filter((e) => e.payload.request?.subtype === "mcp_set_servers"),
+          ).toHaveLength(2);
+          expect(
+            JSON.stringify(posts.filter((e) => e.payload.request?.subtype === "mcp_set_servers")),
+          ).toContain('"existing-cloud-tools":{"type":"http","url":"https://example.test/mcp"}');
+          if (!failSetup) {
+            expect(
+              posts.findLastIndex((e) => e.payload.request?.subtype === "mcp_set_servers"),
+            ).toBeLessThan(posts.findLastIndex((e) => e.payload.type === "user"));
+          }
+          yield* session.close;
+        }),
+      ),
+  );
+  it.effect.each([false, true])(
+    "waits for a fresh handshake after recycling instead of reusing old readiness (connected: %s)",
+    (connected) =>
+      run(
+        Effect.gen(function* () {
+          const f = yield* fixture({
+            workspace: true,
+            initializationEvents: [
+              {
+                type: "control_request",
+                request_id: "initial-handshake",
+                request: {
+                  subtype: "mcp_message",
+                  server_name: "t3-code",
+                  message: { jsonrpc: "2.0", id: 301, method: "tools/list" },
+                },
+              },
+            ],
+          });
+          const session = yield* f.open();
+          yield* f.waitForToolReply;
+          f.recycleCloudWorker(true);
+          const offered = yield* session
+            .offer({
+              type: "user",
+              session_id: "",
+              parent_tool_use_id: null,
+              message: { role: "user", content: "Wait for the new workspace connection" },
+            })
+            .pipe(Effect.result, Effect.forkChild);
+          yield* f.waitPendingMcp;
+          yield* TestClock.adjust("2 seconds");
+          expect(offered.pollUnsafe()).toBeUndefined();
+          expect(f.sentModels).toHaveLength(0);
+          f.completeMcpSetup(connected);
+          const result = yield* Fiber.join(offered);
+          expect(result._tag).toBe(connected ? "Success" : "Failure");
+          expect(f.sentModels).toHaveLength(connected ? 1 : 0);
+          yield* session.close;
+        }),
+      ),
+  );
+  it.effect.each([false, true])(
+    "reconnects a failed SDK connection before admitting a prompt (reconnect failure: %s)",
+    (failReconnect) =>
+      run(
+        Effect.gen(function* () {
+          const f = yield* fixture({ workspace: true });
+          const session = yield* f.open();
+          f.disconnectMcp(failReconnect);
+          const offered = yield* session
+            .offer({
+              type: "user",
+              session_id: "",
+              parent_tool_use_id: null,
+              message: { role: "user", content: "Inspect CI" },
+            })
+            .pipe(Effect.result);
+          expect(offered._tag).toBe(failReconnect ? "Failure" : "Success");
+          expect(f.sentModels).toHaveLength(failReconnect ? 0 : 1);
+          expect(JSON.stringify(f.calls)).toContain('"subtype":"mcp_reconnect"');
+          yield* session.close;
+        }),
+      ),
+  );
   it.effect(
     "recovers before clients report profiles using the persistent signed-in browser profile",
     () =>
