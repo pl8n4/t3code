@@ -48,17 +48,18 @@ function fixture(input?: {
   workspaceMalformed?: boolean;
   workspaceCwd?: string;
   setupFails?: boolean;
+  initializationEvents?: unknown[];
 }) {
   let usage: unknown = input?.paid ? { ...funded(), extra_usage: { is_enabled: true } } : funded();
   const calls: Array<{ path: string; method: string; body?: unknown }> = [];
-  const sent = Promise.withResolvers<void>();
+  let sent = false;
   const rpcCalls: Array<Record<string, unknown>> = [];
   const evaluations: string[] = [];
   const controlReplies: unknown[] = [];
   let sequence = 0;
   let setupFailures = input?.setupFails ? 1 : 0;
   let eventPolls = 0;
-  const toolReply = Promise.withResolvers<void>();
+  let toolReply = Promise.withResolvers<void>();
   const toolResponses: unknown[] = [];
   const fetch = async (url: string, init?: RequestInit) => {
     const method = init?.method ?? "GET";
@@ -74,8 +75,7 @@ function fixture(input?: {
     if (url.endsWith("/events")) {
       if (method === "GET") {
         eventPolls++;
-        if (input?.events) await sent.promise;
-        return Response.json({ data: [...controlReplies, ...(input?.events ?? [])] });
+        return Response.json({ data: [...controlReplies, ...(sent ? (input?.events ?? []) : [])] });
       }
       if (input?.workspace) {
         const payload = (
@@ -85,6 +85,13 @@ function fixture(input?: {
             }>;
           }
         ).events[0]?.payload;
+        if (payload?.type === "control_request" && payload.request.subtype === "mcp_set_servers")
+          for (const event of input.initializationEvents ?? [])
+            controlReplies.push({
+              event_id: `initialization:${++sequence}`,
+              sequence_num: String(sequence),
+              payload: event,
+            });
         if (payload?.type === "control_request")
           controlReplies.push({
             event_id: `reply:${++sequence}`,
@@ -122,7 +129,7 @@ function fixture(input?: {
           (e) => e.payload.type === "user",
         )
       )
-        sent.resolve();
+        sent = true;
       return Response.json({});
     }
     if (url === "/v1/code/sessions" && input?.createFails)
@@ -282,7 +289,13 @@ function fixture(input?: {
       evaluations,
       readBinding: fs.readFileString(bindingPath).pipe(Effect.map(decodeJson)),
       toolResponses,
-      waitForToolReply: Effect.promise(() => toolReply.promise),
+      waitForToolReply: Effect.promise(() => toolReply.promise).pipe(
+        Effect.tap(() =>
+          Effect.sync(() => {
+            toolReply = Promise.withResolvers<void>();
+          }),
+        ),
+      ),
       eventPolls: () => eventPolls,
       pushEvent: (payload: unknown) =>
         controlReplies.push({
@@ -290,6 +303,16 @@ function fixture(input?: {
           sequence_num: String(sequence),
           payload,
         }),
+      replayToolRequest: () => {
+        const previous = controlReplies.find(
+          (e) => (e as { payload: { type: string } }).payload.type === "control_request",
+        ) as { payload: unknown };
+        controlReplies.push({
+          event_id: `duplicate:${++sequence}`,
+          sequence_num: String(sequence),
+          payload: previous.payload,
+        });
+      },
       forgetToolOutcome: (requestId: string) =>
         fs.readFileString(bindingPath).pipe(
           Effect.map(
@@ -324,6 +347,182 @@ const run = <A, E>(
 ) => effect.pipe(Effect.scoped, Effect.provide(NodeServices.layer));
 
 describe("Claude cloud guarded transport", () => {
+  it.effect("stops initialization when a late tool request arrives during MCP setup", () =>
+    run(
+      Effect.gen(function* () {
+        const f = yield* fixture({
+          workspace: true,
+          initializationEvents: [
+            {
+              type: "control_request",
+              request_id: "setup-write",
+              request: {
+                subtype: "mcp_message",
+                server_name: "t3-code",
+                message: {
+                  jsonrpc: "2.0",
+                  id: 203,
+                  method: "tools/call",
+                  params: { name: "t3_workspace_write", arguments: {} },
+                },
+              },
+            },
+          ],
+        });
+        const opened = yield* f.open().pipe(Effect.result);
+        expect(opened._tag).toBe("Failure");
+        expect(JSON.stringify(opened)).toContain("delivery_pending");
+        expect(
+          f.rpcCalls.filter((rpc) => JSON.stringify(rpc).includes("t3_workspace_write")),
+        ).toHaveLength(0);
+      }),
+    ),
+  );
+  it.effect(
+    "blocks unfetched late output and tools after disconnecting before the first reply",
+    () =>
+      run(
+        Effect.gen(function* () {
+          const f = yield* fixture({ workspace: true });
+          const session = yield* f.open();
+          yield* session.offer({
+            type: "user",
+            session_id: "",
+            parent_tool_use_id: null,
+            message: { role: "user", content: "Original task" },
+          });
+          expect(yield* f.readBinding).toMatchObject({ pendingTurn: {} });
+          yield* session.close;
+          f.pushEvent({
+            type: "control_request",
+            request_id: "late-write",
+            request: {
+              subtype: "mcp_message",
+              server_name: "t3-code",
+              message: {
+                jsonrpc: "2.0",
+                id: 200,
+                method: "tools/call",
+                params: { name: "t3_workspace_write", arguments: {} },
+              },
+            },
+          });
+          f.pushEvent({
+            type: "assistant",
+            message: { content: [{ type: "text", text: "Late output" }] },
+          });
+          f.pushEvent({ type: "result", subtype: "success", result: "Late output" });
+          const resumed = yield* f
+            .open({ resume: true, durableCloudSequence: "0" })
+            .pipe(Effect.result);
+          expect(resumed._tag).toBe("Failure");
+          expect(JSON.stringify(resumed)).toContain("delivery_pending");
+          expect(
+            f.rpcCalls.filter((rpc) => JSON.stringify(rpc).includes("t3_workspace_write")),
+          ).toHaveLength(0);
+          expect(JSON.stringify(f.calls)).not.toContain("New task");
+          const closedOffer = yield* session
+            .offer({
+              type: "user",
+              session_id: "",
+              parent_tool_use_id: null,
+              message: { role: "user", content: "New task" },
+            })
+            .pipe(Effect.result);
+          expect(closedOffer._tag).toBe("Failure");
+          expect(
+            f.calls
+              .flatMap(
+                (c) => (c.body as { events?: Array<{ payload: { type: string } }> })?.events ?? [],
+              )
+              .filter((e) => e.payload.type === "user"),
+          ).toHaveLength(1);
+        }),
+      ),
+  );
+  it.effect.each(["tool", "reply"] as const)(
+    "refuses newly fetched historical %s events during initialization",
+    (first) =>
+      run(
+        Effect.gen(function* () {
+          const f = yield* fixture({ workspace: true });
+          const session = yield* f.open();
+          yield* session.close;
+          const tool = {
+            type: "control_request",
+            request_id: "historical-write",
+            request: {
+              subtype: "mcp_message",
+              server_name: "t3-code",
+              message: {
+                jsonrpc: "2.0",
+                id: 201,
+                method: "tools/call",
+                params: { name: "t3_workspace_write", arguments: {} },
+              },
+            },
+          };
+          const reply = {
+            type: "assistant",
+            message: { content: [{ type: "text", text: "Historical output" }] },
+          };
+          for (const payload of first === "tool" ? [tool, reply] : [reply, tool])
+            f.pushEvent(payload);
+          const resumed = yield* f.open({ resume: true }).pipe(Effect.result);
+          expect(resumed._tag).toBe("Failure");
+          expect(JSON.stringify(resumed)).toContain("delivery_pending");
+          expect(
+            f.rpcCalls.filter((rpc) => JSON.stringify(rpc).includes("t3_workspace_write")),
+          ).toHaveLength(0);
+          expect(yield* f.readBinding).toMatchObject({
+            inbox: expect.arrayContaining([expect.objectContaining({ payload: reply })]),
+          });
+        }),
+      ),
+  );
+  it.effect(
+    "rejects idle tool requests arriving after initialization and refuses the next prompt",
+    () =>
+      run(
+        Effect.gen(function* () {
+          const f = yield* fixture({ workspace: true });
+          const session = yield* f.open();
+          f.pushEvent({
+            type: "control_request",
+            request_id: "idle-write",
+            request: {
+              subtype: "mcp_message",
+              server_name: "t3-code",
+              message: {
+                jsonrpc: "2.0",
+                id: 202,
+                method: "tools/call",
+                params: { name: "t3_workspace_write", arguments: {} },
+              },
+            },
+          });
+          yield* TestClock.adjust("2 seconds");
+          const output = yield* session.messages.pipe(Stream.runHead, Effect.result);
+          expect(output._tag).toBe("Failure");
+          expect(JSON.stringify(output)).toContain("delivery_pending");
+          const offered = yield* session
+            .offer({
+              type: "user",
+              session_id: "",
+              parent_tool_use_id: null,
+              message: { role: "user", content: "Must not send" },
+            })
+            .pipe(Effect.result);
+          expect(offered._tag).toBe("Failure");
+          expect(JSON.stringify(offered)).toContain("delivery_pending");
+          expect(
+            f.rpcCalls.filter((rpc) => JSON.stringify(rpc).includes("t3_workspace_write")),
+          ).toHaveLength(0);
+          expect(JSON.stringify(f.calls)).not.toContain("Must not send");
+          yield* session.close;
+        }),
+      ),
+  );
   it.effect("refuses a missing explicit resume without creating a replacement session", () =>
     run(
       Effect.gen(function* () {
@@ -344,6 +543,12 @@ describe("Claude cloud guarded transport", () => {
         yield* TestClock.adjust("10 seconds");
         expect(f.eventPolls()).toBe(polls);
         const session = yield* f.open();
+        yield* session.offer({
+          type: "user",
+          session_id: "",
+          parent_tool_use_id: null,
+          message: { role: "user", content: "Continue" },
+        });
         f.pushEvent({
           type: "control_request",
           request_id: "write-once",
@@ -358,18 +563,24 @@ describe("Claude cloud guarded transport", () => {
             },
           },
         });
-        yield* session.offer({
-          type: "user",
-          session_id: "",
-          parent_tool_use_id: null,
-          message: { role: "user", content: "Continue" },
-        });
+        yield* TestClock.adjust("200 millis");
         yield* f.waitForToolReply;
         expect(
           f.rpcCalls.filter((rpc) => JSON.stringify(rpc).includes("t3_workspace_write")),
         ).toHaveLength(1);
+        f.pushEvent({ type: "result", subtype: "success", result: "Done" });
+        yield* TestClock.adjust("200 millis");
+        const result = yield* session.messages.pipe(
+          Stream.filter((m) => m.type === "result"),
+          Stream.runHead,
+        );
+        if (result._tag !== "Some") throw new Error("Missing result");
+        const checkpoint = session.cloudEventSequence?.(result.value);
+        if (checkpoint === undefined) throw new Error("Missing checkpoint");
         yield* session.close;
-        const resumed = yield* f.open({ resume: true });
+        f.replayToolRequest();
+        const resumed = yield* f.open({ resume: true, durableCloudSequence: checkpoint });
+        yield* f.waitForToolReply;
         yield* resumed.close;
         expect(
           f.rpcCalls.filter((rpc) => JSON.stringify(rpc).includes("t3_workspace_write")),
@@ -383,6 +594,12 @@ describe("Claude cloud guarded transport", () => {
       Effect.gen(function* () {
         const f = yield* fixture({ workspace: true });
         const session = yield* f.open();
+        yield* session.offer({
+          type: "user",
+          session_id: "",
+          parent_tool_use_id: null,
+          message: { role: "user", content: "Continue" },
+        });
         f.pushEvent({
           type: "control_request",
           request_id: "uncertain-write",
@@ -397,16 +614,22 @@ describe("Claude cloud guarded transport", () => {
             },
           },
         });
-        yield* session.offer({
-          type: "user",
-          session_id: "",
-          parent_tool_use_id: null,
-          message: { role: "user", content: "Continue" },
-        });
+        yield* TestClock.adjust("200 millis");
         yield* f.waitForToolReply;
+        f.pushEvent({ type: "result", subtype: "success", result: "Done" });
+        yield* TestClock.adjust("200 millis");
+        const result = yield* session.messages.pipe(
+          Stream.filter((m) => m.type === "result"),
+          Stream.runHead,
+        );
+        if (result._tag !== "Some") throw new Error("Missing result");
+        const checkpoint = session.cloudEventSequence?.(result.value);
+        if (checkpoint === undefined) throw new Error("Missing checkpoint");
         yield* session.close;
         yield* f.forgetToolOutcome("uncertain-write");
-        const resumed = yield* f.open({ resume: true });
+        f.replayToolRequest();
+        const resumed = yield* f.open({ resume: true, durableCloudSequence: checkpoint });
+        yield* f.waitForToolReply;
         yield* resumed.close;
         expect(
           f.rpcCalls.filter((rpc) => JSON.stringify(rpc).includes("t3_workspace_write")),

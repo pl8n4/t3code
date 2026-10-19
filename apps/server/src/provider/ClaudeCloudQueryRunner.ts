@@ -47,6 +47,9 @@ const Binding = Schema.Struct({
   organizationId: Schema.String,
   cloudId: Schema.String,
   sequence: Schema.String,
+  pendingTurn: Schema.optionalKey(
+    Schema.Struct({ resultSequence: Schema.optionalKey(Schema.String) }),
+  ),
   inbox: Schema.optionalKey(Schema.Array(ClaudeCloudEvent)),
   toolRequests: Schema.optionalKey(
     Schema.Record(
@@ -343,10 +346,20 @@ export const makeClaudeCloudQueryRunner = Effect.fn("makeClaudeCloudQueryRunner"
               const cursor = BigInt(checkpoint);
               if (cursor > BigInt(binding.sequence))
                 return yield* new ClaudeCloudGuardError({ reason: "remote_failed" });
-              yield* updateBinding((current) => ({
-                ...current,
-                inbox: (current.inbox ?? []).filter((event) => BigInt(event.sequence_num) > cursor),
-              }));
+              yield* updateBinding((current) => {
+                const { pendingTurn, ...rest } = current;
+                return {
+                  ...rest,
+                  ...(pendingTurn !== undefined &&
+                  (pendingTurn.resultSequence === undefined ||
+                    BigInt(pendingTurn.resultSequence) > cursor)
+                    ? { pendingTurn }
+                    : {}),
+                  inbox: (current.inbox ?? []).filter(
+                    (event) => BigInt(event.sequence_num) > cursor,
+                  ),
+                };
+              });
             });
           };
           yield* acknowledge(input.durableCloudSequence);
@@ -359,11 +372,7 @@ export const makeClaudeCloudQueryRunner = Effect.fn("makeClaudeCloudQueryRunner"
             ),
           );
           yield* checkModel;
-          if (
-            (binding.inbox ?? []).some((event) =>
-              ["assistant", "user", "result", "stream_event"].includes(String(event.payload.type)),
-            )
-          ) {
+          const requireRecovery = Effect.gen(function* () {
             const requestId = yield* crypto.randomUUIDv4();
             yield* request(`${sessionPath}/events`, {
               events: [
@@ -386,12 +395,22 @@ export const makeClaudeCloudQueryRunner = Effect.fn("makeClaudeCloudQueryRunner"
               })
               .pipe(Effect.ignore);
             return yield* new ClaudeCloudGuardError({ reason: "delivery_pending" });
-          }
+          });
+          if (
+            binding.pendingTurn !== undefined ||
+            (binding.inbox ?? []).some((event) =>
+              ["assistant", "user", "result", "stream_event"].includes(String(event.payload.type)),
+            )
+          )
+            return yield* requireRecovery;
           const queue = yield* Queue.unbounded<
             SDKMessage,
             ClaudeAgentSdkQueryRunnerError | Cause.Done
           >();
           let active = false;
+          let closed = false;
+          let usable = true;
+          let recoveryPending = false;
           let connecting = relay !== undefined;
           let lastBillingCheck = 0;
           let sequence = BigInt(binding.sequence);
@@ -405,6 +424,8 @@ export const makeClaudeCloudQueryRunner = Effect.fn("makeClaudeCloudQueryRunner"
           const completedControls = new Set<string>();
           const pollWake = yield* Queue.unbounded<void>();
           const mcpReady = yield* Deferred.make<void, ClaudeCloudGuardError>();
+          const initialPoll = yield* Deferred.make<void, ClaudeCloudGuardError>();
+          const admission = yield* Semaphore.make(1);
           const control = (subtype: string, fields: Record<string, unknown> = {}, wait = false) =>
             Effect.gen(function* () {
               const requestId = yield* crypto.randomUUIDv4();
@@ -442,6 +463,21 @@ export const makeClaudeCloudQueryRunner = Effect.fn("makeClaudeCloudQueryRunner"
                 toolJobs.has(requestId)
               )
                 return;
+              const saved = binding.toolRequests?.[requestId];
+              const method =
+                typeof decoded.message === "object" &&
+                decoded.message !== null &&
+                "method" in decoded.message
+                  ? decoded.message.method
+                  : undefined;
+              if (
+                !active &&
+                !saved &&
+                !["initialize", "notifications/initialized", "tools/list"].includes(String(method))
+              ) {
+                recoveryPending = true;
+                return yield* requireRecovery;
+              }
               const job = yield* Effect.gen(function* () {
                 const saved = binding.toolRequests?.[requestId];
                 if (saved?.state === "completed" && saved.response) return saved.response;
@@ -548,6 +584,13 @@ export const makeClaudeCloudQueryRunner = Effect.fn("makeClaudeCloudQueryRunner"
             if (nextSequence !== undefined) sequence = nextSequence;
             for (const event of events) {
               const payload = event.payload;
+              if (
+                !active &&
+                ["assistant", "user", "result", "stream_event"].includes(String(payload.type))
+              ) {
+                recoveryPending = true;
+                return yield* requireRecovery;
+              }
               if (payload.type === "control_request") {
                 yield* replyToTool(payload);
                 continue;
@@ -585,7 +628,13 @@ export const makeClaudeCloudQueryRunner = Effect.fn("makeClaudeCloudQueryRunner"
                 continue;
               }
               if (typeof payload.type !== "string" || !relayedTypes.has(payload.type)) continue;
-              if (payload.type === "result") active = false;
+              if (payload.type === "result") {
+                yield* updateBinding((current) => ({
+                  ...current,
+                  pendingTurn: { resultSequence: event.sequence_num },
+                }));
+                active = false;
+              }
               // The adapter owns a local UUID; the persisted binding owns the remote session ID.
               const message = { ...payload, session_id: nativeId } as SDKMessage;
               sdkSequences.set(message, event.sequence_num);
@@ -594,6 +643,7 @@ export const makeClaudeCloudQueryRunner = Effect.fn("makeClaudeCloudQueryRunner"
           });
           const fiber = yield* Effect.gen(function* () {
             yield* poll;
+            yield* Deferred.succeed(initialPoll, undefined);
             yield* Queue.take(pollWake).pipe(
               Effect.timeoutOption(
                 active || connecting || pendingControls.size > 0 ? "200 millis" : "2 seconds",
@@ -603,16 +653,15 @@ export const makeClaudeCloudQueryRunner = Effect.fn("makeClaudeCloudQueryRunner"
             Effect.forever,
             Effect.catch((cause) =>
               Effect.gen(function* () {
+                usable = false;
                 if (active) yield* control("interrupt").pipe(Effect.ignore);
-                yield* Deferred.fail(
-                  mcpReady,
-                  new ClaudeCloudGuardError({ reason: "remote_failed" }),
-                );
+                const error = new ClaudeCloudGuardError({
+                  reason: recoveryPending ? "delivery_pending" : "remote_failed",
+                });
+                yield* Deferred.fail(initialPoll, error);
+                yield* Deferred.fail(mcpReady, error);
                 for (const deferred of pendingControls.values())
-                  yield* Deferred.fail(
-                    deferred,
-                    new ClaudeCloudGuardError({ reason: "remote_failed" }),
-                  );
+                  yield* Deferred.fail(deferred, error);
                 yield* Queue.fail(queue, wrap("events")(cause));
               }),
             ),
@@ -621,6 +670,7 @@ export const makeClaudeCloudQueryRunner = Effect.fn("makeClaudeCloudQueryRunner"
           yield* Scope.addFinalizer(
             queryScope,
             Effect.gen(function* () {
+              closed = true;
               yield* Fiber.interrupt(fiber);
               yield* Effect.forEach(toolJobs.values(), Fiber.interrupt, { discard: true });
               if (active) yield* control("interrupt").pipe(Effect.ignore);
@@ -628,6 +678,7 @@ export const makeClaudeCloudQueryRunner = Effect.fn("makeClaudeCloudQueryRunner"
             }),
           );
           const close = Scope.close(queryScope, Exit.void);
+          yield* Deferred.await(initialPoll);
           if (relay) {
             const status = yield* control("mcp_status", {}, true);
             const servers: Record<string, unknown> = {};
@@ -667,12 +718,22 @@ export const makeClaudeCloudQueryRunner = Effect.fn("makeClaudeCloudQueryRunner"
             if (!connected) yield* Deferred.await(mcpReady).pipe(Effect.timeout("90 seconds"));
           }
           connecting = false;
+          if (!usable)
+            return yield* new ClaudeCloudGuardError({
+              reason: recoveryPending ? "delivery_pending" : "remote_failed",
+            });
           const runtime: ClaudeAgentSdkQuerySession = {
             messages: Stream.fromQueue(queue),
             cloudEventSequence: (message) => sdkSequences.get(message),
             offer: (message, durableCloudSequence) =>
               Effect.gen(function* () {
+                if (closed || !usable)
+                  return yield* new ClaudeCloudGuardError({
+                    reason: recoveryPending ? "delivery_pending" : "remote_failed",
+                  });
                 yield* acknowledge(durableCloudSequence);
+                if (binding.pendingTurn !== undefined)
+                  return yield* new ClaudeCloudGuardError({ reason: "delivery_pending" });
                 yield* Effect.all([guard, checkModel], { concurrency: "unbounded" });
                 if (relay) {
                   yield* control(
@@ -752,12 +813,18 @@ export const makeClaudeCloudQueryRunner = Effect.fn("makeClaudeCloudQueryRunner"
                   };
                 }
                 lastBillingCheck = DateTime.toEpochMillis(yield* DateTime.now);
+                // Persist admission before the POST: a disconnect can precede the first event poll.
+                yield* updateBinding((current) => ({ ...current, pendingTurn: {} }));
+                if (closed || !usable)
+                  return yield* new ClaudeCloudGuardError({
+                    reason: recoveryPending ? "delivery_pending" : "remote_failed",
+                  });
                 active = true;
                 yield* request(`${sessionPath}/events`, {
                   events: [{ payload: { ...forwarded, session_id: binding.cloudId } }],
                 }).pipe(Effect.tapError(() => control("interrupt").pipe(Effect.ignore)));
                 yield* Queue.offer(pollWake, undefined);
-              }).pipe(Effect.mapError(wrap("offer"))),
+              }).pipe(admission.withPermits(1), Effect.mapError(wrap("offer"))),
             setModel: (model) =>
               Effect.try(() => verifyClaudeCloudModel(model)).pipe(
                 Effect.mapError(wrap("setModel")),

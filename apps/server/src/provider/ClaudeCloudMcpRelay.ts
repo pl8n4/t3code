@@ -17,24 +17,69 @@ const Rpc = Schema.Struct({
 });
 const decodeRpc = Schema.decodeUnknownEffect(Rpc);
 
-// A cloud-credit turn must not start another provider or change its billing route.
-const modelLaunchingTools = new Set([
-  "delegate_task",
-  "create_threads",
-  "t3_thread_launch",
-  "t3_thread_send",
-  "t3_thread_send_attachments",
-  "schedule_task",
-  "update_scheduled_task",
-  "run_scheduled_task_now",
-  "t3_thread_fork",
-  "t3_thread_merge_back",
-  "t3_queue_promote_to_steer",
-  "t3_thread_configure",
-  "t3_thread_update",
-  "t3_environment_preferences_update",
-  "write_pull_request_guides",
-  "t3_worktree_handoff",
+// Admit reviewed workspace and client tools explicitly. Thread automation can wake a different
+// provider, and new tools must be checked before they become available to free-credit sessions.
+const cloudTools = new Set([
+  "t3_workspace_info",
+  "t3_workspace_pull_requests",
+  "t3_workspace_pull_request_read",
+  "t3_workspace_list",
+  "t3_workspace_read",
+  "t3_workspace_write",
+  "t3_workspace_exec",
+  "preview_status",
+  "preview_open",
+  "preview_dialog",
+  "preview_navigate",
+  "preview_resize",
+  "preview_set_appearance",
+  "preview_snapshot",
+  "preview_click",
+  "preview_type",
+  "preview_hover",
+  "preview_select",
+  "preview_drag",
+  "preview_upload",
+  "preview_press",
+  "preview_scroll",
+  "preview_evaluate",
+  "preview_wait_for",
+  "preview_recording_start",
+  "preview_recording_stop",
+  "t3_preview_list",
+  "t3_preview_close",
+  "html_preview",
+  "html_render",
+  "device_list",
+  "device_open",
+  "device_screenshot",
+  "device_close",
+  "orchestrator_capabilities",
+  "task_status",
+  "t3_thread_list",
+  "t3_thread_read",
+  "t3_thread_wait",
+  "t3_thread_search",
+  "t3_thread_configuration",
+  "t3_thread_transfers",
+  "t3_queue_list",
+  "t3_queue_read",
+  "t3_pending_request_list",
+  "t3_pending_request_read",
+  "list_scheduled_tasks",
+  "t3_environment_read",
+  "t3_worktree_status",
+  "t3_worktree_list",
+  "t3_project_list",
+  "t3_project_read",
+  "link_pull_request",
+  "unlink_pull_request",
+  "list_thread_pull_requests",
+  "unwatch_pull_request",
+  "read_pull_request_guide",
+  "request_secret",
+  "t3_attachment_prepare_upload",
+  "t3_attachment_discard",
 ]);
 
 // The local credential never crosses the cloud/browser boundary. The remote CLI sees an SDK
@@ -110,7 +155,7 @@ export const makeClaudeCloudMcpRelay = Effect.fn("makeClaudeCloudMcpRelay")(func
       return { ...initialized, id: rpc.id };
     if (rpc.method === "notifications/initialized")
       return { jsonrpc: "2.0", id: rpc.id ?? 0, result: {} };
-    if (rpc.method === "tools/call" && modelLaunchingTools.has(String(rpc.params?.name)))
+    if (rpc.method === "tools/call" && !cloudTools.has(String(rpc.params?.name)))
       return {
         jsonrpc: "2.0",
         id: rpc.id,
@@ -140,7 +185,7 @@ export const makeClaudeCloudMcpRelay = Effect.fn("makeClaudeCloudMcpRelay")(func
         result: {
           ...reply.result,
           tools: reply.result.tools.filter(
-            (tool) => typeof tool?.name === "string" && !modelLaunchingTools.has(tool.name),
+            (tool) => typeof tool?.name === "string" && cloudTools.has(tool.name),
           ),
         },
       };
@@ -148,4 +193,4 @@ export const makeClaudeCloudMcpRelay = Effect.fn("makeClaudeCloudMcpRelay")(func
   });
 });
 
-export const CLAUDE_CLOUD_WORKSPACE_INSTRUCTIONS = `You are working inside T3 Code. The project and source-control credentials are on the user's machine, connected through the t3-code MCP server. Call t3_workspace_info to identify the actual project and worktree. Use t3_workspace_pull_requests and t3_workspace_pull_request_read for PR questions, with all states to include merged PRs. For topic lists, filter by relevant labels or titles, follow nextCursors when truncated, and never fill a requested count with unrelated PRs. Use t3_workspace_list/read/write for workspace-relative file operations and t3_workspace_exec for git, gh, rg, tests and patches in the actual project. Cloud Bash, Read, Write, Edit, Glob and Grep are disabled because their /home/user directory is a disposable container unrelated to the project; an empty cloud directory never means the T3 repository is unavailable. Preserve existing edits. Do not clone, commit or push merely to connect the workspace. T3 records local diffs and checkpoints. Link PRs you create or work on with link_pull_request. For browser work, call preview_status first and then preview_open if needed. Use T3 tools for browser, history and user input. This session uses promotional cloud credit and Haiku only: never launch another model, local agent CLI, paid API call or delegated task. Tools that launch model work or change provider settings are disabled.`;
+export const CLAUDE_CLOUD_WORKSPACE_INSTRUCTIONS = `You are working inside T3 Code. The project and source-control credentials are on the user's machine, connected through the t3-code MCP server. Call t3_workspace_info to identify the actual project and worktree. Use t3_workspace_pull_requests and t3_workspace_pull_request_read for PR questions, with all states to include merged PRs. For topic lists, filter by relevant labels or titles, follow nextCursors when truncated, and never fill a requested count with unrelated PRs. Use t3_workspace_list/read/write for workspace-relative file operations and t3_workspace_exec for git, gh, rg, tests and patches in the actual project. Cloud Bash, Read, Write, Edit, Glob and Grep are disabled because their /home/user directory is a disposable container unrelated to the project; an empty cloud directory never means the T3 repository is unavailable. Preserve existing edits. Do not clone, commit or push merely to connect the workspace. T3 records local diffs and checkpoints. Link PRs you create or work on with link_pull_request. For browser work, call preview_status first and then preview_open if needed. Use T3 tools for browser, history and user input. This session uses promotional cloud credit and Haiku only: never launch another model, local agent CLI, paid API call or delegated task. Only reviewed workspace and client tools are available. Model launches, provider changes and PR watching are disabled because they can start other billed work.`;
