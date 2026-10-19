@@ -70,7 +70,11 @@ timestamp shows when the displayed wait started.
 Add a separate Claude instance in **Settings > Providers**, then turn on
 **Cloud sessions · free credits only (prototype)**. Sign in to the same Claude
 subscription in T3's browser using its Default profile. Select that instance,
-**Haiku 5.5**, and **Full access** in the composer.
+**Haiku 5.5**, **Opus 5.5**, or **Fable 5.1**, and **Full access** in the composer.
+Opus 5.5 is the default. Haiku uses promotional credit more slowly; Fable is also available.
+Model changes apply to the next message, including in existing cloud threads.
+Fable may require usage credits on your account. If promotional credit cannot
+cover a model, leave paid usage disabled; the bridge does not enable it.
 
 Also select the cloud instance for **Settings > General > Text generation model**
 if you want to prevent background titles and other generated text from using a
@@ -102,7 +106,7 @@ To switch automatically at a subscription limit, enable **Continue in free cloud
 credit when limited** on your ordinary local Claude instance. Keep exactly one
 free-credit cloud instance enabled for that same Claude config directory and
 account. In a **Full access**, default-mode thread, a rejected usage-limit turn
-stops and continues on cloud Haiku in the same conversation. T3 transfers the
+stops and continues on cloud Opus 5.5 in the same conversation. T3 transfers the
 conversation context and keeps the current workspace; the composer follows the
 cloud instance for subsequent messages. You can select the local instance again
 later. Ambiguous accounts, pending approvals, queued work, snoozed threads, or
@@ -111,7 +115,7 @@ unknown billing information block automatic continuation.
 For manual switching, stop the current turn, select the cloud instance, and send
 a follow-up. You can also start a new cloud thread in any local project.
 
-This prototype supports Haiku 5.5 and Full access. File tools use paths relative
+This prototype supports Haiku 5.5, Opus 5.5, Fable 5.1, and Full access. File tools use paths relative
 to the thread's workspace; commands currently require a Unix shell and have a
 60-second timeout. Local dependencies still run on the environment's machine.
 Cloud-native skills, binary/image attachments, and native conversation fork or

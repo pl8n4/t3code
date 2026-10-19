@@ -50,12 +50,12 @@ const thread = {
   snoozedUntil: null,
 };
 describe("free cloud quota handoff", () => {
-  it("selects matching Haiku without waiting for a reset time and uses a stable dispatch identity", () => {
+  it("selects matching cloud Opus without waiting for a reset time and uses a stable dispatch identity", () => {
     const command = cloudFallbackCommand(thread, settings, instances);
     expect(command).toMatchObject({
       type: "message.dispatch",
       cloudFallbackOfRunId: thread.latestRunId,
-      modelSelection: { instanceId: target, model: "claude-haiku-5-5" },
+      modelSelection: { instanceId: target, model: "claude-opus-5-5" },
     });
     expect(cloudFallbackCommand(thread, settings, instances)).toEqual(command);
   });

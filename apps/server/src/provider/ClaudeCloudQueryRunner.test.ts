@@ -50,6 +50,7 @@ function fixture(input?: {
   workspaceCwd?: string;
   setupFails?: boolean;
   initializationEvents?: unknown[];
+  modelSwitchFails?: boolean;
 }) {
   const workspaceEntered = Promise.withResolvers<void>();
   const workspaceRelease = Promise.withResolvers<void>();
@@ -68,6 +69,10 @@ function fixture(input?: {
   let eventPolls = 0;
   let toolReply = Promise.withResolvers<void>();
   const toolResponses: unknown[] = [];
+  let creationModel = "claude-haiku-5-5";
+  let runtimeModel = creationModel;
+  const sentModels: string[] = [];
+  let scriptedEvents: unknown[] = [];
   const fetch = async (url: string, init?: RequestInit) => {
     const method = init?.method ?? "GET";
     const body = typeof init?.body === "string" ? decodeJson(init.body) : undefined;
@@ -82,23 +87,33 @@ function fixture(input?: {
     if (url.endsWith("/events")) {
       if (method === "GET") {
         eventPolls++;
-        return Response.json({ data: [...controlReplies, ...(sent ? (input?.events ?? []) : [])] });
+        return Response.json({ data: [...controlReplies, ...scriptedEvents] });
       }
-      if (input?.workspace) {
+      {
         const payload = (
           body as {
             events: Array<{
-              payload: { type: string; request_id: string; request: { subtype: string } };
+              payload: {
+                type: string;
+                request_id: string;
+                request: { subtype: string; model?: string };
+              };
             }>;
           }
         ).events[0]?.payload;
         if (payload?.type === "control_request" && payload.request.subtype === "mcp_set_servers")
-          for (const event of input.initializationEvents ?? [])
+          for (const event of input?.initializationEvents ?? [])
             controlReplies.push({
               event_id: `initialization:${++sequence}`,
               sequence_num: String(sequence),
               payload: event,
             });
+        if (
+          payload?.type === "control_request" &&
+          payload.request.subtype === "set_model" &&
+          !input?.modelSwitchFails
+        )
+          runtimeModel = payload.request.model ?? runtimeModel;
         if (payload?.type === "control_request")
           controlReplies.push({
             event_id: `reply:${++sequence}`,
@@ -106,7 +121,10 @@ function fixture(input?: {
             payload: {
               type: "control_response",
               response: {
-                subtype: "success",
+                subtype:
+                  payload.request.subtype === "set_model" && input?.modelSwitchFails
+                    ? "error"
+                    : "success",
                 request_id: payload.request_id,
                 response:
                   payload.request.subtype === "mcp_set_servers" && setupFailures-- > 0
@@ -135,19 +153,29 @@ function fixture(input?: {
         (body as { events?: { payload: { type: string } }[] })?.events?.some(
           (e) => e.payload.type === "user",
         )
-      )
+      ) {
+        sentModels.push(runtimeModel);
+        if (!sent)
+          scriptedEvents = (input?.events ?? [])
+            .map((event) => event as { event_id: string; sequence_num: string; payload: unknown })
+            .sort((a, b) => Number(BigInt(a.sequence_num) - BigInt(b.sequence_num)))
+            .map((event) => ({ ...event, sequence_num: String(++sequence) }));
         sent = true;
+      }
       return Response.json({});
     }
     if (url === "/v1/code/sessions" && input?.createFails)
       return Response.json({}, { status: 503 });
-    if (url === "/v1/code/sessions")
+    if (url === "/v1/code/sessions") {
+      creationModel = (body as { config: { model: string } }).config.model;
+      runtimeModel = creationModel;
       return Response.json({
         deduplicated: false,
-        session: { id: "cse_test", config: { model: "claude-haiku-5-5" } },
+        session: { id: "cse_test", config: { model: creationModel } },
       });
+    }
     return Response.json({
-      response_shape: { id: "cse_test", config: { model: "claude-haiku-5-5" } },
+      response_shape: { id: "cse_test", config: { model: creationModel } },
     });
   };
   const context = NodeVM.createContext({
@@ -273,7 +301,7 @@ function fixture(input?: {
     );
     const sessionId = yield* runner.allocateSessionId;
     const bindingPath = `${dir}/state/userdata/claude-cloud-sessions/${sessionId}.json`;
-    const open = (options?: { resume?: boolean; durableCloudSequence?: string }) =>
+    const open = (options?: { resume?: boolean; durableCloudSequence?: string; model?: string }) =>
       runner
         .open({
           threadId,
@@ -283,7 +311,7 @@ function fixture(input?: {
             : { durableCloudSequence: options.durableCloudSequence }),
           options: {
             ...(options?.resume ? { resume: sessionId } : { sessionId }),
-            model: input?.model ?? "claude-haiku-5-5",
+            model: options?.model ?? input?.model ?? "claude-haiku-5-5",
             tools: [],
             permissionMode: "bypassPermissions",
             ...(input?.workspace
@@ -319,6 +347,7 @@ function fixture(input?: {
       evaluations,
       readBinding: fs.readFileString(bindingPath).pipe(Effect.map(decodeJson)),
       toolResponses,
+      sentModels,
       waitForToolReply: Effect.promise(() => toolReply.promise).pipe(
         Effect.tap(() =>
           Effect.sync(() => {
@@ -377,6 +406,152 @@ const run = <A, E>(
 ) => effect.pipe(Effect.scoped, Effect.provide(NodeServices.layer));
 
 describe("Claude cloud guarded transport", () => {
+  it.effect.each(["claude-haiku-5-5", "claude-opus-5-5", "claude-fable-5-1"])(
+    "creates and sends with the explicitly selected model %s",
+    (model) =>
+      run(
+        Effect.gen(function* () {
+          const f = yield* fixture({ model, workspace: true });
+          const session = yield* f.open();
+          yield* session.offer({
+            type: "user",
+            session_id: "",
+            parent_tool_use_id: null,
+            message: { role: "user", content: "Selected model task" },
+          });
+          expect(f.calls.find((c) => c.path === "/v1/code/sessions")?.body).toMatchObject({
+            config: { model },
+            events: [],
+          });
+          expect(f.sentModels).toEqual([model]);
+          yield* session.close;
+        }),
+      ),
+  );
+  it.effect("switches an existing conversation from Opus to Fable before its next prompt", () =>
+    run(
+      Effect.gen(function* () {
+        const f = yield* fixture({ workspace: true });
+        const session = yield* f.open();
+        yield* session.setModel("opus");
+        yield* session.offer({
+          type: "user",
+          session_id: "",
+          parent_tool_use_id: null,
+          message: { role: "user", content: "First task" },
+        });
+        f.pushEvent({ type: "result", subtype: "success", result: "Done" });
+        yield* TestClock.adjust("200 millis");
+        const result = yield* session.messages.pipe(
+          Stream.filter((m) => m.type === "result"),
+          Stream.runHead,
+        );
+        if (result._tag !== "Some") throw new Error("Missing result");
+        const checkpoint = session.cloudEventSequence?.(result.value);
+        if (checkpoint === undefined) throw new Error("Missing checkpoint");
+        yield* session.setModel("fable");
+        yield* session.offer(
+          {
+            type: "user",
+            session_id: "",
+            parent_tool_use_id: null,
+            message: { role: "user", content: "Second task" },
+          },
+          checkpoint,
+        );
+        expect(f.sentModels).toEqual(["claude-opus-5-5", "claude-fable-5-1"]);
+        expect(
+          f.calls.filter((c) => c.path === "/v1/code/sessions" && c.method === "POST"),
+        ).toHaveLength(1);
+        yield* session.close;
+      }),
+    ),
+  );
+  it.effect("applies a different selected model when resuming a completed cloud conversation", () =>
+    run(
+      Effect.gen(function* () {
+        const f = yield* fixture({ workspace: true });
+        const session = yield* f.open();
+        yield* session.offer({
+          type: "user",
+          session_id: "",
+          parent_tool_use_id: null,
+          message: { role: "user", content: "Original task" },
+        });
+        f.pushEvent({ type: "result", subtype: "success", result: "Done" });
+        yield* TestClock.adjust("200 millis");
+        const result = yield* session.messages.pipe(
+          Stream.filter((m) => m.type === "result"),
+          Stream.runHead,
+        );
+        if (result._tag !== "Some") throw new Error("Missing result");
+        const checkpoint = session.cloudEventSequence?.(result.value);
+        if (checkpoint === undefined) throw new Error("Missing checkpoint");
+        yield* session.close;
+        const resumed = yield* f.open({
+          resume: true,
+          durableCloudSequence: checkpoint,
+          model: "claude-opus-5-5",
+        });
+        yield* resumed.offer(
+          {
+            type: "user",
+            session_id: "",
+            parent_tool_use_id: null,
+            message: { role: "user", content: "Resumed task" },
+          },
+          checkpoint,
+        );
+        expect(f.sentModels).toEqual(["claude-haiku-5-5", "claude-opus-5-5"]);
+        expect(
+          f.calls.filter((c) => c.path === "/v1/code/sessions" && c.method === "POST"),
+        ).toHaveLength(1);
+        yield* resumed.close;
+      }),
+    ),
+  );
+  it.effect("does not send a coding prompt when the remote model change is rejected", () =>
+    run(
+      Effect.gen(function* () {
+        const f = yield* fixture({ workspace: true, modelSwitchFails: true });
+        const session = yield* f.open();
+        const offered = yield* session
+          .offer({
+            type: "user",
+            session_id: "",
+            parent_tool_use_id: null,
+            message: { role: "user", content: "Must not silently use another model" },
+          })
+          .pipe(Effect.result);
+        expect(offered._tag).toBe("Failure");
+        expect(f.sentModels).toEqual([]);
+        yield* session.close;
+      }),
+    ),
+  );
+  it.effect("blocks model changes while work is active or paid usage is enabled", () =>
+    run(
+      Effect.gen(function* () {
+        const f = yield* fixture({ workspace: true });
+        const session = yield* f.open();
+        f.setPaid();
+        expect((yield* session.setModel("opus").pipe(Effect.result))._tag).toBe("Failure");
+        expect(JSON.stringify(f.calls)).not.toContain('"model":"claude-opus-5-5"');
+        yield* session.close;
+        const active = yield* fixture({ workspace: true });
+        const activeSession = yield* active.open();
+        yield* activeSession.offer({
+          type: "user",
+          session_id: "",
+          parent_tool_use_id: null,
+          message: { role: "user", content: "Active task" },
+        });
+        expect((yield* activeSession.setModel("fable").pipe(Effect.result))._tag).toBe("Failure");
+        expect(JSON.stringify(active.calls)).not.toContain('"model":"claude-fable-5-1"');
+        yield* activeSession.close;
+      }),
+    ),
+  );
   it.effect.each(["tool", "reply"] as const)(
     "blocks a new prompt while late %s recovery is awaiting browser navigation",
     (kind) =>
@@ -788,16 +963,19 @@ describe("Claude cloud guarded transport", () => {
             parent_tool_use_id: null,
             message: { role: "user", content: "Read" },
           });
-          yield* session.messages.pipe(Stream.take(1), Stream.runDrain);
+          const first = yield* session.messages.pipe(Stream.runHead);
+          if (first._tag !== "Some") throw new Error("Missing first reply");
+          const checkpoint = session.cloudEventSequence?.(first.value);
+          if (checkpoint === undefined) throw new Error("Missing checkpoint");
           yield* session.close;
           const resumed = yield* f
-            .open({ resume: true, durableCloudSequence: "1" })
+            .open({ resume: true, durableCloudSequence: checkpoint })
             .pipe(Effect.result);
           expect(resumed._tag).toBe("Failure");
           expect(JSON.stringify(resumed)).toContain("delivery_pending");
           expect(yield* f.readBinding).toMatchObject({
             inbox: expect.arrayContaining([
-              { event_id: "unread", sequence_num: "2", payload: expect.anything() },
+              expect.objectContaining({ event_id: "unread", payload: expect.anything() }),
             ]),
           });
           expect(
@@ -877,20 +1055,22 @@ describe("Claude cloud guarded transport", () => {
         }),
       ),
   );
-  it.effect("never creates a session when paid usage is enabled", () =>
-    run(
-      Effect.gen(function* () {
-        const f = yield* fixture({ paid: true });
-        const result = yield* f.open().pipe(Effect.result);
-        expect(result._tag).toBe("Failure");
-        expect(f.calls.some((c) => c.method === "POST")).toBe(false);
-      }),
-    ),
+  it.effect.each(["claude-haiku-5-5", "claude-opus-5-5", "claude-fable-5-1"])(
+    "never creates a %s session when paid usage is enabled",
+    (model) =>
+      run(
+        Effect.gen(function* () {
+          const f = yield* fixture({ paid: true, model });
+          const result = yield* f.open().pipe(Effect.result);
+          expect(result._tag).toBe("Failure");
+          expect(f.calls.some((c) => c.method === "POST")).toBe(false);
+        }),
+      ),
   );
-  it.effect("rejects expensive models before even opening the browser", () =>
+  it.effect("rejects unsupported models before even opening the browser", () =>
     run(
       Effect.gen(function* () {
-        const f = yield* fixture({ model: "claude-opus-5-5" });
+        const f = yield* fixture({ model: "claude-opus-5-5[fast]" });
         const result = yield* f.open().pipe(Effect.result);
         expect(result._tag).toBe("Failure");
         expect(f.calls).toEqual([]);
@@ -997,9 +1177,7 @@ describe("Claude cloud guarded transport", () => {
         yield* session.close;
         const posts = f.calls.filter((c) => c.path.endsWith("/events") && c.method === "POST");
         expect(posts.at(0)?.body).toMatchObject({
-          events: [
-            { payload: { request: { subtype: "set_permission_mode", mode: "bypassPermissions" } } },
-          ],
+          events: [{ payload: { request: { subtype: "set_model", model: "claude-haiku-5-5" } } }],
         });
         expect(posts.at(-1)?.body).toMatchObject({
           events: [{ payload: { request: { subtype: "interrupt" } } }],

@@ -1,6 +1,11 @@
 import * as Schema from "effect/Schema";
 
-export const CLAUDE_CLOUD_MODEL = "claude-haiku-5-5";
+export const CLAUDE_CLOUD_MODEL = "claude-opus-5-5";
+export const CLAUDE_CLOUD_MODELS = [
+  "claude-haiku-5-5",
+  "claude-opus-5-5",
+  "claude-fable-5-1",
+] as const;
 
 const Money = Schema.Number.check(Schema.isFinite(), Schema.isGreaterThanOrEqualTo(0));
 const Usage = Schema.Struct({
@@ -23,6 +28,7 @@ export class ClaudeCloudGuardError extends Schema.TaggedError<ClaudeCloudGuardEr
       "expired_credit",
       "locked_credit",
       "unsupported_model",
+      "model_unavailable",
       "unsupported_policy",
       "api_configuration",
       "account_mismatch",
@@ -41,7 +47,9 @@ export class ClaudeCloudGuardError extends Schema.TaggedError<ClaudeCloudGuardEr
       expired_credit: "Cloud launch blocked: promotional credit has expired or is about to expire.",
       locked_credit: "Cloud launch blocked: promotional credit is unavailable.",
       unsupported_model:
-        "This free-credit prototype only supports Haiku 5.5. Select Haiku before sending.",
+        "This free-credit prototype supports Haiku 5.5, Opus 5.5, and Fable 5.1. Select one before sending.",
+      model_unavailable:
+        "Claude Cloud could not select the requested model. It may be unavailable for this account or promotional balance. No coding prompt was sent and T3 did not enable paid usage.",
       unsupported_policy:
         "This cloud prototype requires Full access. Remote tools cannot use local T3 permission callbacks.",
       api_configuration:
@@ -83,9 +91,17 @@ export function verifyClaudeCloudCredit(raw: unknown, now: number) {
 }
 
 export function verifyClaudeCloudModel(model: string) {
-  if (model !== CLAUDE_CLOUD_MODEL && model !== "haiku") {
-    throw new ClaudeCloudGuardError({ reason: "unsupported_model" });
-  }
+  const resolved =
+    model === "haiku"
+      ? "claude-haiku-5-5"
+      : model === "opus"
+        ? "claude-opus-5-5"
+        : model === "fable"
+          ? "claude-fable-5-1"
+          : model;
+  const canonical = CLAUDE_CLOUD_MODELS.find((allowed) => allowed === resolved);
+  if (!canonical) throw new ClaudeCloudGuardError({ reason: "unsupported_model" });
+  return canonical;
 }
 
 export function verifyClaudeCloudEnvironment(

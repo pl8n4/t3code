@@ -62,15 +62,26 @@ describe("Claude cloud free-credit admission", () => {
       ),
     ).toThrow();
   });
-  it.each(["opus", "fable", "claude-opus-5-5", "claude-fable-5-1", "sonnet", "haiku[fast]"])(
-    "rejects model %s before a cloud request",
-    (model) => {
-      expect(() => verifyClaudeCloudModel(model)).toThrow();
-    },
-  );
-  it("accepts only the two Haiku spellings", () => {
-    expect(() => verifyClaudeCloudModel("haiku")).not.toThrow();
-    expect(() => verifyClaudeCloudModel("claude-haiku-5-5")).not.toThrow();
+  it.each([
+    "sonnet",
+    "claude-fable-5",
+    "claude-opus-4-6",
+    "haiku[fast]",
+    "default",
+    "best",
+    "custom-model",
+  ])("rejects unsupported model %s before a cloud request", (model) => {
+    expect(() => verifyClaudeCloudModel(model)).toThrow();
+  });
+  it.each([
+    ["haiku", "claude-haiku-5-5"],
+    ["claude-haiku-5-5", "claude-haiku-5-5"],
+    ["opus", "claude-opus-5-5"],
+    ["claude-opus-5-5", "claude-opus-5-5"],
+    ["fable", "claude-fable-5-1"],
+    ["claude-fable-5-1", "claude-fable-5-1"],
+  ])("pins %s to the supported cloud model %s", (model, canonical) => {
+    expect(verifyClaudeCloudModel(model)).toBe(canonical);
   });
   it.each([
     "ANTHROPIC_API_KEY",

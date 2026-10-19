@@ -619,7 +619,7 @@ export const ClaudeSettings = makeProviderSettingsSchema(
       Schema.annotateKey({
         title: "Continue in free cloud credit when limited",
         description:
-          "For local Claude: stop a blocked turn and continue with the matching cloud instance using Haiku. Requires one enabled free-credit cloud instance for the same account and Full access.",
+          "For local Claude: stop a blocked turn and continue with the matching cloud instance using Opus 5.5. Requires one enabled free-credit cloud instance for the same account and Full access.",
         providerSettingsForm: { control: "switch" },
       }),
     ),
@@ -628,7 +628,7 @@ export const ClaudeSettings = makeProviderSettingsSchema(
       Schema.annotateKey({
         title: "Cloud sessions · free credits only (prototype)",
         description:
-          "Run Haiku in Anthropic's cloud using your signed-in T3 browser. Requires promotional credit and disabled paid usage. T3 tools read, edit, and test your local project.",
+          "Run Haiku 5.5, Opus 5.5, or Fable 5.1 in Anthropic's cloud using your signed-in T3 browser. Requires promotional credit and disabled paid usage. T3 tools read, edit, and test your local project.",
         providerSettingsForm: { control: "switch" },
       }),
     ),

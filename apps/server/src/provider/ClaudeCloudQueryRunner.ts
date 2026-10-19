@@ -34,7 +34,6 @@ import {
 } from "../orchestration-v2/Adapters/ClaudeAdapterV2.ts";
 import { resolveClaudeHomePath } from "./Drivers/ClaudeHome.ts";
 import {
-  CLAUDE_CLOUD_MODEL,
   ClaudeCloudGuardError,
   ClaudeCloudEvent,
   orderedClaudeCloudEvents,
@@ -145,9 +144,9 @@ export const makeClaudeCloudQueryRunner = Effect.fn("makeClaudeCloudQueryRunner"
       Effect.gen(function* () {
         const queryScope = yield* Scope.fork(ownerScope);
         return yield* Effect.gen(function* () {
+          let selectedModel = yield* Effect.try(() => verifyClaudeCloudModel(input.options.model));
           yield* Effect.try(() => {
             verifyClaudeCloudEnvironment(environment);
-            verifyClaudeCloudModel(input.options.model);
             if (input.options.permissionMode !== "bypassPermissions") {
               throw new ClaudeCloudGuardError({ reason: "unsupported_policy" });
             }
@@ -315,7 +314,7 @@ export const makeClaudeCloudQueryRunner = Effect.fn("makeClaudeCloudQueryRunner"
                 sources: [],
                 outcomes: [],
                 append_system_prompt: CLAUDE_CLOUD_WORKSPACE_INSTRUCTIONS,
-                model: CLAUDE_CLOUD_MODEL,
+                model: selectedModel,
                 effort_level: "low",
                 permission_mode: "bypassPermissions",
               },
@@ -736,6 +735,15 @@ export const makeClaudeCloudQueryRunner = Effect.fn("makeClaudeCloudQueryRunner"
                 if (binding.pendingTurn !== undefined)
                   return yield* new ClaudeCloudGuardError({ reason: "delivery_pending" });
                 yield* Effect.all([guard, checkModel], { concurrency: "unbounded" });
+                // Reassert the explicit selection on resumed sessions as well as fresh ones.
+                yield* control("set_model", { model: selectedModel }, true).pipe(
+                  Effect.mapError(
+                    () =>
+                      new ClaudeCloudGuardError({
+                        reason: recoveryPending ? "delivery_pending" : "model_unavailable",
+                      }),
+                  ),
+                );
                 if (relay) {
                   yield* control(
                     "apply_flag_settings",
@@ -827,9 +835,27 @@ export const makeClaudeCloudQueryRunner = Effect.fn("makeClaudeCloudQueryRunner"
                 yield* Queue.offer(pollWake, undefined);
               }).pipe(admission.withPermits(1), Effect.mapError(wrap("offer"))),
             setModel: (model) =>
-              Effect.try(() => verifyClaudeCloudModel(model)).pipe(
-                Effect.mapError(wrap("setModel")),
-              ),
+              Effect.gen(function* () {
+                const nextModel = yield* Effect.try(() => verifyClaudeCloudModel(model));
+                if (closed || !usable || recoveryPending || active)
+                  return yield* new ClaudeCloudGuardError({
+                    reason: recoveryPending ? "delivery_pending" : "unsupported_policy",
+                  });
+                yield* Effect.all([guard, checkModel], { concurrency: "unbounded" });
+                yield* control("set_model", { model: nextModel }, true).pipe(
+                  Effect.mapError(
+                    () =>
+                      new ClaudeCloudGuardError({
+                        reason: recoveryPending ? "delivery_pending" : "model_unavailable",
+                      }),
+                  ),
+                );
+                if (closed || !usable || recoveryPending)
+                  return yield* new ClaudeCloudGuardError({
+                    reason: recoveryPending ? "delivery_pending" : "remote_failed",
+                  });
+                selectedModel = nextModel;
+              }).pipe(admission.withPermits(1), Effect.mapError(wrap("setModel"))),
             applyFlagSettings: (settings) =>
               settings.fastMode ? unsupported("fastMode") : Effect.void,
             setPermissionMode: (mode) =>
