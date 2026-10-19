@@ -18,6 +18,7 @@ import * as ServerConfig from "../config.ts";
 import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
 import * as PreviewAutomationBroker from "../mcp/PreviewAutomationBroker.ts";
 import type { McpThreadInvocationScope } from "../mcp/McpInvocationContext.ts";
+import { WorkspaceInfo } from "../mcp/AgentWorkspaceSchemas.ts";
 import {
   makeClaudeCloudMcpRelay,
   CLAUDE_CLOUD_WORKSPACE_INSTRUCTIONS,
@@ -65,6 +66,7 @@ const decodeUnknownJson = Schema.decodeUnknownEffect(Schema.fromJsonString(Schem
 const decodeUnknownRecord = Schema.decodeUnknownEffect(
   Schema.Record(Schema.String, Schema.Unknown),
 );
+const decodeWorkspaceInfo = Schema.decodeUnknownEffect(WorkspaceInfo);
 
 const relayedTypes = new Set([
   "assistant",
@@ -169,8 +171,9 @@ export const makeClaudeCloudQueryRunner = Effect.fn("makeClaudeCloudQueryRunner"
         const requestOnce = (endpoint: string, body?: unknown, afterSequence = 0n) =>
           Effect.gen(function* () {
             const key = yield* crypto.randomUUIDv4();
-            if (body !== undefined) {
-              const encoded = json(body);
+            const encoded = body === undefined ? undefined : json(body);
+            const inlineBody = encoded !== undefined && Buffer.byteLength(encoded) <= 10000;
+            if (encoded !== undefined && !inlineBody) {
               for (let offset = 0; offset < encoded.length; offset += 24000) {
                 yield* browser(
                   `(() => {const b=globalThis.__t3CloudBuffers??=Object.create(null);(b[${json(key)}]??=[]).push(${json(encoded.slice(offset, offset + 24000))});return null})()`,
@@ -184,7 +187,7 @@ export const makeClaudeCloudQueryRunner = Effect.fn("makeClaudeCloudQueryRunner"
             try {r=await fetch(${json(endpoint)}, {
               method: ${json(body === undefined ? "GET" : "POST")},
               headers: {'anthropic-version':'2023-06-01','anthropic-organization-id':${json(organizationId)},'content-type':'application/json'},
-              ${body === undefined ? "" : `body:buffers[${json(key)}].join(''),`}
+              ${encoded === undefined ? "" : `body:${inlineBody ? json(encoded) : `buffers[${json(key)}].join('')`},`}
               signal: AbortSignal.timeout(15000)
             });}finally{delete buffers[${json(key)}]}
             if (!r.ok) throw new Error('Claude cloud HTTP ' + r.status);
@@ -192,10 +195,12 @@ export const makeClaudeCloudQueryRunner = Effect.fn("makeClaudeCloudQueryRunner"
             const data=await r.json();
             if (${json(endpoint)}.endsWith('/events') && Array.isArray(data.data)) {
               const allowed=new Set(${json([...relayedTypes])});
-              const value=new TextEncoder().encode(JSON.stringify({data:data.data.filter(e=>BigInt(e.sequence_num)>BigInt(${json(afterSequence.toString())})).map(e=>({
+              const page={data:data.data.filter(e=>BigInt(e.sequence_num)>BigInt(${json(afterSequence.toString())})).map(e=>({
                 event_id:e.event_id,sequence_num:e.sequence_num,
                 payload:allowed.has(e.payload?.type) && !(e.payload?.type==='system' && e.payload?.subtype==='init')?e.payload:{}
-              }))}));
+              }))};
+              const value=new TextEncoder().encode(JSON.stringify(page));
+              if(value.length<=24000)return page;
               if(value.length>16000000)throw new Error('Cloud event page too large');
               buffers[${json(key)}]=value;
               return {cloudBuffer:${json(key)},length:value.length};
@@ -287,7 +292,7 @@ export const makeClaudeCloudQueryRunner = Effect.fn("makeClaudeCloudQueryRunner"
             config: {
               sources: [],
               outcomes: [],
-              append_system_prompt: `${typeof input.options.systemPrompt === "object" && input.options.systemPrompt !== null && "append" in input.options.systemPrompt ? (input.options.systemPrompt.append ?? "") : ""}\n${CLAUDE_CLOUD_WORKSPACE_INSTRUCTIONS}`,
+              append_system_prompt: CLAUDE_CLOUD_WORKSPACE_INSTRUCTIONS,
               model: CLAUDE_CLOUD_MODEL,
               effort_level: "low",
               permission_mode: "bypassPermissions",
@@ -315,6 +320,7 @@ export const makeClaudeCloudQueryRunner = Effect.fn("makeClaudeCloudQueryRunner"
           ClaudeAgentSdkQueryRunnerError | Cause.Done
         >();
         let active = false;
+        let connecting = relay !== undefined;
         let lastBillingCheck = 0;
         let sequence = BigInt(binding.sequence);
         const pendingControls = new Map<
@@ -323,6 +329,7 @@ export const makeClaudeCloudQueryRunner = Effect.fn("makeClaudeCloudQueryRunner"
         >();
         const toolJobs = new Map<string, Fiber.Fiber<void, never>>();
         const completedControls = new Set<string>();
+        const pollWake = yield* Queue.unbounded<void>();
         const mcpReady = yield* Deferred.make<void, ClaudeCloudGuardError>();
         const control = (subtype: string, fields: Record<string, unknown> = {}, wait = false) =>
           Effect.gen(function* () {
@@ -341,6 +348,7 @@ export const makeClaudeCloudQueryRunner = Effect.fn("makeClaudeCloudQueryRunner"
                 },
               ],
             });
+            yield* Queue.offer(pollWake, undefined);
             if (!wait) return;
             return yield* Deferred.await(reply).pipe(
               Effect.timeout("90 seconds"),
@@ -383,6 +391,7 @@ export const makeClaudeCloudQueryRunner = Effect.fn("makeClaudeCloudQueryRunner"
                 ),
               ),
               Effect.tap(() => Effect.sync(() => completedControls.add(requestId))),
+              Effect.tap(() => Queue.offer(pollWake, undefined)),
               Effect.tap((response) =>
                 typeof decoded.message === "object" &&
                 decoded.message !== null &&
@@ -459,8 +468,14 @@ export const makeClaudeCloudQueryRunner = Effect.fn("makeClaudeCloudQueryRunner"
             yield* Queue.offer(queue, { ...payload, session_id: nativeId } as SDKMessage);
           }
         });
-        const fiber = yield* poll.pipe(
-          Effect.andThen(Effect.sleep("1 second")),
+        const fiber = yield* Effect.gen(function* () {
+          yield* poll;
+          yield* Queue.take(pollWake).pipe(
+            Effect.timeoutOption(
+              active || connecting || pendingControls.size > 0 ? "200 millis" : "2 seconds",
+            ),
+          );
+        }).pipe(
           Effect.forever,
           Effect.catch((cause) =>
             Effect.gen(function* () {
@@ -523,12 +538,12 @@ export const makeClaudeCloudQueryRunner = Effect.fn("makeClaudeCloudQueryRunner"
             liveStatus.mcpServers.some((s) => s.name === "t3-code" && s.status === "connected");
           if (!connected) yield* Deferred.await(mcpReady).pipe(Effect.timeout("90 seconds"));
         }
+        connecting = false;
         const runtime: ClaudeAgentSdkQuerySession = {
           messages: Stream.fromQueue(queue),
           offer: (message) =>
             Effect.gen(function* () {
-              yield* guard;
-              yield* checkModel;
+              yield* Effect.all([guard, checkModel], { concurrency: "unbounded" });
               if (relay) {
                 yield* control(
                   "apply_flag_settings",
@@ -554,11 +569,57 @@ export const makeClaudeCloudQueryRunner = Effect.fn("makeClaudeCloudQueryRunner"
                 );
                 yield* control("set_permission_mode", { mode: "dontAsk" }, true);
               } else yield* control("set_permission_mode", { mode: "bypassPermissions" });
+              let forwarded = message;
+              if (relay) {
+                const workspace = yield* relay({
+                  jsonrpc: "2.0",
+                  id: yield* crypto.randomUUIDv4(),
+                  method: "tools/call",
+                  params: { name: "t3_workspace_info", arguments: {} },
+                });
+                if (
+                  typeof workspace !== "object" ||
+                  workspace === null ||
+                  !("result" in workspace) ||
+                  typeof workspace.result !== "object" ||
+                  workspace.result === null ||
+                  ("isError" in workspace.result && workspace.result.isError === true)
+                )
+                  return yield* new ClaudeCloudGuardError({ reason: "tools_unavailable" });
+                const toolResult = workspace.result;
+                const info = yield* Effect.gen(function* () {
+                  if ("structuredContent" in toolResult)
+                    return yield* decodeWorkspaceInfo(toolResult.structuredContent);
+                  const contents =
+                    "content" in toolResult && Array.isArray(toolResult.content)
+                      ? toolResult.content
+                      : [];
+                  const text = contents.find((c) => c?.type === "text")?.text;
+                  return yield* decodeWorkspaceInfo(yield* decodeUnknownJson(text));
+                }).pipe(
+                  Effect.mapError(() => new ClaudeCloudGuardError({ reason: "tools_unavailable" })),
+                );
+                const context = `<t3_workspace_context>\n${CLAUDE_CLOUD_WORKSPACE_INSTRUCTIONS}\nCurrent T3 workspace: ${json(info)}\nFor repository and PR questions, use mcp__t3-code__t3_workspace_pull_requests and t3_workspace_pull_request_read. For git, gh, files and tests, use mcp__t3-code__t3_workspace_exec. These tools already have the local repository and source-control login. Do not try cloud Bash or conclude the project is missing because /home/user is empty. Read the workspace's AGENTS.md or CLAUDE.md before changing source files.\n</t3_workspace_context>`;
+                const content = message.message.content;
+                forwarded = {
+                  ...message,
+                  message: {
+                    ...message.message,
+                    content: [
+                      { type: "text", text: context },
+                      ...(typeof content === "string"
+                        ? [{ type: "text" as const, text: content }]
+                        : content),
+                    ],
+                  },
+                };
+              }
               lastBillingCheck = DateTime.toEpochMillis(yield* DateTime.now);
               active = true;
               yield* request(`${sessionPath}/events`, {
-                events: [{ payload: { ...message, session_id: binding.cloudId } }],
+                events: [{ payload: { ...forwarded, session_id: binding.cloudId } }],
               }).pipe(Effect.tapError(() => control("interrupt").pipe(Effect.ignore)));
+              yield* Queue.offer(pollWake, undefined);
             }).pipe(Effect.mapError(wrap("offer"))),
           setModel: (model) =>
             Effect.try(() => verifyClaudeCloudModel(model)).pipe(Effect.mapError(wrap("setModel"))),

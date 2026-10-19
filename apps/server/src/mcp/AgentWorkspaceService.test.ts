@@ -10,6 +10,7 @@ import * as Config from "../config.ts";
 import * as Threads from "../orchestration-v2/ThreadManagementService.ts";
 import * as Project from "../project/ProjectService.ts";
 import * as Processes from "../processRunner.ts";
+import * as PullRequests from "../pullRequest/PullRequestService.ts";
 import * as Known from "../workspace/KnownWorkspaces.ts";
 import * as Files from "../workspace/WorkspaceFileSystem.ts";
 import * as Entries from "../workspace/WorkspaceEntries.ts";
@@ -41,9 +42,10 @@ const fixture = Effect.gen(function* () {
     deletedAt: null,
   };
   const commands: string[] = [];
+  const prCalls: unknown[] = [];
   const scope: McpInvocationScope = {
     environmentId: EnvironmentId.make("test-env"),
-    capabilities: new Set(["orchestration"]),
+    capabilities: new Set(["orchestration", "pull-requests"]),
     issuedAt: 0,
     requestNamespace: "test",
     thread: {
@@ -60,6 +62,25 @@ const fixture = Effect.gen(function* () {
     Layer.provide(Layer.mock(Known.KnownWorkspaces)({ assertContains: () => Effect.void })),
   );
   const layer = Workspace.layer.pipe(
+    Layer.provide(
+      Layer.mock(PullRequests.PullRequestService)({
+        list: (input) => {
+          prCalls.push(input);
+          return Effect.succeed({
+            viewers: {},
+            providers: [],
+            entries: [],
+            errors: [],
+            truncated: false,
+            nextCursors: {},
+          });
+        },
+        detail: (input) => {
+          prCalls.push(input);
+          return Effect.die("Unused detail");
+        },
+      }),
+    ),
     Layer.provide(files),
     Layer.provide(entries),
     Layer.provide(Paths.layer),
@@ -96,6 +117,7 @@ const fixture = Effect.gen(function* () {
     fs,
     dir,
     commands,
+    prCalls,
     setShell: (patch: Partial<typeof shell>) => {
       shell = { ...shell, ...patch };
     },
@@ -105,6 +127,43 @@ const withServices = <A, E, R>(program: Effect.Effect<A, E, R>) =>
   program.pipe(Effect.provide(NodeServices.layer), Effect.scoped);
 
 describe("agent local workspace", () => {
+  it.effect("identifies the bound worktree and lists PRs with the existing project account", () =>
+    withServices(
+      Effect.gen(function* () {
+        const f = yield* fixture;
+        const worktree = `${f.dir}/worktree`;
+        f.setShell({ worktreePath: worktree, branch: "test/pr-question" });
+        expect(yield* f.service.info(f.scope)).toMatchObject({
+          projectName: "Fixture",
+          workspaceRoot: f.dir,
+          cwd: worktree,
+          branch: "test/pr-question",
+        });
+        yield* f.service.pullRequests(f.scope, {
+          query: "documentation",
+          limit: 10,
+          filters: { labels: [["documentation"]] },
+          cursors: { "github.com": "next-page" },
+        });
+        expect(f.prCalls).toEqual([
+          {
+            projectId: liveThreadShell(f.scope.thread!.threadId).projectId,
+            state: "all",
+            query: "documentation",
+            limit: 10,
+            filters: { labels: [["documentation"]] },
+            cursors: { "github.com": "next-page" },
+          },
+        ]);
+        expect(
+          (yield* f.service
+            .pullRequests({ ...f.scope, capabilities: new Set(["orchestration"]) }, {})
+            .pipe(Effect.result))._tag,
+        ).toBe("Failure");
+        expect(f.prCalls).toHaveLength(1);
+      }),
+    ),
+  );
   it.effect("writes the actual local file and refuses stale versions", () =>
     withServices(
       Effect.gen(function* () {

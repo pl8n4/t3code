@@ -14,6 +14,7 @@ import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
+import { HttpClient, HttpClientResponse } from "effect/http";
 import * as ServerConfig from "../config.ts";
 import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
 import * as PreviewAutomationBroker from "../mcp/PreviewAutomationBroker.ts";
@@ -41,10 +42,17 @@ function fixture(input?: {
   model?: string;
   createFails?: boolean;
   events?: unknown[];
+  workspace?: boolean;
+  workspaceUnavailable?: boolean;
+  workspaceMalformed?: boolean;
 }) {
   let usage: unknown = input?.paid ? { ...funded(), extra_usage: { is_enabled: true } } : funded();
   const calls: Array<{ path: string; method: string; body?: unknown }> = [];
   const sent = Promise.withResolvers<void>();
+  const rpcCalls: Array<Record<string, unknown>> = [];
+  const evaluations: string[] = [];
+  const controlReplies: unknown[] = [];
+  let sequence = 0;
   const fetch = async (url: string, init?: RequestInit) => {
     const method = init?.method ?? "GET";
     const body = typeof init?.body === "string" ? decodeJson(init.body) : undefined;
@@ -59,7 +67,41 @@ function fixture(input?: {
     if (url.endsWith("/events")) {
       if (method === "GET") {
         if (input?.events) await sent.promise;
-        return Response.json({ data: input?.events ?? [] });
+        return Response.json({ data: [...controlReplies, ...(input?.events ?? [])] });
+      }
+      if (input?.workspace) {
+        const payload = (
+          body as {
+            events: Array<{
+              payload: { type: string; request_id: string; request: { subtype: string } };
+            }>;
+          }
+        ).events[0]?.payload;
+        if (payload?.type === "control_request")
+          controlReplies.push({
+            event_id: `reply:${++sequence}`,
+            sequence_num: String(sequence),
+            payload: {
+              type: "control_response",
+              response: {
+                subtype: "success",
+                request_id: payload.request_id,
+                response:
+                  payload.request.subtype === "mcp_status"
+                    ? {
+                        mcpServers: [
+                          {
+                            name: "t3-code",
+                            status: "connected",
+                            source: "sdk",
+                            config: { type: "sdk", name: "t3-code" },
+                          },
+                        ],
+                      }
+                    : {},
+              },
+            },
+          });
       }
       if (
         (body as { events?: { payload: { type: string } }[] })?.events?.some(
@@ -96,6 +138,7 @@ function fixture(input?: {
         return Effect.succeed({ tabId: PreviewTabId.make("cloud-test-tab") } as A);
       if (request.operation === "navigate") return Effect.succeed({} as A);
       const expression = (request.input as { expression: string }).expression;
+      evaluations.push(expression);
       return Effect.tryPromise({
         try: async () => {
           const value = await NodeVM.runInContext(expression, context);
@@ -118,6 +161,50 @@ function fixture(input?: {
       });
     },
   });
+  const localClient = HttpClient.make((request) =>
+    Effect.sync(() => {
+      if (request.body._tag !== "Uint8Array") throw new Error("Expected JSON");
+      const rpc = decodeJson(new TextDecoder().decode(request.body.body)) as Record<
+        string,
+        unknown
+      >;
+      rpcCalls.push(rpc);
+      return HttpClientResponse.fromWeb(
+        request,
+        rpc.method === "notifications/initialized"
+          ? new Response(null, { status: 202 })
+          : Response.json({
+              jsonrpc: "2.0",
+              id: rpc.id,
+              result:
+                rpc.method === "tools/call"
+                  ? {
+                      isError: input?.workspaceUnavailable ?? false,
+                      content: [
+                        {
+                          type: "text",
+                          text: input?.workspaceMalformed
+                            ? "unavailable"
+                            : json({
+                                projectId: "project-football",
+                                projectName: "football-data",
+                                cwd: "/projects/football-data/worktree",
+                                workspaceRoot: "/projects/football-data",
+                                branch: "test-branch",
+                                repository: "github.com/pl8n4/football-data",
+                              }),
+                        },
+                      ],
+                    }
+                  : {
+                      protocolVersion: "2025-06-18",
+                      capabilities: {},
+                      serverInfo: { name: "T3", version: "1" },
+                    },
+            }),
+      );
+    }),
+  );
   const setup = Effect.gen(function* () {
     const fs = yield* FileSystem.FileSystem;
     const dir = yield* fs.makeTempDirectoryScoped();
@@ -145,20 +232,36 @@ function fixture(input?: {
     );
     const sessionId = yield* runner.allocateSessionId;
     const open = () =>
-      runner.open({
-        threadId,
-        providerSessionId: ProviderSessionId.make("cloud-test-session"),
-        options: {
-          sessionId,
-          model: input?.model ?? "claude-haiku-5-5",
-          tools: [],
-          permissionMode: "bypassPermissions",
-        },
-      });
+      runner
+        .open({
+          threadId,
+          providerSessionId: ProviderSessionId.make("cloud-test-session"),
+          options: {
+            sessionId,
+            model: input?.model ?? "claude-haiku-5-5",
+            tools: [],
+            permissionMode: "bypassPermissions",
+            ...(input?.workspace
+              ? {
+                  cwd: "/projects/football-data/worktree",
+                  mcpServers: {
+                    "t3-code": {
+                      type: "http" as const,
+                      url: "http://127.0.0.1/mcp",
+                      headers: { Authorization: "Bearer local-only" },
+                    },
+                  },
+                }
+              : {}),
+          },
+        })
+        .pipe(Effect.provideService(HttpClient.HttpClient, localClient));
     return {
       runner,
       open,
       calls,
+      rpcCalls,
+      evaluations,
       setPaid: () => {
         usage = { ...funded(), spend: { enabled: true } };
       },
@@ -179,6 +282,76 @@ const run = <A, E>(
 ) => effect.pipe(Effect.scoped, Effect.provide(NodeServices.layer));
 
 describe("Claude cloud guarded transport", () => {
+  it.effect(
+    "supplies project and PR tools for an ordinary question without special user prompting",
+    () =>
+      run(
+        Effect.gen(function* () {
+          const f = yield* fixture({ workspace: true });
+          const session = yield* f.open();
+          yield* session.offer({
+            type: "user",
+            session_id: "",
+            parent_tool_use_id: null,
+            message: {
+              role: "user",
+              content: "Can you tell me about recent PRs regarding documentation?",
+            },
+          });
+          const user = f.calls
+            .flatMap(
+              (c) =>
+                (
+                  c.body as {
+                    events?: Array<{ payload: { type: string; message?: { content: unknown } } }>;
+                  }
+                )?.events ?? [],
+            )
+            .find((e) => e.payload.type === "user");
+          const text = JSON.stringify(user);
+          expect(text).toContain("Can you tell me about recent PRs regarding documentation?");
+          expect(text).toContain("football-data");
+          expect(text).toContain("t3_workspace_pull_requests");
+          expect(text).toContain("/projects/football-data/worktree");
+          expect(text).not.toContain("local-only");
+          expect(f.rpcCalls.filter((c) => c.method === "tools/call")).toHaveLength(1);
+          expect(
+            f.evaluations.every(
+              (e) =>
+                !e.includes(".push(") &&
+                !e.startsWith("btoa(") &&
+                !e.startsWith("delete globalThis"),
+            ),
+          ).toBe(true);
+          yield* session.close;
+        }),
+      ),
+  );
+  it.effect.each(["error", "malformed"] as const)(
+    "does not send the task if workspace verification returns %s",
+    (kind) =>
+      run(
+        Effect.gen(function* () {
+          const f = yield* fixture({
+            workspace: true,
+            workspaceUnavailable: kind === "error",
+            workspaceMalformed: kind === "malformed",
+          });
+          const session = yield* f.open();
+          const result = yield* session
+            .offer({
+              type: "user",
+              session_id: "",
+              parent_tool_use_id: null,
+              message: { role: "user", content: "Inspect my repo" },
+            })
+            .pipe(Effect.result);
+          expect(result._tag).toBe("Failure");
+          expect(JSON.stringify(f.calls)).not.toContain("Inspect my repo");
+          yield* session.close;
+        }),
+      ),
+  );
   it.effect("never creates a session when paid usage is enabled", () =>
     run(
       Effect.gen(function* () {

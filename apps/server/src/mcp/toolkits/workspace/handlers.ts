@@ -9,6 +9,21 @@ export const layer = Access.toLayer(
   Effect.gen(function* () {
     const workspace = yield* Workspace.AgentWorkspaceService;
     return {
+      t3_workspace_info: Access.readsAsCaller(() =>
+        Effect.gen(function* () {
+          return yield* workspace.info(yield* Invocation.McpInvocationContext);
+        }),
+      ),
+      t3_workspace_pull_requests: Access.readsAsCaller((input) =>
+        Effect.gen(function* () {
+          return yield* workspace.pullRequests(yield* Invocation.McpInvocationContext, input);
+        }),
+      ),
+      t3_workspace_pull_request_read: Access.readsAsCaller((input) =>
+        Effect.gen(function* () {
+          return yield* workspace.pullRequestRead(yield* Invocation.McpInvocationContext, input);
+        }),
+      ),
       t3_workspace_list: Access.readsAsCaller((input) =>
         Effect.gen(function* () {
           const scope = yield* Invocation.McpInvocationContext;

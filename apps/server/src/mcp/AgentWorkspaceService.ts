@@ -1,5 +1,11 @@
 import {
   OrchestratorMcpFailure,
+  PullRequestListState,
+  PullRequestListFilters,
+  PullRequestListCursors,
+  type PullRequestListResult,
+  type PullRequestListEntry,
+  type PullRequestDetail,
   type ProjectListEntriesResult,
   type ProjectReadFileResult,
 } from "@t3tools/contracts";
@@ -16,9 +22,11 @@ import * as Schema from "effect/Schema";
 import * as Threads from "../orchestration-v2/ThreadManagementService.ts";
 import * as Project from "../project/ProjectService.ts";
 import * as Processes from "../processRunner.ts";
+import * as PullRequests from "../pullRequest/PullRequestService.ts";
 import * as Files from "../workspace/WorkspaceFileSystem.ts";
 import * as Entries from "../workspace/WorkspaceEntries.ts";
 import * as Invocation from "./McpInvocationContext.ts";
+import { WorkspaceInfo } from "./AgentWorkspaceSchemas.ts";
 import { assertFullAccess, assertLiveCaller, readCaller, unavailable } from "./threadAccess.ts";
 
 export const WorkspaceRead = Schema.Struct({
@@ -37,11 +45,49 @@ export const WorkspaceExec = Schema.Struct({
   command: Schema.String.check(Schema.isNonEmpty(), Schema.isMaxLength(20000)),
 });
 export const WorkspaceList = Schema.Struct({ path: Schema.optional(Schema.String) });
+export const WorkspacePullRequests = Schema.Struct({
+  state: Schema.optional(PullRequestListState),
+  filters: Schema.optional(PullRequestListFilters),
+  cursors: Schema.optional(PullRequestListCursors),
+  query: Schema.optional(Schema.String.check(Schema.isNonEmpty(), Schema.isMaxLength(200))),
+  limit: Schema.optional(Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 50 }))),
+});
+export const WorkspacePullRequestRead = Schema.Struct({
+  number: Schema.Int.check(Schema.isGreaterThan(0)),
+  repository: Schema.String.check(Schema.isNonEmpty()),
+  host: Schema.optional(Schema.String.check(Schema.isNonEmpty())),
+});
+type WorkspacePullRequestList = Omit<PullRequestListResult, "entries"> & {
+  entries: ReadonlyArray<
+    Pick<
+      PullRequestListEntry,
+      | "number"
+      | "title"
+      | "state"
+      | "url"
+      | "host"
+      | "repository"
+      | "headBranch"
+      | "updatedAt"
+      | "isDraft"
+      | "checksState"
+    > & { author: { login: string } | null; labels: ReadonlyArray<{ name: string }> }
+  >;
+};
 
 type Request<A> = Effect.Effect<A, OrchestratorMcpFailure>;
 export class AgentWorkspaceService extends Context.Service<
   AgentWorkspaceService,
   {
+    readonly info: (scope: Invocation.McpInvocationScope) => Request<typeof WorkspaceInfo.Type>;
+    readonly pullRequests: (
+      scope: Invocation.McpInvocationScope,
+      input: typeof WorkspacePullRequests.Type,
+    ) => Request<WorkspacePullRequestList>;
+    readonly pullRequestRead: (
+      scope: Invocation.McpInvocationScope,
+      input: typeof WorkspacePullRequestRead.Type,
+    ) => Request<PullRequestDetail>;
     readonly list: (
       scope: Invocation.McpInvocationScope,
       input: typeof WorkspaceList.Type,
@@ -76,7 +122,8 @@ const make = Effect.gen(function* () {
   const path = yield* Path.Path;
   const crypto = yield* Crypto.Crypto;
   const processes = yield* Processes.ProcessRunner;
-  const root = (scope: Invocation.McpInvocationScope, write = false) =>
+  const pullRequests = yield* PullRequests.PullRequestService;
+  const workspace = (scope: Invocation.McpInvocationScope, write = false) =>
     Effect.gen(function* () {
       const context = yield* readCaller().pipe(
         Effect.provideService(Threads.ThreadManagementService, threads),
@@ -101,8 +148,26 @@ const make = Effect.gen(function* () {
           code: "invalid_request",
           message: "The calling thread's project is unavailable.",
         });
-      return context.caller.worktreePath ?? project.value.workspaceRoot;
+      return {
+        projectId: project.value.id,
+        projectName: project.value.title,
+        workspaceRoot: project.value.workspaceRoot,
+        cwd: context.caller.worktreePath ?? project.value.workspaceRoot,
+        branch: context.caller.branch,
+        repository: project.value.repositoryIdentity?.canonicalKey ?? null,
+      };
     });
+  const root = (scope: Invocation.McpInvocationScope, write = false) =>
+    workspace(scope, write).pipe(Effect.map((value) => value.cwd));
+  const prWorkspace = (scope: Invocation.McpInvocationScope) =>
+    scope.capabilities.has("pull-requests")
+      ? workspace(scope)
+      : Effect.fail(
+          new OrchestratorMcpFailure({
+            code: "capability_denied",
+            message: "This credential cannot read pull requests.",
+          }),
+        );
   const relative = (value: string) => {
     const segments = value.replaceAll("\\", "/").split("/");
     return (
@@ -126,6 +191,43 @@ const make = Effect.gen(function* () {
       .pipe(Effect.map(Hex.encode), Effect.mapError(unavailable));
 
   return AgentWorkspaceService.of({
+    info: Effect.fn("AgentWorkspaceService.info")(workspace),
+    pullRequests: Effect.fn("AgentWorkspaceService.pullRequests")(function* (scope, input) {
+      const current = yield* prWorkspace(scope);
+      const result = yield* pullRequests
+        .list({
+          projectId: current.projectId,
+          state: input.state ?? "all",
+          limit: input.limit ?? 25,
+          ...(input.query ? { query: input.query } : {}),
+          ...(input.filters ? { filters: input.filters } : {}),
+          ...(input.cursors ? { cursors: input.cursors } : {}),
+        })
+        .pipe(Effect.mapError(unavailable));
+      return {
+        ...result,
+        entries: result.entries.map((entry) => ({
+          number: entry.number,
+          title: entry.title,
+          state: entry.state,
+          url: entry.url,
+          host: entry.host,
+          repository: entry.repository,
+          headBranch: entry.headBranch,
+          updatedAt: entry.updatedAt,
+          isDraft: entry.isDraft,
+          checksState: entry.checksState,
+          author: entry.author ? { login: entry.author.login } : null,
+          labels: entry.labels.map(({ name }) => ({ name })),
+        })),
+      };
+    }),
+    pullRequestRead: Effect.fn("AgentWorkspaceService.pullRequestRead")(function* (scope, input) {
+      const current = yield* prWorkspace(scope);
+      return yield* pullRequests
+        .detail({ projectId: current.projectId, ...input })
+        .pipe(Effect.mapError(unavailable));
+    }),
     list: Effect.fn("AgentWorkspaceService.list")(function* (scope, input) {
       const cwd = yield* root(scope);
       yield* checkPath(input.path ?? "");

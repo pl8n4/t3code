@@ -86,8 +86,17 @@ local project or worktree. Existing edits and untracked files are available;
 there is no clean-checkout, GitHub remote, push, or manual synchronization step.
 Edits appear in T3's normal local diffs and checkpoints. Browser and thread-history
 tools use the same T3 permissions as other providers. Tools that start other model
-work or change provider settings are disabled in free-credit mode. Keep T3 and the environment's
-machine running while a cloud task uses those tools.
+work or change provider settings are disabled in free-credit mode. Keep T3 and
+the environment's machine running while a cloud task uses those tools.
+
+T3 verifies the selected project before sending each task and supplies its current
+repository and worktree context. PR questions use the environment's existing
+source-control login; no second GitHub login in the cloud container is needed.
+Ask normally: for example, ‘Which recent PRs changed this project's documentation?’
+
+The first response waits for Anthropic's cloud environment to start. A new
+worktree also runs the project's setup scripts. Choose **Current checkout** for
+repository questions that do not need a separate checkout to avoid that setup.
 
 To switch automatically at a subscription limit, enable **Continue in free cloud
 credit when limited** on your ordinary local Claude instance. Keep exactly one
