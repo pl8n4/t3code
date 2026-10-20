@@ -53,6 +53,7 @@ function fixture(input?: {
   workspaceMalformed?: boolean;
   workspaceCwd?: string;
   setupFails?: boolean;
+  setupStatusLag?: number;
   initializationEvents?: unknown[];
   modelSwitchFails?: boolean;
   effort?: EffortLevel;
@@ -81,6 +82,7 @@ function fixture(input?: {
   let mcpStatus: "missing" | "connected" | "failed" | "pending" = "missing";
   let reconnectFails = false;
   let holdMcpSetup = false;
+  let pendingStatusReads = 0;
   const pendingMcpStatus = Promise.withResolvers<void>();
   let eventPolls = 0;
   let eventFailures = 0;
@@ -145,7 +147,8 @@ function fixture(input?: {
           !setupFailed &&
           !(payload.request.subtype === "mcp_reconnect" && reconnectFails)
         ) {
-          mcpStatus = holdMcpSetup ? "pending" : "connected";
+          pendingStatusReads = input?.setupStatusLag ?? 0;
+          mcpStatus = holdMcpSetup || pendingStatusReads > 0 ? "pending" : "connected";
           for (const event of holdMcpSetup ? [] : (input?.initializationEvents ?? []))
             controlReplies.push({
               event_id: `initialization:${++sequence}`,
@@ -165,8 +168,9 @@ function fixture(input?: {
           payload.request.settings?.effortLevel !== undefined
         )
           runtimeEffort = payload.request.settings.effortLevel ?? "medium";
-        if (payload?.request?.subtype === "mcp_status" && mcpStatus === "pending")
+        if (payload?.request?.subtype === "mcp_status" && mcpStatus === "pending") {
           pendingMcpStatus.resolve();
+        }
         if (payload?.type === "control_request")
           controlReplies.push({
             event_id: `reply:${++sequence}`,
@@ -209,6 +213,10 @@ function fixture(input?: {
               },
             },
           });
+        if (payload?.request?.subtype === "mcp_status" && pendingStatusReads > 0) {
+          pendingStatusReads--;
+          if (pendingStatusReads === 0) mcpStatus = "connected";
+        }
         if (payload?.type === "control_response") {
           toolResponses.push(payload);
           toolReply.resolve();
@@ -565,6 +573,68 @@ const run = <A, E>(
 ) => effect.pipe(Effect.scoped, Effect.provide(NodeServices.layer));
 
 describe("Claude cloud guarded transport", () => {
+  it.live("waits for cloud status to catch up after the tools/list reply is delivered", () =>
+    run(
+      Effect.gen(function* () {
+        const f = yield* fixture({
+          workspace: true,
+          setupStatusLag: 3,
+          initializationEvents: [
+            {
+              type: "control_request",
+              request_id: "lagged-handshake",
+              request: {
+                subtype: "mcp_message",
+                server_name: "t3-code",
+                message: { jsonrpc: "2.0", id: 303, method: "tools/list" },
+              },
+            },
+          ],
+        });
+        const opened = yield* f.open().pipe(Effect.forkChild);
+        yield* f.waitForToolReply;
+        const session = yield* Fiber.join(opened);
+        yield* session.offer({
+          type: "user",
+          session_id: "",
+          parent_tool_use_id: null,
+          message: { role: "user", content: "Only send after cloud confirms connected" },
+        });
+        expect(f.sentModels).toHaveLength(1);
+        yield* session.close;
+      }),
+    ),
+  );
+  it.effect("closes a failed reconnect's query so the same conversation can be retried", () =>
+    run(
+      Effect.gen(function* () {
+        const f = yield* fixture({ workspace: true });
+        const session = yield* f.open();
+        f.disconnectMcp(true);
+        const offered = yield* session
+          .offer({
+            type: "user",
+            session_id: "",
+            parent_tool_use_id: null,
+            message: { role: "user", content: "Do not send while pending" },
+          })
+          .pipe(Effect.result);
+        expect(offered._tag).toBe("Failure");
+        expect(f.sentModels).toHaveLength(0);
+        expect(yield* session.messages.pipe(Stream.runCollect)).toEqual([]);
+        f.disconnectMcp();
+        const retried = yield* f.open({ resume: true });
+        yield* retried.offer({
+          type: "user",
+          session_id: "",
+          parent_tool_use_id: null,
+          message: { role: "user", content: "Resume after reconnecting" },
+        });
+        expect(f.sentModels).toHaveLength(1);
+        yield* retried.close;
+      }),
+    ),
+  );
   it.effect.each([false, true])(
     "reconnects workspace tools before a new turn after idle worker recycling (setup failure: %s)",
     (failSetup) =>

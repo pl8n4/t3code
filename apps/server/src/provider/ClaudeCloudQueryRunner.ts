@@ -932,18 +932,34 @@ export const makeClaudeCloudQueryRunner = Effect.fn("makeClaudeCloudQueryRunner"
                 (s) => s.name === "t3-code" && s.source === "sdk" && s.status === "connected",
               );
             if (!connected) {
-              yield* Deferred.await(mcpReady).pipe(Effect.timeout("90 seconds"));
-              const verified = yield* control("mcp_status", {}, true);
-              if (
-                typeof verified !== "object" ||
-                verified === null ||
-                !("mcpServers" in verified) ||
-                !Array.isArray(verified.mcpServers) ||
-                !verified.mcpServers.some(
-                  (s) => s.name === "t3-code" && s.source === "sdk" && s.status === "connected",
-                )
-              )
-                return yield* new ClaudeCloudGuardError({ reason: "tools_unavailable" });
+              yield* Effect.gen(function* () {
+                yield* Deferred.await(mcpReady);
+                // Posting tools/list's reply finishes our handshake before the cloud
+                // worker consumes it and changes its connection status to connected.
+                yield* control("mcp_status", {}, true).pipe(
+                  Effect.flatMap((verified) => {
+                    const server =
+                      typeof verified === "object" &&
+                      verified !== null &&
+                      "mcpServers" in verified &&
+                      Array.isArray(verified.mcpServers)
+                        ? verified.mcpServers.find(
+                            (s) => s.name === "t3-code" && s.source === "sdk",
+                          )
+                        : undefined;
+                    if (server?.status === "connected") return Effect.succeed(true);
+                    if (server?.status === "pending") return Effect.succeed(false);
+                    return Effect.fail(new ClaudeCloudGuardError({ reason: "tools_unavailable" }));
+                  }),
+                  Effect.repeat({
+                    while: (ready) => !ready,
+                    schedule: Schedule.spaced("200 millis"),
+                  }),
+                );
+              }).pipe(
+                Effect.timeout("90 seconds"),
+                Effect.mapError(() => new ClaudeCloudGuardError({ reason: "tools_unavailable" })),
+              );
             }
           });
           yield* ensureMcpConnected;
@@ -1027,7 +1043,7 @@ export const makeClaudeCloudQueryRunner = Effect.fn("makeClaudeCloudQueryRunner"
                   ),
                 );
                 yield* applyReasoning;
-                yield* ensureMcpConnected;
+                yield* ensureMcpConnected.pipe(Effect.onError(() => close));
                 if (relay) {
                   yield* control(
                     "apply_flag_settings",
