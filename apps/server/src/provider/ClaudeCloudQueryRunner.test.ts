@@ -56,6 +56,8 @@ function fixture(input?: {
   setupStatusLag?: number;
   initializationEvents?: unknown[];
   modelSwitchFails?: boolean;
+  modelSwitchIgnored?: boolean;
+  modelSettingMissing?: boolean;
   effort?: EffortLevel;
   appliedEffortOverride?: EffortLevel;
   reasoningFails?: boolean;
@@ -159,7 +161,8 @@ function fixture(input?: {
         if (
           payload?.type === "control_request" &&
           payload.request.subtype === "set_model" &&
-          !input?.modelSwitchFails
+          !input?.modelSwitchFails &&
+          !input?.modelSwitchIgnored
         )
           runtimeModel = payload.request.model ?? runtimeModel;
         if (
@@ -188,7 +191,12 @@ function fixture(input?: {
                 response: setupFailed
                   ? { errors: { "t3-code": "injected failure" } }
                   : payload.request.subtype === "get_settings"
-                    ? { applied: { effort: input?.appliedEffortOverride ?? runtimeEffort } }
+                    ? {
+                        applied: {
+                          effort: input?.appliedEffortOverride ?? runtimeEffort,
+                          ...(input?.modelSettingMissing ? {} : { model: runtimeModel }),
+                        },
+                      }
                     : payload.request.subtype === "mcp_status"
                       ? {
                           mcpServers: [
@@ -465,6 +473,12 @@ function fixture(input?: {
       readBinding: fs.readFileString(bindingPath).pipe(Effect.map(decodeJson)),
       toolResponses,
       sentModels,
+      driftRuntimeModel: (model: string) => {
+        runtimeModel = model;
+      },
+      allowModelSwitch: () => {
+        if (input) input.modelSwitchFails = false;
+      },
       sentEfforts,
       waitForToolReply: Effect.promise(() => toolReply.promise).pipe(
         Effect.tap(() =>
@@ -1392,24 +1406,105 @@ describe("Claude cloud guarded transport", () => {
       }),
     ),
   );
-  it.effect("does not send a coding prompt when the remote model change is rejected", () =>
+  it.effect("keeps the selected model when redundant model selection would be rejected", () =>
     run(
       Effect.gen(function* () {
-        const f = yield* fixture({ workspace: true, modelSwitchFails: true });
+        const f = yield* fixture({
+          workspace: true,
+          model: "claude-opus-5-5",
+          modelSwitchFails: true,
+        });
         const session = yield* f.open();
-        const offered = yield* session
-          .offer({
-            type: "user",
-            session_id: "",
-            parent_tool_use_id: null,
-            message: { role: "user", content: "Must not silently use another model" },
-          })
-          .pipe(Effect.result);
-        expect(offered._tag).toBe("Failure");
-        expect(f.sentModels).toEqual([]);
+        yield* session.offer({
+          type: "user",
+          session_id: "",
+          parent_tool_use_id: null,
+          message: { role: "user", content: "Continue using the already selected model" },
+        });
+        expect(f.sentModels).toEqual(["claude-opus-5-5"]);
+        expect(JSON.stringify(f.calls)).not.toContain('"subtype":"set_model"');
         yield* session.close;
       }),
     ),
+  );
+  it.effect("restores the selected model after runtime drift before sending a prompt", () =>
+    run(
+      Effect.gen(function* () {
+        const f = yield* fixture({ workspace: true });
+        const session = yield* f.open();
+        f.driftRuntimeModel("claude-opus-5-5");
+        yield* session.offer({
+          type: "user",
+          session_id: "",
+          parent_tool_use_id: null,
+          message: { role: "user", content: "Use the intended model" },
+        });
+        expect(f.sentModels).toEqual(["claude-haiku-5-5"]);
+        expect(JSON.stringify(f.calls)).toContain('"subtype":"set_model"');
+        yield* session.close;
+      }),
+    ),
+  );
+  it.effect.each(["ignored", "missing"] as const)(
+    "refuses the prompt and releases the stream when model confirmation is %s",
+    (kind) =>
+      run(
+        Effect.gen(function* () {
+          const f = yield* fixture({
+            workspace: true,
+            ...(kind === "ignored" ? { modelSwitchIgnored: true } : { modelSettingMissing: true }),
+          });
+          const session = yield* f.open();
+          f.driftRuntimeModel("claude-opus-5-5");
+          const offered = yield* session
+            .offer({
+              type: "user",
+              session_id: "",
+              parent_tool_use_id: null,
+              message: { role: "user", content: "Must verify the exact model" },
+            })
+            .pipe(Effect.result);
+          expect(offered._tag).toBe("Failure");
+          expect(JSON.stringify(offered)).toContain("model_unavailable");
+          expect(f.sentModels).toEqual([]);
+          expect(yield* session.messages.pipe(Stream.runCollect)).toEqual([]);
+        }),
+      ),
+  );
+  it.effect(
+    "reopens the same conversation after a rejected model change without posting twice",
+    () =>
+      run(
+        Effect.gen(function* () {
+          const f = yield* fixture({ workspace: true, modelSwitchFails: true });
+          const session = yield* f.open();
+          f.driftRuntimeModel("claude-opus-5-5");
+          const offered = yield* session
+            .offer({
+              type: "user",
+              session_id: "",
+              parent_tool_use_id: null,
+              message: { role: "user", content: "Must not silently use another model" },
+            })
+            .pipe(Effect.result);
+          expect(offered._tag).toBe("Failure");
+          expect(f.sentModels).toEqual([]);
+          expect(yield* session.messages.pipe(Stream.runCollect)).toEqual([]);
+          f.allowModelSwitch();
+          const resumed = yield* f.open({ resume: true });
+          yield* resumed.offer({
+            type: "user",
+            session_id: "",
+            parent_tool_use_id: null,
+            message: { role: "user", content: "Retry the undelivered task" },
+          });
+          expect(f.sentModels).toEqual(["claude-haiku-5-5"]);
+          expect(
+            f.calls.filter((c) => c.path === "/v1/code/sessions" && c.method === "POST"),
+          ).toHaveLength(1);
+          yield* resumed.close;
+        }),
+      ),
   );
   it.effect("blocks model changes while work is active or paid usage is enabled", () =>
     run(
@@ -2058,9 +2153,7 @@ describe("Claude cloud guarded transport", () => {
         });
         yield* session.close;
         const posts = f.calls.filter((c) => c.path.endsWith("/events") && c.method === "POST");
-        expect(posts.at(0)?.body).toMatchObject({
-          events: [{ payload: { request: { subtype: "set_model", model: "claude-haiku-5-5" } } }],
-        });
+        expect(f.sentModels).toEqual(["claude-haiku-5-5"]);
         expect(posts.at(-1)?.body).toMatchObject({
           events: [{ payload: { request: { subtype: "interrupt" } } }],
         });

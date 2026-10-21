@@ -113,6 +113,9 @@ const decodeAppliedReasoning = Schema.decodeUnknownEffect(
     }),
   }),
 );
+const decodeAppliedModel = Schema.decodeUnknownEffect(
+  Schema.Struct({ applied: Schema.Struct({ model: Schema.String }) }),
+);
 
 const isClaudeCloudHttpError = Schema.is(ClaudeCloudHttpError);
 const relayedTypes = new Set([
@@ -968,6 +971,29 @@ export const makeClaudeCloudQueryRunner = Effect.fn("makeClaudeCloudQueryRunner"
             return yield* new ClaudeCloudGuardError({
               reason: recoveryPending ? "delivery_pending" : "remote_failed",
             });
+          const ensureModel = (model: string) =>
+            Effect.gen(function* () {
+              const current = yield* control("get_settings", {}, true).pipe(
+                Effect.flatMap(decodeAppliedModel),
+              );
+              // Re-selecting the same model needlessly calls Claude's availability
+              // API, which can reject a healthy session after an idle worker restart.
+              if (current.applied.model === model) return;
+              yield* control("set_model", { model }, true);
+              const confirmed = yield* control("get_settings", {}, true).pipe(
+                Effect.flatMap(decodeAppliedModel),
+              );
+              if (confirmed.applied.model !== model)
+                return yield* new ClaudeCloudGuardError({ reason: "model_unavailable" });
+            }).pipe(
+              Effect.mapError(
+                () =>
+                  new ClaudeCloudGuardError({
+                    reason: recoveryPending ? "delivery_pending" : "model_unavailable",
+                  }),
+              ),
+              Effect.onError(() => close),
+            );
           const applyReasoning = Effect.gen(function* () {
             yield* control(
               "apply_flag_settings",
@@ -1033,15 +1059,7 @@ export const makeClaudeCloudQueryRunner = Effect.fn("makeClaudeCloudQueryRunner"
                 if (binding.pendingTurn !== undefined)
                   return yield* new ClaudeCloudGuardError({ reason: "delivery_pending" });
                 yield* Effect.all([guard, checkModel], { concurrency: "unbounded" });
-                // Reassert the explicit selection on resumed sessions as well as fresh ones.
-                yield* control("set_model", { model: selectedModel }, true).pipe(
-                  Effect.mapError(
-                    () =>
-                      new ClaudeCloudGuardError({
-                        reason: recoveryPending ? "delivery_pending" : "model_unavailable",
-                      }),
-                  ),
-                );
+                yield* ensureModel(selectedModel);
                 yield* applyReasoning;
                 yield* ensureMcpConnected.pipe(Effect.onError(() => close));
                 if (relay) {
@@ -1166,14 +1184,7 @@ export const makeClaudeCloudQueryRunner = Effect.fn("makeClaudeCloudQueryRunner"
                     reason: recoveryPending ? "delivery_pending" : "unsupported_policy",
                   });
                 yield* Effect.all([guard, checkModel], { concurrency: "unbounded" });
-                yield* control("set_model", { model: nextModel }, true).pipe(
-                  Effect.mapError(
-                    () =>
-                      new ClaudeCloudGuardError({
-                        reason: recoveryPending ? "delivery_pending" : "model_unavailable",
-                      }),
-                  ),
-                );
+                yield* ensureModel(nextModel);
                 if (closed || !usable || recoveryPending)
                   return yield* new ClaudeCloudGuardError({
                     reason: recoveryPending ? "delivery_pending" : "remote_failed",
