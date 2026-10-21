@@ -735,7 +735,15 @@ const make = Effect.gen(function* () {
           yield* cloudExecutionPolicy.inherit(target(source.thread), destination);
         else yield* cloudExecutionPolicy.assertRelated(target(source.thread), destination);
       }
-      yield* cloudExecutionPolicy.admit(destination);
+      yield* cloudExecutionPolicy.admit({
+        ...destination,
+        userInitiated:
+          command.createdBy === "user" &&
+          (command.creationSource === "web" || command.creationSource === "mobile") &&
+          command.scheduledTaskId === undefined &&
+          command.notification === undefined &&
+          command.senderThreadId === undefined,
+      });
       if (
         command.dispatchMode.type === "steer_active" ||
         command.dispatchMode.type === "restart_active"

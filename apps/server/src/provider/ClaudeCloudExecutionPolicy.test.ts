@@ -2,6 +2,9 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, describe, it } from "@effect/vitest";
 import {
   EnvironmentId,
+  CommandId,
+  MessageId,
+  ProjectId,
   OrchestratorMcpFailure,
   RuntimeRequestId,
   NodeId,
@@ -24,10 +27,15 @@ import { ThreadToolkit } from "../mcp/toolkits/thread/tools.ts";
 import * as ThreadSearch from "../orchestration-v2/ThreadSearch.ts";
 import * as ScheduledTasks from "../scheduledTasks/ScheduledTaskService.ts";
 import * as ThreadManagement from "../orchestration-v2/ThreadManagementService.ts";
+import * as Orchestrator from "../orchestration-v2/Orchestrator.ts";
+import * as CommandReceiptStore from "../orchestration-v2/CommandReceiptStore.ts";
+import * as SqlitePersistence from "../persistence/Sqlite.ts";
+import * as ProviderSessionManager from "../orchestration-v2/ProviderSessionManager.ts";
 import { liveThreadShell, idleThreadProjection } from "../mcp/McpToolAccess.testkit.ts";
 import * as McpToolAccess from "../mcp/McpToolAccess.ts";
 import * as McpInvocationContext from "../mcp/McpInvocationContext.ts";
 import * as HostProcess from "@t3tools/shared/HostProcess";
+import { HttpClient, HttpClientResponse } from "effect/http";
 import { symlinksSupported } from "@t3tools/shared/testing/symlinks";
 import * as ServerConfig from "../config.ts";
 import * as Settings from "../serverSettings.ts";
@@ -53,10 +61,20 @@ const fixture = Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem;
   const directory = yield* fs.makeTempDirectoryScoped();
   const home = `${directory}/claude`;
+  const localHome = `${directory}/local-claude`;
   yield* fs.makeDirectory(home);
+  yield* fs.makeDirectory(localHome);
   yield* fs.writeFileString(
     `${home}/.claude.json`,
     JSON.stringify({ oauthAccount: { organizationUuid: "org-one" } }),
+  );
+  yield* fs.writeFileString(
+    `${localHome}/.claude.json`,
+    JSON.stringify({ oauthAccount: { organizationUuid: "org-one" } }),
+  );
+  yield* fs.writeFileString(
+    `${localHome}/.credentials.json`,
+    JSON.stringify({ claudeAiOauth: { accessToken: "test-oauth" } }),
   );
   const configuration = yield* Ref.make<Pick<ServerSettings, "providerInstances">>({
     providerInstances: {
@@ -65,13 +83,32 @@ const fixture = Effect.gen(function* () {
         config: { homePath: home, cloudFreeCreditsOnly: true, cloudCodexDelegationEnabled: true },
       },
       [codexId]: { driver: "codex", config: { homePath: `${directory}/codex` } },
-      claude: { driver: "claudeAgent", config: {} },
+      claude: { driver: "claudeAgent", config: { homePath: localHome } },
     },
   } as unknown as Pick<ServerSettings, "providerInstances">);
   const account = yield* Ref.make("chatgpt");
   const hydrated = yield* Ref.make(true);
   const codexHydrated = yield* Ref.make(true);
   const cloudHarness = yield* Ref.make(true);
+  const claudeAccount = yield* Ref.make("pro");
+  const billing = yield* Ref.make<unknown>({ extra_usage: { is_enabled: false } });
+  const billingStatus = yield* Ref.make(200);
+  let billingReads = 0;
+  const claudeProvider = {
+    instanceId: localClaude.modelSelection.instanceId,
+    driverKind: "claudeAgent",
+    enabled: true,
+    continuationIdentity: { continuationKey: `claude:home:${localHome}` },
+    snapshot: {
+      refresh: Effect.gen(function* () {
+        return {
+          status: "ready",
+          auth: { status: "authenticated", type: yield* Ref.get(claudeAccount) },
+          models: [{ slug: "claude-opus-5-5", isCustom: false }],
+        } as unknown as ServerProvider;
+      }),
+    },
+  };
   let probes = 0;
   const provider = {
     instanceId: codexId,
@@ -89,6 +126,20 @@ const fixture = Effect.gen(function* () {
     },
   };
   const dependencies = Layer.mergeAll(
+    Layer.succeed(
+      HttpClient.HttpClient,
+      HttpClient.make((request) =>
+        Effect.gen(function* () {
+          billingReads++;
+          assert.strictEqual(request.url, "https://api.anthropic.com/api/oauth/usage");
+          assert.strictEqual(request.method, "GET");
+          return HttpClientResponse.fromWeb(
+            request,
+            Response.json(yield* Ref.get(billing), { status: yield* Ref.get(billingStatus) }),
+          );
+        }),
+      ),
+    ),
     Layer.succeed(ServerConfig.ServerConfig, {
       stateDir: `${directory}/state`,
     } as ServerConfig.ServerConfig["Service"]),
@@ -113,22 +164,31 @@ const fixture = Effect.gen(function* () {
                     : `claude:home:${home}`,
                 },
               } as never)
-            : (provider as never);
+            : id === localClaude.modelSelection.instanceId
+              ? (claudeProvider as never)
+              : (provider as never);
         }),
     }),
   );
-  const policy = yield* Policy.ClaudeCloudExecutionPolicy.pipe(
+  const reloadPolicy = Policy.ClaudeCloudExecutionPolicy.pipe(
     Effect.provide(Policy.layer.pipe(Layer.provide(dependencies))),
   );
+  const policy = yield* reloadPolicy;
   return {
     policy,
     directory,
     home,
+    localHome,
     configuration,
     account,
     hydrated,
     codexHydrated,
     cloudHarness,
+    claudeAccount,
+    billing,
+    billingStatus,
+    billingReads: () => billingReads,
+    reloadPolicy,
     probes: () => probes,
     fs,
   };
@@ -150,6 +210,276 @@ const run = <A, E>(
   );
 
 describe("ClaudeCloudExecutionPolicy", () => {
+  it.effect.each([
+    { createdBy: "user", creationSource: "web", scheduled: false, allowed: true },
+    { createdBy: "user", creationSource: "mobile", scheduled: false, allowed: true },
+    { createdBy: "user", creationSource: "web", scheduled: true, allowed: false },
+    { createdBy: "user", creationSource: "mobile", scheduled: true, allowed: false },
+    { createdBy: "user", creationSource: "mcp", scheduled: false, allowed: false },
+    { createdBy: "agent", creationSource: "mcp", scheduled: false, allowed: false },
+  ] as const)(
+    "dispatches the first local handoff only for a manual composer message: %j",
+    (origin) =>
+      run(
+        Effect.gen(function* () {
+          const f = yield* fixture;
+          yield* f.policy.admit(root);
+          const schedule = ScheduledTaskId.make("composer-schedule");
+          yield* f.policy.bindSchedule(root, schedule);
+          let dispatched = 0;
+          const layer = ThreadManagement.layer.pipe(
+            Layer.provide(
+              Layer.mergeAll(
+                Layer.succeed(Policy.ClaudeCloudExecutionPolicy, f.policy),
+                Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({}),
+                Settings.layerTest({
+                  providerInstances: {
+                    [localClaude.modelSelection.instanceId]: {
+                      driver: "claudeAgent",
+                      enabled: true,
+                    },
+                  },
+                }),
+                CommandReceiptStore.layer.pipe(Layer.provide(SqlitePersistence.layerMemory)),
+                Layer.mock(Orchestrator.OrchestratorV2)({
+                  getThreadRecords: () =>
+                    Effect.succeed({
+                      thread: {
+                        id: root.threadId,
+                        projectId: ProjectId.make("project"),
+                        modelSelection: root.modelSelection,
+                        worktreePath: null,
+                      },
+                    } as never),
+                  dispatch: () =>
+                    Effect.sync(() => {
+                      dispatched++;
+                      return { sequence: 1, storedEvents: [] };
+                    }),
+                }),
+              ),
+            ),
+          );
+          const result = yield* Effect.gen(function* () {
+            const threads = yield* ThreadManagement.ThreadManagementService;
+            return yield* threads.dispatch({
+              type: "message.dispatch",
+              threadId: root.threadId,
+              commandId: CommandId.make("first-local-switch"),
+              messageId: MessageId.make("switch-message"),
+              text: "Continue with local Claude",
+              attachments: [],
+              modelSelection: localClaude.modelSelection,
+              dispatchMode: { type: "start_immediately" },
+              createdBy: origin.createdBy,
+              creationSource: origin.creationSource,
+              ...(origin.scheduled ? { scheduledTaskId: schedule } : {}),
+            });
+          }).pipe(Effect.provide(layer), Effect.result);
+          assert.strictEqual(result._tag, origin.allowed ? "Success" : "Failure");
+          assert.strictEqual(dispatched, origin.allowed ? 1 : 0);
+          const later = yield* f.policy
+            .admit({ ...root, modelSelection: localClaude.modelSelection })
+            .pipe(Effect.result);
+          assert.strictEqual(later._tag, origin.allowed ? "Success" : "Failure");
+        }),
+      ),
+  );
+  it.effect("persists a human-selected local Claude handoff and rechecks it after restart", () =>
+    run(
+      Effect.gen(function* () {
+        const f = yield* fixture;
+        yield* f.policy.admit(root);
+        const target = { ...root, modelSelection: localClaude.modelSelection };
+        const schedule = ScheduledTaskId.make("existing-schedule");
+        yield* f.policy.bindSchedule(root, schedule);
+        assert.strictEqual((yield* f.policy.admit(target).pipe(Effect.result))._tag, "Failure");
+        // Exhausted promotional credit must not block a separately verified subscription.
+        yield* Ref.set(f.billing, {
+          extra_usage: { is_enabled: false },
+          iguana_necktie: { remaining_dollars: 0 },
+        });
+        const authorized = yield* f.policy.admit({ ...target, userInitiated: true });
+        assert.strictEqual(
+          authorized?.localClaudeInstanceId,
+          localClaude.modelSelection.instanceId,
+        );
+        const restarted = yield* f.reloadPolicy;
+        yield* restarted.admit(target);
+        assert.strictEqual(f.billingReads(), 2);
+        yield* restarted.prepareScheduled(schedule, target);
+        yield* Ref.set(f.billing, { extra_usage: { is_enabled: true } });
+        assert.strictEqual((yield* restarted.admit(target).pipe(Effect.result))._tag, "Failure");
+        yield* restarted.admit(root);
+      }),
+    ),
+  );
+  it.effect("cannot authorize local Claude through children or scheduled work", () =>
+    run(
+      Effect.gen(function* () {
+        const f = yield* fixture;
+        yield* f.policy.admit(root);
+        assert.strictEqual(
+          (yield* f.policy.inherit(root, localClaude).pipe(Effect.result))._tag,
+          "Failure",
+        );
+        yield* f.policy.inherit(root, child);
+        assert.strictEqual(
+          (yield* f.policy
+            .admit({ ...child, modelSelection: localClaude.modelSelection, userInitiated: true })
+            .pipe(Effect.result))._tag,
+          "Failure",
+        );
+        const task = ScheduledTaskId.make("local-switch");
+        yield* f.policy.bindSchedule(root, task);
+        assert.strictEqual(
+          (yield* f.policy
+            .prepareScheduled(task, { ...root, modelSelection: localClaude.modelSelection })
+            .pipe(Effect.result))._tag,
+          "Failure",
+        );
+        assert.strictEqual(f.billingReads(), 0);
+      }),
+    ),
+  );
+  it.effect("keeps authorized local Claude descendants on the verified subscription route", () =>
+    run(
+      Effect.gen(function* () {
+        const f = yield* fixture;
+        yield* f.policy.admit(root);
+        const target = { ...root, modelSelection: localClaude.modelSelection, userInitiated: true };
+        yield* f.policy.admit(target);
+        yield* f.policy.inherit(target, localClaude);
+        yield* f.policy.admit(localClaude);
+        yield* Ref.set(f.claudeAccount, "apiKey");
+        assert.strictEqual(
+          (yield* f.policy.admit(localClaude).pipe(Effect.result))._tag,
+          "Failure",
+        );
+      }),
+    ),
+  );
+  it.effect.each([{}, { extra_usage: null }, { extra_usage: { is_enabled: true } }])(
+    "refuses unverified or paid local Claude billing: %j",
+    (billing) =>
+      run(
+        Effect.gen(function* () {
+          const f = yield* fixture;
+          yield* f.policy.admit(root);
+          yield* Ref.set(f.billing, billing);
+          const target = {
+            ...root,
+            modelSelection: localClaude.modelSelection,
+            userInitiated: true,
+          };
+          assert.strictEqual((yield* f.policy.admit(target).pipe(Effect.result))._tag, "Failure");
+          yield* Ref.set(f.billing, { extra_usage: { is_enabled: false } });
+          assert.strictEqual(
+            (yield* f.policy.admit({ ...target, userInitiated: false }).pipe(Effect.result))._tag,
+            "Failure",
+          );
+        }),
+      ),
+  );
+  it.effect.each([401, 429, 500])("refuses a local billing check returning HTTP %s", (status) =>
+    run(
+      Effect.gen(function* () {
+        const f = yield* fixture;
+        yield* f.policy.admit(root);
+        yield* Ref.set(f.billingStatus, status);
+        assert.strictEqual(
+          (yield* f.policy
+            .admit({ ...root, modelSelection: localClaude.modelSelection, userInitiated: true })
+            .pipe(Effect.result))._tag,
+          "Failure",
+        );
+      }),
+    ),
+  );
+  it.effect.each(["apiKey", "bedrock", "unknown"])(
+    "refuses local Claude authentication %s",
+    (auth) =>
+      run(
+        Effect.gen(function* () {
+          const f = yield* fixture;
+          yield* f.policy.admit(root);
+          yield* Ref.set(f.claudeAccount, auth);
+          assert.strictEqual(
+            (yield* f.policy
+              .admit({ ...root, modelSelection: localClaude.modelSelection, userInitiated: true })
+              .pipe(Effect.result))._tag,
+            "Failure",
+          );
+          assert.strictEqual(f.billingReads(), 0);
+        }),
+      ),
+  );
+  it.effect.each([
+    "environment",
+    "helper",
+    "project",
+    "launchArgs",
+    "model",
+    "account",
+    "credentials",
+    "fastMode",
+  ] as const)("refuses local Claude with unsafe %s", (kind) =>
+    run(
+      Effect.gen(function* () {
+        const f = yield* fixture;
+        yield* f.policy.admit(root);
+        const cwd = `${f.directory}/project/nested`;
+        yield* f.fs.makeDirectory(cwd, { recursive: true });
+        if (kind === "helper")
+          yield* f.fs.writeFileString(
+            `${f.localHome}/settings.json`,
+            JSON.stringify({ apiKeyHelper: "some-command" }),
+          );
+        if (kind === "project") {
+          yield* f.fs.makeDirectory(`${f.directory}/project/.claude`);
+          yield* f.fs.writeFileString(
+            `${f.directory}/project/.claude/settings.local.json`,
+            JSON.stringify({ env: { ANTHROPIC_BASE_URL: "https://example.invalid" } }),
+          );
+        }
+        if (kind === "environment" || kind === "launchArgs")
+          yield* Ref.update(f.configuration, (all) => ({
+            ...all,
+            providerInstances: {
+              ...all.providerInstances,
+              claude: {
+                ...all.providerInstances[localClaude.modelSelection.instanceId]!,
+                ...(kind === "environment"
+                  ? {
+                      environment: [
+                        { name: "ANTHROPIC_API_KEY", value: "paid-key", sensitive: true },
+                      ],
+                    }
+                  : { config: { homePath: f.localHome, launchArgs: "--settings paid.json" } }),
+              },
+            },
+          }));
+        if (kind === "credentials") yield* f.fs.remove(`${f.localHome}/.credentials.json`);
+        if (kind === "account")
+          yield* f.fs.writeFileString(
+            `${f.localHome}/.claude.json`,
+            JSON.stringify({ oauthAccount: { organizationUuid: "other-account" } }),
+          );
+        const target = {
+          ...root,
+          cwd,
+          modelSelection: {
+            ...localClaude.modelSelection,
+            ...(kind === "model" ? { model: "custom-paid-model" } : {}),
+            ...(kind === "fastMode" ? { options: [{ id: "fastMode", value: true }] } : {}),
+          },
+          userInitiated: true,
+        };
+        assert.strictEqual((yield* f.policy.admit(target).pipe(Effect.result))._tag, "Failure");
+        assert.strictEqual(f.billingReads(), 0);
+      }),
+    ),
+  );
   it.effect(
     "permits cloud work and requested subscription Codex children, but pins descendants",
     () =>

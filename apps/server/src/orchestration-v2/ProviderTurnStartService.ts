@@ -542,6 +542,12 @@ export const layer: Layer.Layer<
       const executionTarget = {
         threadId: projection.thread.id,
         modelSelection: run.modelSelection,
+        userInitiated:
+          message.createdBy === "user" &&
+          (message.creationSource === "web" || message.creationSource === "mobile") &&
+          message.scheduledTaskId === undefined &&
+          message.notification === undefined &&
+          message.senderThreadId === undefined,
         ...(resolvedRuntimePolicy.cwd === null || resolvedRuntimePolicy.cwd === undefined
           ? {}
           : { cwd: resolvedRuntimePolicy.cwd }),

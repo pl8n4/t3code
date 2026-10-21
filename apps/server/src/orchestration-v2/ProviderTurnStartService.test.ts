@@ -13,6 +13,7 @@ import {
   ProviderSetupError,
   RunAttemptId,
   RunId,
+  ScheduledTaskId,
   ThreadId,
   ProjectId,
   type OrchestrationV2ThreadProjection,
@@ -280,6 +281,12 @@ it.each([
 function makeLocalCommandHarness(input: {
   readonly text: string;
   readonly policyFailure?: string;
+  readonly requireUserSelection?: boolean;
+  readonly messageOrigin?: Pick<
+    OrchestrationV2ThreadProjection["messages"][number],
+    "createdBy" | "creationSource"
+  >;
+  readonly scheduledTaskId?: ScheduledTaskId;
   readonly cloudRecovery?: boolean;
   readonly worktreePath?: string;
   readonly worktreesDir?: string;
@@ -350,8 +357,9 @@ function makeLocalCommandHarness(input: {
     text: input.text,
     attachments: [],
     streaming: false,
-    createdBy: "user",
-    creationSource: "web",
+    createdBy: input.messageOrigin?.createdBy ?? "user",
+    creationSource: input.messageOrigin?.creationSource ?? "web",
+    ...(input.scheduledTaskId === undefined ? {} : { scheduledTaskId: input.scheduledTaskId }),
     createdAt: now,
     updatedAt: now,
   };
@@ -634,15 +642,14 @@ function makeLocalCommandHarness(input: {
     ClaudeCloudExecutionPolicy.ClaudeCloudExecutionPolicy.pipe(
       Effect.map((base) => ({
         ...base,
-        admit:
-          input.policyFailure === undefined
-            ? base.admit
-            : () =>
-                Effect.fail(
-                  new ClaudeCloudExecutionPolicy.ClaudeCloudExecutionPolicyError({
-                    detail: input.policyFailure!,
-                  }),
-                ),
+        admit: (target: Parameters<typeof base.admit>[0]) =>
+          input.policyFailure !== undefined || (input.requireUserSelection && !target.userInitiated)
+            ? Effect.fail(
+                new ClaudeCloudExecutionPolicy.ClaudeCloudExecutionPolicyError({
+                  detail: input.policyFailure ?? "A human must select this provider.",
+                }),
+              )
+            : base.admit(target),
       })),
       Effect.provide(ClaudeCloudExecutionPolicyTestkit.layer),
     ),
@@ -1216,6 +1223,44 @@ effectIt.effect("rejects a delayed or notification wake before opening a changed
     ).toBe(true);
   });
 });
+
+effectIt.effect.each([
+  { createdBy: "user", creationSource: "web", allowed: true },
+  { createdBy: "user", creationSource: "mobile", allowed: true },
+  { createdBy: "user", creationSource: "mcp", allowed: false },
+  { createdBy: "agent", creationSource: "web", allowed: false },
+  { createdBy: "system", creationSource: "server", allowed: false },
+  {
+    createdBy: "user",
+    creationSource: "web",
+    scheduledTaskId: "scheduled-human-task",
+    allowed: false,
+  },
+  {
+    createdBy: "user",
+    creationSource: "mobile",
+    scheduledTaskId: "scheduled-human-task",
+    allowed: false,
+  },
+] as const)(
+  "gates a manual provider switch from $createdBy/$creationSource before opening it",
+  (origin) =>
+    Effect.gen(function* () {
+      const harness = makeLocalCommandHarness({
+        text: "/recover",
+        cloudRecovery: true,
+        requireUserSelection: true,
+        messageOrigin: origin,
+        ...("scheduledTaskId" in origin
+          ? { scheduledTaskId: ScheduledTaskId.make(origin.scheduledTaskId) }
+          : {}),
+      });
+      yield* harness.start;
+      expect(harness.open).toHaveBeenCalledTimes(origin.allowed ? 1 : 0);
+      expect(harness.startRootRun).toHaveBeenCalledTimes(origin.allowed ? 1 : 0);
+      if (!origin.allowed) expect(harness.projection().runs.at(-1)?.status).toBe("failed");
+    }),
+);
 
 effectIt.effect("preserves exact cloud /recover when the run has pending context handoffs", () =>
   Effect.gen(function* () {

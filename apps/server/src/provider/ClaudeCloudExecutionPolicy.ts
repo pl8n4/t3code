@@ -17,6 +17,7 @@ import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
 import * as Semaphore from "effect/Semaphore";
 import * as HostProcess from "@t3tools/shared/HostProcess";
+import { HttpClient, HttpClientRequest, HttpClientResponse } from "effect/http";
 import { mergeProviderInstanceEnvironment } from "@t3tools/provider-core/server/instanceEnvironment";
 import * as ServerConfig from "../config.ts";
 import * as ServerSettings from "../serverSettings.ts";
@@ -32,6 +33,7 @@ const Binding = Schema.Struct({
   depth: Schema.Int,
   cloudInstanceId: ProviderInstanceId,
   organizationId: Schema.String,
+  localClaudeInstanceId: Schema.optional(ProviderInstanceId),
 });
 export type Binding = typeof Binding.Type;
 const BindingJson = Schema.fromJsonString(Binding);
@@ -57,6 +59,7 @@ interface ThreadTarget {
   readonly threadId: ThreadId;
   readonly modelSelection: ModelSelection;
   readonly cwd?: string;
+  readonly userInitiated?: boolean;
 }
 export class ClaudeCloudExecutionPolicy extends Context.Service<
   ClaudeCloudExecutionPolicy,
@@ -124,6 +127,27 @@ const hasUnsafeCodexConfig = (value: unknown): boolean => {
   );
 };
 
+const unsafeClaudeEnvironment =
+  /^(?:ANTHROPIC_|CLAUDE_CODE_(?:USE_|OAUTH_TOKEN|API|BASE|SUBAGENT_MODEL))/i;
+const decodeClaudeCredentials = Schema.decodeUnknownEffect(
+  Schema.fromJsonString(
+    Schema.Struct({ claudeAiOauth: Schema.Struct({ accessToken: Schema.NonEmptyString }) }),
+  ),
+);
+const decodeClaudeBilling = Schema.decodeUnknownEffect(
+  Schema.Struct({ extra_usage: Schema.Struct({ is_enabled: Schema.Literal(false) }) }),
+);
+const decodeJsonObject = Schema.decodeUnknownEffect(
+  Schema.fromJsonString(Schema.Record(Schema.String, Schema.Unknown)),
+);
+const hasUnsafeClaudeSettings = (value: Record<string, unknown>): boolean =>
+  value.apiKeyHelper !== undefined ||
+  (typeof value.env === "object" &&
+    value.env !== null &&
+    Object.entries(value.env).some(
+      ([key, entry]) => unsafeClaudeEnvironment.test(key) && Boolean(entry),
+    ));
+
 export const layer = Layer.effect(
   ClaudeCloudExecutionPolicy,
   Effect.gen(function* () {
@@ -134,6 +158,7 @@ export const layer = Layer.effect(
     const settings = yield* ServerSettings.ServerSettingsService;
     const instances = yield* ProviderInstanceRegistry.ProviderInstanceRegistry;
     const baseEnv = yield* HostProcess.Environment;
+    const http = yield* HttpClient.HttpClient;
     const lock = yield* Semaphore.make(1);
     const directory = path.join(server.stateDir, "claude-cloud-execution-policies");
     const fail = (detail: string) => new ClaudeCloudExecutionPolicyError({ detail });
@@ -157,6 +182,7 @@ export const layer = Layer.effect(
       kind: "thread" | "schedule",
       id: string,
       binding: Binding,
+      update = false,
     ) {
       const previous = yield* read(kind, id);
       if (previous !== undefined) {
@@ -168,7 +194,7 @@ export const layer = Layer.effect(
           return yield* fail(
             "This workflow belongs to a different promotional-credit cloud account.",
           );
-        return;
+        if (!update) return;
       }
       yield* fs.makeDirectory(directory, { recursive: true });
       const filename = yield* storage(kind, id);
@@ -328,7 +354,164 @@ export const layer = Layer.effect(
         }
       }
     });
-    const validate = Effect.fnUntraced(function* (binding: Binding, target: ThreadTarget) {
+    const assertLocalClaude = Effect.fnUntraced(function* (binding: Binding, target: ThreadTarget) {
+      const all = yield* settings.getSettings;
+      const entry = all.providerInstances[target.modelSelection.instanceId];
+      if (entry?.driver !== "claudeAgent" || entry.enabled === false)
+        return yield* fail("Select an enabled local Claude subscription instance.");
+      const config = yield* decodeClaudeSettings(entry.config ?? {});
+      const environment = yield* mergeProviderInstanceEnvironment(entry.environment, baseEnv);
+      if (
+        !config.enabled ||
+        config.cloudFreeCreditsOnly ||
+        config.launchArgs.trim() ||
+        target.modelSelection.options?.some(
+          (option) => option.id === "fastMode" && option.value === true,
+        ) ||
+        Object.entries(environment).some(
+          ([key, value]) => value && unsafeClaudeEnvironment.test(key),
+        ) ||
+        entry.environment?.some(
+          (variable) =>
+            /^(?:HOME|USERPROFILE|HOMEDRIVE|HOMEPATH)$/i.test(variable.name) &&
+            variable.value !== baseEnv[variable.name],
+        )
+      )
+        return yield* fail(
+          "Local Claude continuation refuses API routing and custom launch arguments.",
+        );
+      const home = yield* resolveClaudeHomePath(config, environment);
+      const instance = yield* instances.getInstanceForConfig(
+        target.modelSelection.instanceId,
+        entry,
+      );
+      if (
+        instance === undefined ||
+        !instance.enabled ||
+        instance.driverKind !== "claudeAgent" ||
+        instance.continuationIdentity.continuationKey !== `claude:home:${home}`
+      )
+        return yield* fail("The local Claude configuration is still loading.");
+      const snapshot = yield* instance.snapshot.refresh;
+      if (
+        !Equal.equals(
+          (yield* settings.getSettings).providerInstances[target.modelSelection.instanceId],
+          entry,
+        ) ||
+        (yield* instances.getInstanceForConfig(target.modelSelection.instanceId, entry)) !==
+          instance
+      )
+        return yield* fail(
+          "The local Claude configuration changed during subscription verification. Retry after setup finishes.",
+        );
+      const auth = snapshot.auth.type?.toLowerCase().replace(/[\s_-]+/g, "");
+      if (
+        snapshot.status !== "ready" ||
+        snapshot.auth.status !== "authenticated" ||
+        !auth ||
+        ![
+          "pro",
+          "max",
+          "max5x",
+          "max20x",
+          "claudeprosubscription",
+          "claudemaxsubscription",
+          "claudemax5xsubscription",
+          "claudemax20xsubscription",
+        ].includes(auth)
+      )
+        return yield* fail(
+          "Local Claude continuation requires a verified Claude Pro or Max subscription sign-in.",
+        );
+      const model = snapshot.models.find(
+        (m) =>
+          m.slug === target.modelSelection.model ||
+          m.aliases?.includes(target.modelSelection.model),
+      );
+      if (model === undefined || model.isCustom || model.subProvider !== undefined)
+        return yield* fail("Local Claude continuation requires a built-in subscription model.");
+      const accountPath =
+        config.homePath.trim() || environment.CLAUDE_CONFIG_DIR?.trim()
+          ? path.join(home, ".claude.json")
+          : path.join(home, "..", ".claude.json");
+      const account = yield* fs.readFileString(accountPath).pipe(Effect.flatMap(decodeAccount));
+      if (account.oauthAccount.organizationUuid !== binding.organizationId)
+        return yield* fail(
+          "Select local Claude signed in to the same account as this cloud workflow.",
+        );
+      const files = new Set([
+        path.join(home, "settings.json"),
+        path.join(home, "settings.local.json"),
+        "/etc/claude-code/managed-settings.json",
+      ]);
+      if (target.cwd !== undefined) {
+        const canonical = yield* fs.realPath(target.cwd);
+        const actual = yield* fs.stat(canonical);
+        const selected = yield* fs.stat(target.cwd);
+        if (
+          actual.type !== "Directory" ||
+          selected.type !== "Directory" ||
+          actual.dev !== selected.dev ||
+          Option.isNone(actual.ino) ||
+          Option.isNone(selected.ino) ||
+          actual.ino.value === 0n ||
+          actual.ino.value !== selected.ino.value
+        )
+          return yield* fail(
+            "Select the existing, direct workspace path for local Claude continuation.",
+          );
+        for (const start of new Set([canonical, path.resolve(target.cwd)])) {
+          let current = start;
+          for (;;) {
+            files.add(path.join(current, ".claude", "settings.json"));
+            files.add(path.join(current, ".claude", "settings.local.json"));
+            const parent = path.dirname(current);
+            if (parent === current) break;
+            current = parent;
+          }
+        }
+      }
+      for (const file of files) {
+        if (!(yield* fs.exists(file))) continue;
+        const value = yield* fs.readFileString(file).pipe(Effect.flatMap(decodeJsonObject));
+        if (hasUnsafeClaudeSettings(value))
+          return yield* fail(
+            "Claude settings contain API routing or an API key helper. Use a clean subscription instance.",
+          );
+      }
+      // Read-only OAuth billing verification works after promotional credit is exhausted.
+      const credentials = yield* fs.readFileString(path.join(home, ".credentials.json")).pipe(
+        Effect.flatMap(decodeClaudeCredentials),
+        Effect.mapError(() =>
+          fail("Sign in to local Claude again; subscription credentials are unavailable."),
+        ),
+      );
+      yield* http
+        .execute(
+          HttpClientRequest.get("https://api.anthropic.com/api/oauth/usage").pipe(
+            HttpClientRequest.setHeaders({
+              authorization: `Bearer ${credentials.claudeAiOauth.accessToken}`,
+              "anthropic-beta": "oauth-2025-04-20",
+            }),
+          ),
+        )
+        .pipe(
+          Effect.flatMap(HttpClientResponse.filterStatusOk),
+          Effect.flatMap((response) => response.json),
+          Effect.flatMap(decodeClaudeBilling),
+          Effect.timeout("10 seconds"),
+          Effect.mapError(() =>
+            fail(
+              "Could not verify that paid extra usage is disabled for local Claude. No model was started.",
+            ),
+          ),
+        );
+    });
+    const validate = Effect.fnUntraced(function* (
+      binding: Binding,
+      target: ThreadTarget,
+      manualLocalInstance?: ProviderInstanceId,
+    ) {
       const cloud = yield* loadCloud(binding.cloudInstanceId);
       if (cloud === undefined || cloud.organizationId !== binding.organizationId)
         return yield* fail(
@@ -341,6 +524,12 @@ export const layer = Layer.effect(
         });
         return;
       }
+      const permissions = yield* read("thread", binding.rootThreadId);
+      if (
+        (manualLocalInstance ?? permissions?.localClaudeInstanceId) ===
+        target.modelSelection.instanceId
+      )
+        return yield* assertLocalClaude(binding, target);
       if (!cloud.config.cloudCodexDelegationEnabled)
         return yield* fail(
           "Codex delegation has not been enabled for this promotional-credit cloud instance.",
@@ -359,6 +548,21 @@ export const layer = Layer.effect(
           organizationId: cloud.organizationId,
         };
         yield* write("thread", target.threadId, binding);
+      }
+      const selected = (yield* settings.getSettings).providerInstances[
+        target.modelSelection.instanceId
+      ];
+      if (
+        target.userInitiated === true &&
+        target.threadId === binding.rootThreadId &&
+        binding.depth === 0 &&
+        selected?.driver === "claudeAgent" &&
+        target.modelSelection.instanceId !== binding.cloudInstanceId
+      ) {
+        const authorized = { ...binding, localClaudeInstanceId: target.modelSelection.instanceId };
+        yield* validate(binding, target, target.modelSelection.instanceId);
+        yield* write("thread", target.threadId, authorized, true);
+        return authorized;
       }
       yield* validate(binding, target);
       return binding;

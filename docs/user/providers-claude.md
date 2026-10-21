@@ -124,12 +124,23 @@ account. In a **Full access**, default-mode thread, a rejected usage-limit turn
 stops and continues on cloud Opus 5.5 in the same conversation. T3 transfers the
 conversation context and keeps the current workspace; the composer follows the
 cloud instance for subsequent messages. The free-credit workflow keeps this
-thread and its descendants restricted to verified routes. To return to ordinary
-local Claude, start a separate local thread. Ambiguous accounts, pending approvals, queued work, snoozed threads, or
+thread and its descendants restricted to verified routes. Ambiguous accounts, pending approvals, queued work, snoozed threads, or
 unknown billing information block automatic continuation.
 
 For manual switching, stop the current turn, select the cloud instance, and send
 a follow-up. You can also start a new cloud thread in any local project.
+
+To continue a cloud task with your local Claude subscription, wait for the current
+turn to finish or stop it, select the local Claude instance in the composer, and
+send a follow-up yourself. The first switch requires a message from the web,
+desktop, or mobile composer; an agent or scheduled task cannot authorize it.
+T3 keeps the same thread and worktree and transfers conversation history into a
+fresh local Claude session. Long histories may be condensed. Local Claude must
+use a built-in model and a verified Pro or Max login for the same account, with
+paid extra usage disabled. API routes, custom launch arguments, and Fast mode
+are refused. These checks run again before later turns, including automation.
+This switch can work after promotional credit is exhausted; it does not happen
+automatically. Keep the original cloud instance enabled.
 
 This prototype supports Haiku 5.5, Opus 5.5, Fable 5.1, and Full access. Select
 reasoning effort in the composer; T3 confirms that Claude applied it before
