@@ -297,6 +297,9 @@ export const layerExecutor: Layer.Layer<
                         ...(message.scheduledTaskId === undefined
                           ? {}
                           : { scheduledTaskId: message.scheduledTaskId }),
+                        ...(message.scheduledTaskTrigger === undefined
+                          ? {}
+                          : { scheduledTaskTrigger: message.scheduledTaskTrigger }),
                         ...(message.senderThreadId === undefined
                           ? {}
                           : { senderThreadId: message.senderThreadId }),

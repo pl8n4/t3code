@@ -1817,7 +1817,7 @@ const layerWsRpc = (
                         ThreadManagementService.withCreationProvenance(command, {
                           createdBy: "user",
                           creationSource:
-                            "creationSource" in command ? command.creationSource : "web",
+                            "creationSource" in command ? (command.creationSource ?? "web") : "web",
                         }),
                       )
                   ).pipe(Effect.provide(intakeContext)),

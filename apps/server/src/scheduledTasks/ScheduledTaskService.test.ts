@@ -186,8 +186,11 @@ it.effect(
               ),
               Layer.mergeAll(
                 Layer.mock(ThreadLaunchService.ThreadLaunchService)({
-                  launch: () =>
-                    Ref.updateAndGet(dispatched, (n) => n + 1).pipe(
+                  launch: (input) =>
+                    Effect.sync(() => {
+                      assert.equal(input.initialMessage?.scheduledTaskTrigger, "scheduled");
+                    }).pipe(
+                      Effect.andThen(Ref.updateAndGet(dispatched, (n) => n + 1)),
                       Effect.andThen((n) =>
                         n === 4
                           ? Deferred.succeed(lastDispatched, undefined).pipe(

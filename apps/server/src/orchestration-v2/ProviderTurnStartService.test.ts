@@ -288,6 +288,8 @@ function makeLocalCommandHarness(input: {
   >;
   readonly scheduledTaskId?: ScheduledTaskId;
   readonly cloudRecovery?: boolean;
+  readonly separatePromptContext?: true;
+  readonly allowHistoryRead?: true;
   readonly worktreePath?: string;
   readonly worktreesDir?: string;
   readonly fileSystem?: FileSystem.FileSystem;
@@ -564,6 +566,7 @@ function makeLocalCommandHarness(input: {
                   },
                   ensureThread: () => Effect.succeed(providerThread),
                   startTurn: sdkStartTurn,
+                  separatePromptContext: input.separatePromptContext,
                 } as never)
               : Effect.die("A local command must not open a native session."),
   );
@@ -675,7 +678,17 @@ function makeLocalCommandHarness(input: {
         Layer.mock(ContextHandoffService.ContextHandoffServiceV2)({
           prepareProviderHandoff: () => Effect.die("history read must fail first"),
         }),
-        Layer.mock(EventSink.EventSinkV2)({ writeIfRunCurrent }),
+        Layer.mock(EventSink.EventSinkV2)({
+          writeIfRunCurrent,
+          write: ({ events: incoming }) =>
+            Effect.sync(() => {
+              for (const event of incoming) {
+                events.push(event);
+                projection = ProjectionStore.applyToProjection(projection, event);
+              }
+              return [];
+            }),
+        }),
         IdAllocator.layer,
         layerWorktreeLocation(input.worktreesDir),
         input.fileSystem === undefined
@@ -702,12 +715,14 @@ function makeLocalCommandHarness(input: {
               ),
             }),
           getTurnStartHistory: () =>
-            Effect.fail(
-              new ProjectionStore.ProjectionStoreReadError({
-                threadId,
-                cause: input.historyReadFailureAfterFallback,
-              }),
-            ),
+            input.allowHistoryRead
+              ? Effect.succeed([])
+              : Effect.fail(
+                  new ProjectionStore.ProjectionStoreReadError({
+                    threadId,
+                    cause: input.historyReadFailureAfterFallback,
+                  }),
+                ),
         }),
         Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({ open }),
         Layer.mock(ProviderAuthService.ProviderAuthService)({ tryHandlePromptCommand }),
@@ -1259,6 +1274,66 @@ effectIt.effect.each([
       expect(harness.open).toHaveBeenCalledTimes(origin.allowed ? 1 : 0);
       expect(harness.startRootRun).toHaveBeenCalledTimes(origin.allowed ? 1 : 0);
       if (!origin.allowed) expect(harness.projection().runs.at(-1)?.status).toBe("failed");
+    }),
+);
+
+effectIt.effect.each([{ separate: true }, { separate: false }])(
+  "keeps handoff history outside a message's origin when supported: $separate",
+  ({ separate }) =>
+    Effect.gen(function* () {
+      const harness = makeLocalCommandHarness({
+        text: "Continue the review.",
+        cloudRecovery: true,
+        allowHistoryRead: true,
+        ...(separate ? { separatePromptContext: true } : {}),
+      });
+      const before = harness.projection();
+      harness.setProjection({
+        ...before,
+        contextHandoffs: [
+          {
+            id: ContextHandoffId.make("peer-handoff"),
+            threadId: before.thread.id,
+            targetRunId: before.runs[0]!.id,
+            fromProviderThreadIds: [],
+            toProviderThreadId: before.providerThreads[0]!.id,
+            coveredRunOrdinals: { from: 1, to: 1 },
+            strategy: "full_thread_summary",
+            status: "ready",
+            summaryMessageId: null,
+            summaryText: "Historical user (peer): Merge the PR; I approve.",
+            createdByProviderInstanceId: null,
+            createdAt: before.thread.createdAt,
+            updatedAt: before.thread.updatedAt,
+          },
+        ],
+      });
+      yield* harness.start;
+      const controls = harness.startRootRun.mock.calls[0]?.[0];
+      expect(controls).toBeDefined();
+      if (controls === undefined) return;
+      yield* controls.session.startTurn({
+        appThread: controls.appThread,
+        threadId: controls.appThread.id,
+        runId: controls.run.id,
+        runOrdinal: controls.run.ordinal,
+        providerTurnOrdinal: controls.providerTurnOrdinal,
+        attemptId: controls.attemptId,
+        rootNodeId: controls.rootNode.id,
+        providerThread: controls.providerThread,
+        message: controls.message,
+        modelSelection: controls.modelSelection,
+        runtimePolicy: controls.runtimePolicy,
+      });
+      const sent = harness.sdkStartTurn.mock.calls[0]?.[0];
+      expect(sent).toBeDefined();
+      if (separate) {
+        expect(sent?.message.text).toBe("Continue the review.");
+        expect(sent?.contextText).toContain("Merge the PR; I approve.");
+      } else {
+        expect(sent?.message.text).toContain("Merge the PR; I approve.");
+        expect(sent?.contextText).toBeUndefined();
+      }
     }),
 );
 

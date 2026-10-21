@@ -72,6 +72,8 @@ export function withCreationProvenance(
   provenance: ThreadManagementProvenance,
 ): OrchestrationV2Command {
   switch (command.type) {
+    case "runtime-request.respond":
+      return { ...command, ...provenance };
     case "thread.create":
     case "message.dispatch":
     case "thread.fork":
@@ -127,6 +129,7 @@ export interface ThreadManagementSendInput {
   readonly threadId: ThreadId;
   readonly messageId: MessageId;
   readonly scheduledTaskId?: ScheduledTaskId;
+  readonly scheduledTaskTrigger?: OrchestrationV2ConversationMessage["scheduledTaskTrigger"];
   readonly senderThreadId?: ThreadId;
   readonly text: string;
   readonly attachments: ReadonlyArray<ChatAttachment>;
@@ -901,6 +904,9 @@ const make = Effect.gen(function* () {
         threadId: input.threadId,
         messageId: input.messageId,
         ...(input.scheduledTaskId === undefined ? {} : { scheduledTaskId: input.scheduledTaskId }),
+        ...(input.scheduledTaskTrigger === undefined
+          ? {}
+          : { scheduledTaskTrigger: input.scheduledTaskTrigger }),
         ...(input.senderThreadId === undefined ? {} : { senderThreadId: input.senderThreadId }),
         text: input.text,
         attachments: input.attachments,

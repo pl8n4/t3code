@@ -760,6 +760,7 @@ export const layer = Layer.effect(
                   initialMessage: {
                     messageId,
                     scheduledTaskId: active.id,
+                    scheduledTaskTrigger: trigger,
                     text: prompt,
                     attachments: [],
                   },
@@ -774,6 +775,7 @@ export const layer = Layer.effect(
                   threadId: ThreadId.make(active.threadId),
                   messageId,
                   scheduledTaskId: active.id,
+                  scheduledTaskTrigger: trigger,
                   text: prompt,
                   attachments: [],
                   modelSelection: active.modelSelection,

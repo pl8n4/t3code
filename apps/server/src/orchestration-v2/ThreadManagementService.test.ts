@@ -18,6 +18,7 @@ import {
   ProjectId,
   ProviderInstanceId,
   RunId,
+  RuntimeRequestId,
   ThreadId,
 } from "@t3tools/contracts";
 import * as Deferred from "effect/Deferred";
@@ -87,6 +88,25 @@ it("leaves commands that do not create durable authored content unchanged", () =
       creationSource: "web",
     }),
   ).toBe(command);
+});
+
+it.each([
+  { createdBy: "user", creationSource: "web" },
+  { createdBy: "user", creationSource: "mobile" },
+  { createdBy: "agent", creationSource: "mcp" },
+] as const)("stamps responder provenance from the transport: %j", (provenance) => {
+  const command: OrchestrationV2Command = {
+    type: "runtime-request.respond",
+    commandId: CommandId.make("response-provenance"),
+    threadId: ThreadId.make("thread-response"),
+    requestId: RuntimeRequestId.make("request-response"),
+    createdBy: "user",
+    creationSource: "web",
+    answers: { approval: "Merge it" },
+  };
+  expect(ThreadManagementService.withCreationProvenance(command, provenance)).toMatchObject(
+    provenance,
+  );
 });
 
 it("identifies every existing thread that must be hydrated before dispatch", () => {

@@ -1087,6 +1087,7 @@ export const OrchestrationV2ConversationMessage = Schema.Struct({
   notification: Schema.optional(OrchestrationV2Notification),
   ...OrchestrationV2CreationFields,
   scheduledTaskId: Schema.optional(ScheduledTaskId),
+  scheduledTaskTrigger: Schema.optional(Schema.Literals(["scheduled", "manual", "webhook"])),
   senderThreadId: Schema.optional(ThreadId),
   /**
    * The message is the script a provider-native workflow run executes, not prose. Clients show
@@ -1342,6 +1343,7 @@ export const OrchestrationV2TurnItem = Schema.Union([
     type: Schema.Literal("user_message"),
     messageId: MessageId,
     scheduledTaskId: Schema.optional(ScheduledTaskId),
+    scheduledTaskTrigger: Schema.optional(Schema.Literals(["scheduled", "manual", "webhook"])),
     senderThreadId: Schema.optional(ThreadId),
     workflowScript: OrchestrationV2ConversationMessage.fields.workflowScript,
     inputIntent: OrchestrationV2UserMessageInputIntent,
@@ -2098,6 +2100,7 @@ export const OrchestrationV2TurnItemJson = Schema.Union([
     type: Schema.Literal("user_message"),
     messageId: MessageId,
     scheduledTaskId: Schema.optional(ScheduledTaskId),
+    scheduledTaskTrigger: Schema.optional(Schema.Literals(["scheduled", "manual", "webhook"])),
     senderThreadId: Schema.optional(ThreadId),
     workflowScript: OrchestrationV2ConversationMessage.fields.workflowScript,
     inputIntent: OrchestrationV2UserMessageInputIntent,
@@ -2767,6 +2770,7 @@ export const OrchestrationV2Command = Schema.Union([
     notification: Schema.optional(OrchestrationV2Notification),
     ...OrchestrationV2CreationFields,
     scheduledTaskId: Schema.optional(ScheduledTaskId),
+    scheduledTaskTrigger: Schema.optional(Schema.Literals(["scheduled", "manual", "webhook"])),
     senderThreadId: Schema.optional(ThreadId),
     commandId: CommandId,
     threadId: ThreadId,
@@ -2886,6 +2890,8 @@ export const OrchestrationV2Command = Schema.Union([
   }),
   Schema.Struct({
     type: Schema.Literal("runtime-request.respond"),
+    createdBy: Schema.optional(OrchestrationV2Actor),
+    creationSource: Schema.optional(OrchestrationV2CreationSource),
     commandId: CommandId,
     threadId: ThreadId,
     requestId: RuntimeRequestId,

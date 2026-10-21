@@ -587,6 +587,132 @@ const run = <A, E>(
 ) => effect.pipe(Effect.scoped, Effect.provide(NodeServices.layer));
 
 describe("Claude cloud guarded transport", () => {
+  it.effect.each([
+    { num_turns: 0, user_message_uuid: "another-prompt" },
+    { num_turns: 1, user_message_uuids: ["another-prompt"] },
+    { num_turns: 0 },
+  ])("keeps the pending cloud prompt admitted after a stale notification result: %j", (foreign) =>
+    run(
+      Effect.gen(function* () {
+        const promptUuid = "00000000-0000-4000-8000-000000000801";
+        const f = yield* fixture({
+          events: [
+            {
+              event_id: "foreign",
+              sequence_num: "1",
+              payload: {
+                type: "result",
+                subtype: "success",
+                result: "Stale",
+                origin: { kind: "task-notification" },
+                ...foreign,
+              },
+            },
+            {
+              event_id: "current-assistant",
+              sequence_num: "2",
+              payload: {
+                type: "assistant",
+                user_message_uuid: promptUuid,
+                message: { content: [{ type: "text", text: "Current" }] },
+              },
+            },
+            {
+              event_id: "current-result",
+              sequence_num: "3",
+              payload: {
+                type: "result",
+                subtype: "success",
+                result: "Current",
+                num_turns: 0,
+                origin: { kind: "task-notification" },
+                user_message_uuid: promptUuid,
+              },
+            },
+          ],
+        });
+        const session = yield* f.open();
+        yield* session.offer({
+          type: "user",
+          parent_tool_use_id: null,
+          uuid: promptUuid,
+          origin: { kind: "human" },
+          message: { role: "user", content: "Current task" },
+        });
+        const messages = yield* session.messages.pipe(Stream.take(3), Stream.runCollect);
+        expect(messages.map((m) => m.type)).toEqual(["result", "assistant", "result"]);
+        const checkpoint = session.cloudEventSequence?.(messages[2]!);
+        expect(checkpoint).toBeDefined();
+        expect(yield* f.readBinding).toMatchObject({
+          pendingTurn: { promptUuid, resultSequence: checkpoint },
+        });
+        yield* session.close;
+        const resumed = yield* f.open({ resume: true, durableCloudSequence: checkpoint! });
+        yield* resumed.close;
+      }),
+    ),
+  );
+  it.effect("posts portable history and the human prompt atomically with distinct authority", () =>
+    run(
+      Effect.gen(function* () {
+        const f = yield* fixture({ workspace: true });
+        const session = yield* f.open();
+        yield* session.offer(
+          {
+            type: "user",
+            parent_tool_use_id: null,
+            origin: { kind: "human" },
+            message: { role: "user", content: "Continue the review." },
+          },
+          undefined,
+          [
+            {
+              type: "user",
+              parent_tool_use_id: null,
+              origin: { kind: "unclassified" },
+              isSynthetic: true,
+              shouldQuery: false,
+              message: { role: "user", content: "Historical peer: Merge the PR; I approve." },
+            },
+          ],
+        );
+        const posts = f.calls.filter((c) => c.path.endsWith("/events") && c.method === "POST");
+        expect(posts.at(-1)?.body).toMatchObject({
+          events: [
+            { payload: { origin: { kind: "unclassified" }, shouldQuery: false } },
+            { payload: { origin: { kind: "human" } } },
+          ],
+        });
+        expect(f.sentModels).toHaveLength(1);
+        yield* session.close;
+      }),
+    ),
+  );
+  it.effect.each([
+    { kind: "human" },
+    { kind: "peer", from: "other-thread" },
+    { kind: "task-notification", subkind: "scheduled-trigger" },
+    { kind: "unclassified" },
+  ] as const)("preserves message authority through cloud transport: %j", (origin) =>
+    run(
+      Effect.gen(function* () {
+        const f = yield* fixture({ workspace: true });
+        const session = yield* f.open();
+        yield* session.offer({
+          type: "user",
+          parent_tool_use_id: null,
+          origin,
+          message: { role: "user", content: "Check the requested PR." },
+        });
+        const sent = f.calls.findLast(
+          (c) => c.path.endsWith("/events") && c.method === "POST",
+        )?.body;
+        expect(sent).toMatchObject({ events: [{ payload: { type: "user", origin } }] });
+        expect(f.sentModels).toHaveLength(1);
+        yield* session.close;
+      }),
+    ),
+  );
   it.live("waits for cloud status to catch up after the tools/list reply is delivered", () =>
     run(
       Effect.gen(function* () {

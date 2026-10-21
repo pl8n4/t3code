@@ -1,12 +1,14 @@
 import { assert, it } from "@effect/vitest";
 import {
   CommandId,
+  MessageId,
   NodeId,
   ProviderSessionId,
   ProviderThreadId,
   ProviderTurnId,
   RunAttemptId,
   RunId,
+  ScheduledTaskId,
   ThreadId,
 } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
@@ -83,6 +85,7 @@ function layerExecutorFor(input: {
   readonly threads?: Partial<ThreadManagementService.ThreadManagementService["Service"]>;
   readonly continueAfterRestart?: boolean;
   readonly interrupt?: ProviderTurnControlService.ProviderTurnControlServiceV2Shape["interrupt"];
+  readonly steer?: ProviderTurnControlService.ProviderTurnControlServiceV2Shape["steer"];
 }) {
   const record = (event: string) => Ref.update(input.events, (events) => [...events, event]);
   const layerDependencies = Layer.mergeAll(
@@ -90,7 +93,7 @@ function layerExecutorFor(input: {
       ProviderTurnControlService.ProviderTurnControlServiceV2,
       ProviderTurnControlService.ProviderTurnControlServiceV2.of({
         interrupt: input.interrupt ?? (() => Effect.void),
-        steer: () => Effect.void,
+        steer: input.steer ?? (() => Effect.void),
         interruptAndAwaitTerminal: (request) =>
           record(
             request.replacementProviderSessionId === undefined
@@ -194,6 +197,71 @@ it("does not retry pure interrupt races where the turn is already gone", () => {
     ),
   );
 });
+
+it.effect("retains scheduled trigger provenance when completion races steering", () =>
+  Effect.gen(function* () {
+    const now = yield* DateTime.now;
+    const events = yield* Ref.make<ReadonlyArray<string>>([]);
+    const messageId = MessageId.make("scheduled-steer-race");
+    const scheduledTaskId = ScheduledTaskId.make("race-task");
+    let forwarded = false;
+    const layer = layerExecutorFor({
+      events,
+      steer: () =>
+        new ProviderTurnControlService.ProviderTurnControlError({
+          threadId,
+          operation: "steer",
+          providerTurnId,
+          turnCompleted: true,
+          cause: "Completed turn",
+        }),
+      threads: {
+        getThreadRecords: () =>
+          Effect.succeed({
+            messages: [
+              {
+                id: messageId,
+                runId,
+                text: "Stored task",
+                attachments: [],
+                createdBy: "user",
+                creationSource: "web",
+                scheduledTaskId,
+                scheduledTaskTrigger: "scheduled",
+              },
+            ],
+            runs: [{ id: runId }],
+          } as never),
+        dispatch: (command) =>
+          Effect.sync(() => {
+            forwarded = true;
+            assert.equal(command.type, "message.dispatch");
+            if (command.type === "message.dispatch") {
+              assert.equal(command.scheduledTaskId, scheduledTaskId);
+              assert.equal(command.scheduledTaskTrigger, "scheduled");
+              assert.equal(command.createdBy, "user");
+              assert.equal(command.creationSource, "web");
+            }
+            return { sequence: 1, storedEvents: [] };
+          }),
+      },
+    });
+    yield* Effect.gen(function* () {
+      const executor = yield* EffectWorker.OrchestrationEffectExecutorV2;
+      yield* executor.execute({
+        ...restartEffect(now, { type: "detach" }),
+        request: {
+          type: "provider-turn.steer",
+          providerSessionId: oldSessionId,
+          providerThreadId,
+          providerTurnId,
+          messageId,
+        },
+      });
+    }).pipe(Effect.provide(layer));
+    assert.isTrue(forwarded);
+  }),
+);
 
 it.effect("settles a stopped run when its adapter has already lost the native turn", () =>
   Effect.gen(function* () {

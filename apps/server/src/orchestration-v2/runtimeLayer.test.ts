@@ -1011,22 +1011,28 @@ it.layer(layerTest)("OrchestrationV2LayerLive", (it) => {
     }),
   );
 
-  it.effect("answers an async question after its provider exits and commits the answer once", () =>
+  it.effect.each([
+    { createdBy: "user", creationSource: "web" },
+    { createdBy: "user", creationSource: "mobile" },
+    { createdBy: "agent", creationSource: "mcp" },
+    {},
+  ] as const)("preserves async answer provenance and commits once: %j", (provenance) =>
     Effect.gen(function* () {
+      const identity = `runtime-async-question-${"createdBy" in provenance ? provenance.createdBy : "legacy"}-${"creationSource" in provenance ? provenance.creationSource : "server"}`;
       const orchestrator = yield* Orchestrator.OrchestratorV2;
       const eventSink = yield* EventSink.EventSinkV2;
       const now = yield* DateTime.now;
-      const threadId = ThreadId.make("runtime-async-question");
-      const requestId = RuntimeRequestId.make("runtime-async-question-request");
-      const nodeId = NodeId.make("runtime-async-question-node");
-      const itemId = TurnItemId.make("runtime-async-question-item");
+      const threadId = ThreadId.make(identity);
+      const requestId = RuntimeRequestId.make(`${identity}-request`);
+      const nodeId = NodeId.make(`${identity}-node`);
+      const itemId = TurnItemId.make(`${identity}-item`);
       yield* orchestrator.dispatch({
         type: "thread.create",
-        commandId: CommandId.make("runtime-async-question-create"),
+        commandId: CommandId.make(`${identity}-create`),
         createdBy: "user",
         creationSource: "web",
         threadId,
-        projectId: ProjectId.make("runtime-async-question-project"),
+        projectId: ProjectId.make(`${identity}-project`),
         title: "Async question",
         modelSelection,
         runtimeMode: "full-access",
@@ -1035,10 +1041,10 @@ it.layer(layerTest)("OrchestrationV2LayerLive", (it) => {
         worktreePath: process.cwd(),
       });
       yield* eventSink.write({
-        commandId: CommandId.make("runtime-async-question-seed"),
+        commandId: CommandId.make(`${identity}-seed`),
         events: [
           {
-            id: EventId.make("runtime-async-question-node-event"),
+            id: EventId.make(`${identity}-node-event`),
             type: "node.updated",
             threadId,
             nodeId,
@@ -1062,7 +1068,7 @@ it.layer(layerTest)("OrchestrationV2LayerLive", (it) => {
             },
           },
           {
-            id: EventId.make("runtime-async-question-request-event"),
+            id: EventId.make(`${identity}-request-event`),
             type: "runtime-request.updated",
             threadId,
             nodeId,
@@ -1080,7 +1086,7 @@ it.layer(layerTest)("OrchestrationV2LayerLive", (it) => {
             },
           },
           {
-            id: EventId.make("runtime-async-question-item-event"),
+            id: EventId.make(`${identity}-item-event`),
             type: "turn-item.updated",
             threadId,
             nodeId,
@@ -1111,7 +1117,7 @@ it.layer(layerTest)("OrchestrationV2LayerLive", (it) => {
       const invalid = yield* orchestrator
         .dispatch({
           type: "runtime-request.respond",
-          commandId: CommandId.make("runtime-async-question-blank"),
+          commandId: CommandId.make(`${identity}-blank`),
           threadId,
           requestId,
           answers: { color: " " },
@@ -1124,7 +1130,8 @@ it.layer(layerTest)("OrchestrationV2LayerLive", (it) => {
 
       const command = {
         type: "runtime-request.respond" as const,
-        commandId: CommandId.make("runtime-async-question-answer"),
+        ...provenance,
+        commandId: CommandId.make(`${identity}-answer`),
         threadId,
         requestId,
         answers: { color: "  Blue  " },
@@ -1150,12 +1157,20 @@ it.layer(layerTest)("OrchestrationV2LayerLive", (it) => {
       assert.equal(answered.messages.length, 1);
       assert.equal(answered.messages[0]?.text, "Which color?\nBlue");
       assert.equal(answered.messages[0]?.role, "user");
+      assert.equal(
+        answered.messages[0]?.createdBy,
+        "createdBy" in provenance ? provenance.createdBy : "user",
+      );
+      assert.equal(
+        answered.messages[0]?.creationSource,
+        "creationSource" in provenance ? provenance.creationSource : "server",
+      );
       assert.equal(answered.runs.length, 1);
 
       const duplicate = yield* orchestrator
         .dispatch({
           ...command,
-          commandId: CommandId.make("runtime-async-question-duplicate"),
+          commandId: CommandId.make(`${identity}-duplicate`),
         })
         .pipe(Effect.result);
       assert.equal(duplicate._tag, "Failure");

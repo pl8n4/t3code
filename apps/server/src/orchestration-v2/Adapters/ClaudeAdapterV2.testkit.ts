@@ -292,10 +292,10 @@ function normalizeContextHandoffText(value: string): string {
   const userMessageMarker = "\n\nUser message:\n";
   const userMessageIndex = value.indexOf(userMessageMarker);
   const headerEndIndex = value.indexOf(":\n");
-  if (headerEndIndex === -1 || userMessageIndex === -1 || headerEndIndex >= userMessageIndex) {
+  if (headerEndIndex === -1 || (userMessageIndex !== -1 && headerEndIndex >= userMessageIndex)) {
     return value;
   }
-  return `${value.slice(0, headerEndIndex + 2)}<dynamic-summary>${value.slice(userMessageIndex)}`;
+  return `${value.slice(0, headerEndIndex + 2)}<dynamic-summary>${userMessageIndex === -1 ? "" : value.slice(userMessageIndex)}`;
 }
 
 function normalizeReplayFrame(value: unknown): unknown {
@@ -812,8 +812,11 @@ function makeReplayQueryRunner(
         messages: Stream.fromAsyncIterable(replayMessagesWithGateCleanup(input.options), (cause) =>
           replayQueryRunnerError(transcript, cause),
         ),
-        offer: (message) =>
+        offer: (message, _sequence, contextMessages = []) =>
           replayEffect(() => {
+            for (const context of contextMessages) {
+              assertNextOutboundFrame(makeClaudePromptOfferFrame(context));
+            }
             assertNextOutboundFrame(makeClaudePromptOfferFrame(message));
           }),
         setModel: (model) =>
@@ -1638,6 +1641,7 @@ async function recordClaudeStreamingQuery(input: {
   try {
     for (const [index, prompt] of input.prompts.entries()) {
       const message = ClaudeAdapterV2.makeClaudeUserMessage({
+        origin: { kind: "human" },
         text: prompt,
         uuid: await Effect.runPromise(
           Crypto.Crypto.pipe(
@@ -1716,6 +1720,7 @@ async function recordClaudeActiveSteeringQuery(input: {
   const offeredPrompts = new Set<number>();
   const offerPrompt = (index: number, priority?: SDKUserMessage["priority"]) => {
     const message = ClaudeAdapterV2.makeClaudeUserMessage({
+      origin: { kind: "human" },
       text: input.prompts[index]!,
       ...(priority === undefined ? {} : { priority }),
     });
@@ -1868,7 +1873,10 @@ async function recordClaudeRestartingQueries(input: {
       label: `query.open:${index + 1}`,
       frame: makeClaudeQueryOpenFrame({ options }),
     });
-    const message = ClaudeAdapterV2.makeClaudeUserMessage({ text: prompt });
+    const message = ClaudeAdapterV2.makeClaudeUserMessage({
+      origin: { kind: "human" },
+      text: prompt,
+    });
     input.entries.push({
       type: "expect_outbound",
       label: `prompt.offer:${index + 1}`,
@@ -1970,7 +1978,10 @@ async function recordClaudeResumeAtCursorQuery(input: {
   try {
     const sourceCursors: Array<SDKAssistantMessage["uuid"]> = [];
     for (const [index, prompt] of input.prompts.slice(0, 2).entries()) {
-      const message = ClaudeAdapterV2.makeClaudeUserMessage({ text: prompt });
+      const message = ClaudeAdapterV2.makeClaudeUserMessage({
+        origin: { kind: "human" },
+        text: prompt,
+      });
       input.entries.push({
         type: "expect_outbound",
         label: `prompt.offer:${index + 1}`,
@@ -2032,7 +2043,10 @@ async function recordClaudeResumeAtCursorQuery(input: {
       label: "query.open:resume_at_cursor",
       frame: makeClaudeQueryOpenFrame({ options: resumedOptions }),
     });
-    const resumedMessage = ClaudeAdapterV2.makeClaudeUserMessage({ text: input.prompts[2]! });
+    const resumedMessage = ClaudeAdapterV2.makeClaudeUserMessage({
+      origin: { kind: "human" },
+      text: input.prompts[2]!,
+    });
     input.entries.push({
       type: "expect_outbound",
       label: "prompt.offer:3",
@@ -2152,7 +2166,10 @@ async function recordClaudeForkSessionQuery(input: {
   try {
     const sourceCursors: Array<SDKAssistantMessage["uuid"]> = [];
     for (const [index, prompt] of input.prompts.slice(0, sourcePromptCount).entries()) {
-      const message = ClaudeAdapterV2.makeClaudeUserMessage({ text: prompt });
+      const message = ClaudeAdapterV2.makeClaudeUserMessage({
+        origin: { kind: "human" },
+        text: prompt,
+      });
       input.entries.push({
         type: "expect_outbound",
         label: `prompt.offer:${index + 1}`,
@@ -2258,7 +2275,10 @@ async function recordClaudeForkSessionQuery(input: {
       const targetIterator = targetRuntime[Symbol.asyncIterator]();
       for (const prompt of forkPrompts) {
         promptOrdinal += 1;
-        const targetMessage = ClaudeAdapterV2.makeClaudeUserMessage({ text: prompt });
+        const targetMessage = ClaudeAdapterV2.makeClaudeUserMessage({
+          origin: { kind: "human" },
+          text: prompt,
+        });
         input.entries.push({
           type: "expect_outbound",
           label: `prompt.offer:${promptOrdinal}`,
@@ -2316,7 +2336,10 @@ async function recordClaudeForkSessionQuery(input: {
       const continuationIterator = continuationRuntime[Symbol.asyncIterator]();
       for (const prompt of input.prompts.slice(forkPromptEnd)) {
         promptOrdinal += 1;
-        const continuationMessage = ClaudeAdapterV2.makeClaudeUserMessage({ text: prompt });
+        const continuationMessage = ClaudeAdapterV2.makeClaudeUserMessage({
+          origin: { kind: "human" },
+          text: prompt,
+        });
         input.entries.push({
           type: "expect_outbound",
           label: `prompt.offer:${promptOrdinal}`,
@@ -2404,7 +2427,10 @@ async function recordInterruptedClaudeQuery(input: {
     options,
   });
   const iterator = runtime[Symbol.asyncIterator]();
-  const message = ClaudeAdapterV2.makeClaudeUserMessage({ text: input.prompt });
+  const message = ClaudeAdapterV2.makeClaudeUserMessage({
+    origin: { kind: "human" },
+    text: input.prompt,
+  });
   input.entries.push({
     type: "expect_outbound",
     label: input.promptOfferLabel,
@@ -2580,7 +2606,10 @@ async function recordClaudeInterruptRestartQuery(input: {
     label: "query.open:2",
     frame: makeClaudeQueryOpenFrame({ options: secondOptions }),
   });
-  const secondMessage = ClaudeAdapterV2.makeClaudeUserMessage({ text: input.prompts[1]! });
+  const secondMessage = ClaudeAdapterV2.makeClaudeUserMessage({
+    origin: { kind: "human" },
+    text: input.prompts[1]!,
+  });
   input.entries.push({
     type: "expect_outbound",
     label: "prompt.offer:2",
@@ -2879,6 +2908,62 @@ export const ClaudeOrchestratorReplayHarness: OrchestratorV2ProviderReplayHarnes
   driver: ClaudeAdapterV2.CLAUDE_PROVIDER,
   decodeTranscript: (transcript) =>
     decodeClaudeAgentSdkReplayTranscript(transcript).pipe(
+      Effect.map((decoded) => ({
+        ...decoded,
+        // Older recordings used keyboard prompts without SDK origin and packed
+        // portable history into them. Upgrade expectations, retaining strict
+        // origin comparisons for both legacy and current recordings.
+        entries: decoded.entries.flatMap((entry) => {
+          if (
+            entry.type !== "expect_outbound" ||
+            typeof entry.frame !== "object" ||
+            entry.frame === null ||
+            Reflect.get(entry.frame, "type") !== "prompt.offer"
+          )
+            return [entry];
+          const message: unknown = Reflect.get(entry.frame, "message");
+          if (
+            !isClaudeSdkReplayMessage(message) ||
+            message.type !== "user" ||
+            message.origin !== undefined
+          )
+            return [entry];
+          const content = message.message.content;
+          const marker = "\n\nUser message:\n";
+          const split =
+            typeof content === "string" && content.startsWith("Context handoff (")
+              ? content.lastIndexOf(marker)
+              : -1;
+          if (split === -1 || typeof content !== "string")
+            return [
+              {
+                ...entry,
+                frame: makeClaudePromptOfferFrame({ ...message, origin: { kind: "human" } }),
+              },
+            ];
+          return [
+            {
+              type: "expect_outbound" as const,
+              frame: makeClaudePromptOfferFrame({
+                ...ClaudeAdapterV2.makeClaudeUserMessage({
+                  text: content.slice(0, split),
+                  origin: { kind: "unclassified" },
+                }),
+                isSynthetic: true,
+                shouldQuery: false,
+              }),
+            },
+            {
+              ...entry,
+              frame: makeClaudePromptOfferFrame({
+                ...message,
+                origin: { kind: "human" },
+                message: { ...message.message, content: content.slice(split + marker.length) },
+              }),
+            },
+          ];
+        }),
+      })),
       Effect.mapError(
         (cause) =>
           new ClaudeReplayTranscriptDecodeError({

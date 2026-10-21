@@ -833,11 +833,33 @@ export const makeClaudeCloudQueryRunner = Effect.fn("makeClaudeCloudQueryRunner"
               }
               if (typeof payload.type !== "string" || !relayedTypes.has(payload.type)) continue;
               if (payload.type === "result") {
-                yield* updateBinding((current) => ({
-                  ...current,
-                  pendingTurn: { ...current.pendingTurn, resultSequence: event.sequence_num },
-                }));
-                active = false;
+                const promptUuid = binding.pendingTurn?.promptUuid;
+                const echoed = Array.isArray(payload.user_message_uuids)
+                  ? payload.user_message_uuids.filter(
+                      (uuid): uuid is string => typeof uuid === "string",
+                    )
+                  : typeof payload.user_message_uuid === "string"
+                    ? [payload.user_message_uuid]
+                    : [];
+                const origin = payload.origin;
+                // Stale wake results still reach the adapter's filter, but must
+                // not close transport admission for the actual pending prompt.
+                const foreign =
+                  promptUuid !== undefined &&
+                  (echoed.length > 0
+                    ? !echoed.includes(promptUuid)
+                    : payload.num_turns === 0 &&
+                      typeof origin === "object" &&
+                      origin !== null &&
+                      "kind" in origin &&
+                      origin.kind === "task-notification");
+                if (!foreign) {
+                  yield* updateBinding((current) => ({
+                    ...current,
+                    pendingTurn: { ...current.pendingTurn, resultSequence: event.sequence_num },
+                  }));
+                  active = false;
+                }
               }
               // The adapter owns a local UUID; the persisted binding owns the remote session ID.
               const message = { ...payload, session_id: nativeId } as SDKMessage;
@@ -1049,7 +1071,7 @@ export const makeClaudeCloudQueryRunner = Effect.fn("makeClaudeCloudQueryRunner"
                     yield* Queue.offer(pollWake, undefined);
                   }).pipe(admission.withPermits(1), Effect.mapError(wrap("recover"))),
                 }),
-            offer: (message, durableCloudSequence) =>
+            offer: (message, durableCloudSequence, contextMessages = []) =>
               Effect.gen(function* () {
                 if (closed || !usable || recoveryPending)
                   return yield* new ClaudeCloudGuardError({
@@ -1156,7 +1178,9 @@ export const makeClaudeCloudQueryRunner = Effect.fn("makeClaudeCloudQueryRunner"
                   });
                 active = true;
                 yield* request(`${sessionPath}/events`, {
-                  events: [{ payload: { ...forwarded, session_id: binding.cloudId } }],
+                  events: [...contextMessages, forwarded].map((entry) => ({
+                    payload: { ...entry, session_id: binding.cloudId },
+                  })),
                 }).pipe(
                   // A failed response does not prove the prompt was rejected. Keep reading
                   // this conversation instead of interrupting it or posting the prompt twice.

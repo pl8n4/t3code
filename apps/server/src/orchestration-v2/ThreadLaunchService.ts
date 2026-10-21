@@ -68,6 +68,7 @@ export type ThreadLaunchWorkspaceStrategy =
 export interface ThreadLaunchInitialMessage {
   readonly messageId?: MessageId;
   readonly scheduledTaskId?: ScheduledTaskId;
+  readonly scheduledTaskTrigger?: import("@t3tools/contracts").OrchestrationV2ConversationMessage["scheduledTaskTrigger"];
   readonly senderThreadId?: ThreadId;
   readonly text: string;
   readonly attachments: ReadonlyArray<ChatAttachment>;
@@ -971,6 +972,9 @@ const make = Effect.gen(function* () {
               ...(input.initialMessage.scheduledTaskId === undefined
                 ? {}
                 : { scheduledTaskId: input.initialMessage.scheduledTaskId }),
+              ...(input.initialMessage.scheduledTaskTrigger === undefined
+                ? {}
+                : { scheduledTaskTrigger: input.initialMessage.scheduledTaskTrigger }),
               ...(input.initialMessage.senderThreadId === undefined
                 ? {}
                 : { senderThreadId: input.initialMessage.senderThreadId }),

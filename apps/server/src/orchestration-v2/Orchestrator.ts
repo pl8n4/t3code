@@ -1674,6 +1674,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           ...(queuedMessage.scheduledTaskId === undefined
             ? {}
             : { scheduledTaskId: queuedMessage.scheduledTaskId }),
+          ...(queuedMessage.scheduledTaskTrigger === undefined
+            ? {}
+            : { scheduledTaskTrigger: queuedMessage.scheduledTaskTrigger }),
           ...(queuedMessage.senderThreadId === undefined
             ? {}
             : { senderThreadId: queuedMessage.senderThreadId }),
@@ -3816,6 +3819,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     readonly createdBy: OrchestrationV2ConversationMessage["createdBy"];
     readonly creationSource: OrchestrationV2ConversationMessage["creationSource"];
     readonly scheduledTaskId?: OrchestrationV2ConversationMessage["scheduledTaskId"];
+    readonly scheduledTaskTrigger?: OrchestrationV2ConversationMessage["scheduledTaskTrigger"];
     readonly senderThreadId?: OrchestrationV2ConversationMessage["senderThreadId"];
     readonly delegatedCompletion?: OrchestrationV2ConversationMessage["delegatedCompletion"];
     readonly forceRestart: boolean;
@@ -3970,6 +3974,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             ...(input.scheduledTaskId === undefined
               ? {}
               : { scheduledTaskId: input.scheduledTaskId }),
+            ...(input.scheduledTaskTrigger === undefined
+              ? {}
+              : { scheduledTaskTrigger: input.scheduledTaskTrigger }),
             ...(input.senderThreadId === undefined ? {} : { senderThreadId: input.senderThreadId }),
             id: input.messageId,
             threadId: input.command.threadId,
@@ -3989,6 +3996,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             ...(input.scheduledTaskId === undefined
               ? {}
               : { scheduledTaskId: input.scheduledTaskId }),
+            ...(input.scheduledTaskTrigger === undefined
+              ? {}
+              : { scheduledTaskTrigger: input.scheduledTaskTrigger }),
             ...(input.senderThreadId === undefined ? {} : { senderThreadId: input.senderThreadId }),
             id: idAllocator.derive.userTurnItem({ messageId: input.messageId }),
             threadId: input.command.threadId,
@@ -4925,6 +4935,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           ...(command.scheduledTaskId === undefined
             ? {}
             : { scheduledTaskId: command.scheduledTaskId }),
+          ...(command.scheduledTaskTrigger === undefined
+            ? {}
+            : { scheduledTaskTrigger: command.scheduledTaskTrigger }),
           ...(command.senderThreadId === undefined
             ? {}
             : { senderThreadId: command.senderThreadId }),
@@ -5124,6 +5137,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           ...(command.scheduledTaskId === undefined
             ? {}
             : { scheduledTaskId: command.scheduledTaskId }),
+          ...(command.scheduledTaskTrigger === undefined
+            ? {}
+            : { scheduledTaskTrigger: command.scheduledTaskTrigger }),
           ...(command.senderThreadId === undefined
             ? {}
             : { senderThreadId: command.senderThreadId }),
@@ -5468,6 +5484,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           ...(command.scheduledTaskId === undefined
             ? {}
             : { scheduledTaskId: command.scheduledTaskId }),
+          ...(command.scheduledTaskTrigger === undefined
+            ? {}
+            : { scheduledTaskTrigger: command.scheduledTaskTrigger }),
           ...(command.senderThreadId === undefined
             ? {}
             : { senderThreadId: command.senderThreadId }),
@@ -5491,6 +5510,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           ...(command.scheduledTaskId === undefined
             ? {}
             : { scheduledTaskId: command.scheduledTaskId }),
+          ...(command.scheduledTaskTrigger === undefined
+            ? {}
+            : { scheduledTaskTrigger: command.scheduledTaskTrigger }),
           ...(command.senderThreadId === undefined
             ? {}
             : { senderThreadId: command.senderThreadId }),
@@ -6162,6 +6184,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         ...(command.scheduledTaskId === undefined
           ? {}
           : { scheduledTaskId: command.scheduledTaskId }),
+        ...(command.scheduledTaskTrigger === undefined
+          ? {}
+          : { scheduledTaskTrigger: command.scheduledTaskTrigger }),
         ...(command.senderThreadId === undefined ? {} : { senderThreadId: command.senderThreadId }),
         id: command.messageId,
         threadId: command.threadId,
@@ -6183,6 +6208,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         ...(command.scheduledTaskId === undefined
           ? {}
           : { scheduledTaskId: command.scheduledTaskId }),
+        ...(command.scheduledTaskTrigger === undefined
+          ? {}
+          : { scheduledTaskTrigger: command.scheduledTaskTrigger }),
         ...(command.senderThreadId === undefined ? {} : { senderThreadId: command.senderThreadId }),
         id: idAllocator.derive.userTurnItem({ messageId: command.messageId }),
         threadId: command.threadId,
@@ -7512,8 +7540,8 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             messageId: MessageId.make(`async-answer:${command.requestId}`),
             text: replies.join("\n\n"),
             attachments: [],
-            createdBy: "user",
-            creationSource: "server",
+            createdBy: command.createdBy ?? "user",
+            creationSource: command.creationSource ?? "server",
             dispatchMode,
           },
           events,
@@ -7709,6 +7737,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         ...(queuedMessage.scheduledTaskId === undefined
           ? {}
           : { scheduledTaskId: queuedMessage.scheduledTaskId }),
+        ...(queuedMessage.scheduledTaskTrigger === undefined
+          ? {}
+          : { scheduledTaskTrigger: queuedMessage.scheduledTaskTrigger }),
         ...(queuedMessage.senderThreadId === undefined
           ? {}
           : { senderThreadId: queuedMessage.senderThreadId }),

@@ -56,6 +56,25 @@ const readRestartTranscript = Effect.fn("readRestartTranscript")(function* (
   }
   const { sessionId: _sessionId, ...resumeOptions } = queryOptions as Record<string, unknown>;
   const resumedTurn = (label: string, text: string): ReadonlyArray<ProviderReplayEntry> => [
+    ...(text.startsWith(NOTE)
+      ? [
+          {
+            type: "expect_outbound" as const,
+            label: `prompt.context:${label}`,
+            frame: {
+              type: "prompt.offer",
+              message: {
+                type: "user",
+                parent_tool_use_id: null,
+                origin: { kind: "unclassified" },
+                isSynthetic: true,
+                shouldQuery: false,
+                message: { role: "user", content: NOTE },
+              },
+            },
+          },
+        ]
+      : []),
     {
       type: "expect_outbound",
       label: `prompt.offer:${label}`,
@@ -63,7 +82,11 @@ const readRestartTranscript = Effect.fn("readRestartTranscript")(function* (
         type: "prompt.offer",
         message: {
           type: "user",
-          message: { role: "user", content: text },
+          message: {
+            role: "user",
+            content: text.startsWith(NOTE) ? text.slice(`${NOTE}\n\nUser message:\n`.length) : text,
+          },
+          origin: { kind: "human" },
           parent_tool_use_id: null,
         },
       },

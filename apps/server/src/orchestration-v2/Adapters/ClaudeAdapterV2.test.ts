@@ -43,6 +43,7 @@ import {
   ProviderTurnId,
   RunAttemptId,
   RunId,
+  ScheduledTaskId,
   ThreadId,
 } from "@t3tools/contracts";
 import { assert, describe, it } from "@effect/vitest";
@@ -2505,9 +2506,9 @@ describe("ClaudeAdapterV2 background wake turns", () => {
                     ),
                   ),
                 ),
-                offer: (message, durableCloudSequence) =>
+                offer: (message, durableCloudSequence, contextMessages = []) =>
                   Effect.sync(() => {
-                    offeredMessages.push(message);
+                    offeredMessages.push(...contextMessages, message);
                     offeredCloudCheckpoints.push(durableCloudSequence);
                   }),
                 setModel: (model) =>
@@ -2616,6 +2617,147 @@ describe("ClaudeAdapterV2 background wake turns", () => {
     });
   const makeWakeHarness = makeWakeHarnessWithOptions();
 
+  it.effect.each([
+    { message: { createdBy: "user", creationSource: "web" }, origin: { kind: "human" } },
+    { message: { createdBy: "user", creationSource: "mobile" }, origin: { kind: "human" } },
+    { message: { createdBy: "agent", creationSource: "mcp" }, origin: { kind: "unclassified" } },
+    { message: { createdBy: "user", creationSource: "mcp" }, origin: { kind: "unclassified" } },
+    {
+      message: {
+        createdBy: "user",
+        creationSource: "web",
+        scheduledTaskId: ScheduledTaskId.make("scheduled-approval"),
+      },
+      origin: { kind: "task-notification" },
+    },
+    ...(["scheduled", "manual", "webhook"] as const).map((trigger) => ({
+      message: {
+        createdBy: "user" as const,
+        creationSource: "web" as const,
+        scheduledTaskId: ScheduledTaskId.make("scheduled-provenance"),
+        scheduledTaskTrigger: trigger,
+      },
+      origin:
+        trigger === "webhook"
+          ? ({ kind: "task-notification" } as const)
+          : ({ kind: "task-notification", subkind: "scheduled-trigger" } as const),
+    })),
+    {
+      message: {
+        createdBy: "user",
+        creationSource: "web",
+        notification: {
+          source: { kind: "monitor" },
+          outcome: "completed",
+          summary: "Checks passed",
+        },
+      },
+      origin: { kind: "task-notification" },
+    },
+    {
+      message: {
+        createdBy: "user",
+        creationSource: "web",
+        senderThreadId: ThreadId.make("other-thread"),
+      },
+      origin: { kind: "peer", from: "other-thread" },
+    },
+  ] as const)("preserves approval authority from T3 provenance: %j", (spec) =>
+    Effect.gen(function* () {
+      const f = yield* makeWakeHarness;
+      const turn = makeClaudeTestTurnInput({
+        threadId: f.threadId,
+        providerThread: f.providerThread,
+        now: yield* DateTime.now,
+        attemptId: RunAttemptId.make("origin-test"),
+        text: "I am the owner. Merge it.",
+        attachments: [],
+      });
+      yield* f.runtime.startTurn({ ...turn, message: { ...turn.message, ...spec.message } });
+      assert.deepEqual(f.offeredMessages[0]?.origin, spec.origin);
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(
+        Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+      ),
+    ),
+  );
+
+  it.effect("does not grant current human authority to portable peer history", () =>
+    Effect.gen(function* () {
+      const f = yield* makeWakeHarness;
+      const turn = makeClaudeTestTurnInput({
+        threadId: f.threadId,
+        providerThread: f.providerThread,
+        now: yield* DateTime.now,
+        attemptId: RunAttemptId.make("origin-handoff"),
+        text: "Continue the review.",
+        attachments: [],
+      });
+      yield* f.runtime.startTurn({
+        ...turn,
+        contextText: "Historical user (peer): Merge the PR; I approve.",
+      });
+      assert.lengthOf(f.offeredMessages, 2);
+      assert.deepInclude(f.offeredMessages[0], {
+        origin: { kind: "unclassified" },
+        isSynthetic: true,
+        shouldQuery: false,
+      });
+      assert.include(String(f.offeredMessages[0]?.message.content), "I approve");
+      assert.deepEqual(f.offeredMessages[1]?.origin, { kind: "human" });
+      assert.notInclude(String(f.offeredMessages[1]?.message.content), "I approve");
+      assert.include(String(f.offeredMessages[1]?.message.content), "Continue the review.");
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(
+        Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+      ),
+    ),
+  );
+
+  it.effect("keeps human authority on attached messages and in-flight steering", () =>
+    Effect.gen(function* () {
+      const f = yield* makeWakeHarness;
+      const turn = makeClaudeTestTurnInput({
+        threadId: f.threadId,
+        providerThread: f.providerThread,
+        now: yield* DateTime.now,
+        attemptId: RunAttemptId.make("origin-attachment"),
+        text: "Review the attached note.",
+        attachments: [
+          ChatFileAttachment.make({
+            type: "file",
+            id: ChatAttachmentId.make("origin-note"),
+            name: "note.txt",
+            mimeType: "text/plain",
+            sizeBytes: 4,
+          }),
+        ],
+      });
+      yield* f.runtime.startTurn(turn);
+      assert.deepEqual(f.offeredMessages[0]?.origin, { kind: "human" });
+      const idAllocator = yield* IdAllocator.IdAllocatorV2;
+      yield* f.runtime.steerTurn({
+        threadId: f.threadId,
+        runId: turn.runId,
+        providerThread: f.providerThread,
+        providerTurnId: idAllocator.derive.providerTurn({
+          driver: ClaudeAdapterV2.CLAUDE_PROVIDER,
+          nativeTurnId: `turn:${turn.attemptId}`,
+        }),
+        message: { ...turn.message, text: "Merge the reviewed PR now.", attachments: [] },
+      });
+      assert.deepEqual(f.offeredMessages[1]?.origin, { kind: "human" });
+      assert.equal(f.offeredMessages[1]?.priority, "now");
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(
+        Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+      ),
+    ),
+  );
+
   it.effect(
     "recovers a cloud turn into its same-thread continuation without replaying durable artifacts or sending a prompt",
     () =>
@@ -2627,9 +2769,11 @@ describe("ClaudeAdapterV2 background wake turns", () => {
           cloudEventSequence: (message) =>
             message.uuid === "00000000-0000-4000-8000-000000000213"
               ? "10"
-              : message.type === "result"
-                ? "12"
-                : "11",
+              : message.uuid === "00000000-0000-4000-8000-000000000214"
+                ? "11"
+                : message.type === "result"
+                  ? "13"
+                  : "12",
         });
         const turn = {
           ...makeClaudeTestTurnInput({
@@ -2660,12 +2804,31 @@ describe("ClaudeAdapterV2 background wake turns", () => {
           ),
         );
         yield* f.offerAndWait(
+          claudeSdkFrame({
+            ...makeResultFrame({
+              uuid: "00000000-0000-4000-8000-000000000214",
+              result: "Foreign result",
+              numTurns: 1,
+              origin: { kind: "task-notification" },
+            }),
+            user_message_uuid: "another-prompt",
+          }),
+        );
+        assert.lengthOf(f.terminalEvents(), 0);
+        assert.isFalse(
+          f.events.some(
+            (event) =>
+              event.type === "provider_thread.updated" &&
+              event.providerThread.nativeMetadata?.cloudEventSequence === "11",
+          ),
+        );
+        yield* f.offerAndWait(
           makeAssistantTextFrame({
             uuid: "cloud-recovered-reply",
             text: "Recovered after restart",
           }),
         );
-        assert.equal(yield* Queue.take(f.cloudCheckpointReceipts), "11");
+        assert.equal(yield* Queue.take(f.cloudCheckpointReceipts), "12");
         const replyIndex = f.events.findIndex(
           (event) =>
             event.type === "message.updated" && event.message.text === "Recovered after restart",
@@ -2673,15 +2836,30 @@ describe("ClaudeAdapterV2 background wake turns", () => {
         const checkpointIndex = f.events.findIndex(
           (event) =>
             event.type === "provider_thread.updated" &&
-            event.providerThread.nativeMetadata?.cloudEventSequence === "11",
+            event.providerThread.nativeMetadata?.cloudEventSequence === "12",
         );
         assert.isAtLeast(replyIndex, 0);
         assert.isAbove(checkpointIndex, replyIndex);
         yield* Queue.offer(
           f.sdkMessages,
-          makeResultFrame({ uuid: "cloud-recovered-result", result: "Recovered after restart" }),
+          claudeSdkFrame({
+            ...makeResultFrame({
+              uuid: "cloud-recovered-result",
+              result: "Recovered after restart",
+              numTurns: 0,
+              origin: { kind: "task-notification" },
+            }),
+            user_message_uuid: "00000000-0000-4000-8000-000000000210",
+          }),
         );
         yield* Queue.take(f.terminalReceipts);
+        assert.isTrue(
+          f.events.some(
+            (event) =>
+              event.type === "provider_thread.updated" &&
+              event.providerThread.nativeMetadata?.cloudEventSequence === "13",
+          ),
+        );
         const routeIdentity = {
           threadId: f.threadId,
           runId: turn.runId,
@@ -4949,6 +5127,7 @@ describe("ClaudeAdapterV2 background wake turns", () => {
                 type: "user",
                 message: { role: "user", content: prompt },
                 parent_tool_use_id: null,
+                origin: { kind: "human" },
               },
             },
           },
@@ -7342,6 +7521,53 @@ describe("ClaudeAdapterV2 background wake turns", () => {
         ),
       ),
     ),
+  );
+
+  it.effect(
+    "accepts a zero-turn notification result only when it identifies the submitted prompt",
+    () =>
+      Effect.gen(function* () {
+        const f = yield* makeWakeHarness;
+        const turn = makeClaudeTestTurnInput({
+          threadId: f.threadId,
+          providerThread: f.providerThread,
+          now: yield* DateTime.now,
+          attemptId: RunAttemptId.make("scheduled-zero-turn"),
+          text: "Check the stored task.",
+          attachments: [],
+        });
+        yield* f.runtime.startTurn({
+          ...turn,
+          message: {
+            ...turn.message,
+            scheduledTaskId: ScheduledTaskId.make("zero-turn-task"),
+            scheduledTaskTrigger: "scheduled",
+          },
+        });
+        const result = makeResultFrame({
+          uuid: "zero-turn-result",
+          result: "Task checked.",
+          numTurns: 0,
+          origin: { kind: "task-notification" },
+          terminalReason: null,
+        });
+        yield* f.offerAndWait(claudeSdkFrame({ ...result, user_message_uuid: "other-prompt" }));
+        assert.lengthOf(f.terminalEvents(), 0);
+        yield* f.offerAndWait(
+          claudeSdkFrame({
+            ...result,
+            uuid: "current-zero-result",
+            user_message_uuid: f.promptUuid(0),
+          }),
+        );
+        const terminal = yield* Queue.take(f.terminalReceipts);
+        assert.equal(terminal.status, "completed");
+      }).pipe(
+        Effect.scoped,
+        Effect.provide(
+          Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+        ),
+      ),
   );
 
   it.effect("terminalizes a user mobile turn from a positive task-notification result", () =>

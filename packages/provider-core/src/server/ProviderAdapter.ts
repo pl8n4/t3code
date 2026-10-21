@@ -61,7 +61,9 @@ export const ProviderAdapterV2TurnMessage = Schema.Struct({
   attachments: Schema.Array(ChatAttachment),
   createdBy: OrchestrationV2ConversationMessage.fields.createdBy,
   creationSource: OrchestrationV2ConversationMessage.fields.creationSource,
+  notification: OrchestrationV2ConversationMessage.fields.notification,
   scheduledTaskId: OrchestrationV2ConversationMessage.fields.scheduledTaskId,
+  scheduledTaskTrigger: OrchestrationV2ConversationMessage.fields.scheduledTaskTrigger,
   senderThreadId: OrchestrationV2ConversationMessage.fields.senderThreadId,
 });
 export type ProviderAdapterV2TurnMessage = typeof ProviderAdapterV2TurnMessage.Type;
@@ -421,6 +423,7 @@ export interface ProviderAdapterV2TurnInput {
   readonly rootNodeId: NodeId;
   readonly providerThread: OrchestrationV2ProviderThread;
   readonly message: ProviderAdapterV2TurnMessage;
+  readonly contextText?: string;
   readonly modelSelection: ModelSelection;
   readonly runtimePolicy: ProviderAdapterV2RuntimePolicy;
   readonly appContext?: ReadonlyArray<{ readonly key: string; readonly text: string }>;
@@ -588,6 +591,8 @@ export interface ProviderAdapterV2SessionRuntime {
       readonly providerThread: OrchestrationV2ProviderThread;
     },
   ) => Effect.Effect<boolean, ProviderAdapterV2Error>;
+  /** Keep portable history outside the current message's authorship envelope. */
+  readonly separatePromptContext?: true;
   readonly startTurn: (
     input: ProviderAdapterV2TurnInput,
   ) => Effect.Effect<void, ProviderAdapterV2Error>;

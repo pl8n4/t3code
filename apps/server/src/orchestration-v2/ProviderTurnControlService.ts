@@ -364,9 +364,15 @@ export const layer: Layer.Layer<
                 attachments: message.attachments,
                 createdBy: message.createdBy,
                 creationSource: message.creationSource,
+                ...(message.notification === undefined
+                  ? {}
+                  : { notification: message.notification }),
                 ...(message.scheduledTaskId === undefined
                   ? {}
                   : { scheduledTaskId: message.scheduledTaskId }),
+                ...(message.scheduledTaskTrigger === undefined
+                  ? {}
+                  : { scheduledTaskTrigger: message.scheduledTaskTrigger }),
                 ...(message.senderThreadId === undefined
                   ? {}
                   : { senderThreadId: message.senderThreadId }),

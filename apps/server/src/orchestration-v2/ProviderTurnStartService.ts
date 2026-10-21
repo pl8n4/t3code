@@ -1192,9 +1192,13 @@ export const layer: Layer.Layer<
           const { restartContinuationOfRunId: _resumedRunId, ...promptedInput } = turnInput;
           yield* start({
             ...(noteContinuation && !cloudContinuation ? promptedInput : turnInput),
+            ...(session.separatePromptContext && context !== "" ? { contextText: context } : {}),
             message: {
               ...turnInput.message,
-              text: context === "" ? userText : `${context}\n\nUser message:\n${userText}`,
+              text:
+                context === "" || session.separatePromptContext
+                  ? userText
+                  : `${context}\n\nUser message:\n${userText}`,
             },
           }).pipe(
             // A pending marker would make the next turn abandon this native
@@ -1305,9 +1309,13 @@ export const layer: Layer.Layer<
           attachments: message.attachments,
           createdBy: message.createdBy,
           creationSource: message.creationSource,
+          ...(message.notification === undefined ? {} : { notification: message.notification }),
           ...(message.scheduledTaskId === undefined
             ? {}
             : { scheduledTaskId: message.scheduledTaskId }),
+          ...(message.scheduledTaskTrigger === undefined
+            ? {}
+            : { scheduledTaskTrigger: message.scheduledTaskTrigger }),
           ...(message.senderThreadId === undefined
             ? {}
             : { senderThreadId: message.senderThreadId }),

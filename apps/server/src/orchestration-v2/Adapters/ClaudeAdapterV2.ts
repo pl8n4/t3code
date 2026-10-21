@@ -418,6 +418,7 @@ export interface ClaudeAgentSdkQuerySession {
   readonly offer: (
     message: SDKUserMessage,
     durableCloudSequence?: string,
+    contextMessages?: ReadonlyArray<SDKUserMessage>,
   ) => Effect.Effect<void, ClaudeAgentSdkQueryRunnerError>;
   readonly cloudEventSequence?: (message: SDKMessage) => string | undefined;
   readonly cloudEventWasDurable?: (message: SDKMessage) => boolean;
@@ -855,18 +856,20 @@ export const layerQueryRunner: Layer.Layer<
               }),
             ),
           ),
-          offer: (message) =>
-            Queue.offer(promptQueue, message).pipe(
+          offer: (message, _durableCloudSequence, contextMessages = []) =>
+            Queue.offerAll(promptQueue, [...contextMessages, message]).pipe(
               Effect.asVoid,
               Effect.tap(() =>
-                logProtocolEvent({
-                  direction: "outgoing",
-                  stage: "decoded",
-                  payload: {
-                    type: "prompt.offer",
-                    message,
-                  },
-                }),
+                Effect.forEach([...contextMessages, message], (offered) =>
+                  logProtocolEvent({
+                    direction: "outgoing",
+                    stage: "decoded",
+                    payload: {
+                      type: "prompt.offer",
+                      message: offered,
+                    },
+                  }),
+                ),
               ),
             ),
           setModel: (model) =>
@@ -1557,6 +1560,7 @@ function isSupportedClaudeImageMimeType(
 
 export function makeClaudeUserMessage(input: {
   readonly text: string;
+  readonly origin?: SDKUserMessage["origin"];
   readonly priority?: SDKUserMessage["priority"];
   readonly skillNames?: ReadonlySet<string>;
   readonly uuid?: SDKUserMessage["uuid"];
@@ -1583,6 +1587,7 @@ export function makeClaudeUserMessage(input: {
         : input.text,
     },
     parent_tool_use_id: null,
+    ...(input.origin === undefined ? {} : { origin: input.origin }),
     ...(input.priority === undefined ? {} : { priority: input.priority }),
     ...(input.uuid === undefined ? {} : { uuid: input.uuid }),
   };
@@ -1590,6 +1595,7 @@ export function makeClaudeUserMessage(input: {
 
 const makeClaudeUserMessageWithAttachments = Effect.fnUntraced(function* (input: {
   readonly text: string;
+  readonly origin?: SDKUserMessage["origin"];
   readonly attachments: ReadonlyArray<ChatAttachment>;
   readonly priority?: SDKUserMessage["priority"];
   readonly uuid?: SDKUserMessage["uuid"];
@@ -1600,6 +1606,7 @@ const makeClaudeUserMessageWithAttachments = Effect.fnUntraced(function* (input:
   if (input.attachments.length === 0) {
     return makeClaudeUserMessage({
       text: input.text,
+      ...(input.origin === undefined ? {} : { origin: input.origin }),
       ...(input.skillNames === undefined ? {} : { skillNames: input.skillNames }),
       ...(input.priority === undefined ? {} : { priority: input.priority }),
       ...(input.uuid === undefined ? {} : { uuid: input.uuid }),
@@ -1679,6 +1686,7 @@ const makeClaudeUserMessageWithAttachments = Effect.fnUntraced(function* (input:
       content,
     },
     parent_tool_use_id: null,
+    ...(input.origin === undefined ? {} : { origin: input.origin }),
     ...(input.priority === undefined ? {} : { priority: input.priority }),
     ...(input.uuid === undefined ? {} : { uuid: input.uuid }),
   } satisfies SDKUserMessage;
@@ -1686,6 +1694,25 @@ const makeClaudeUserMessageWithAttachments = Effect.fnUntraced(function* (input:
 
 export function isClaudePromptUuid(value: string): value is NonNullable<SDKUserMessage["uuid"]> {
   return /^[^-]+-[^-]+-[^-]+-[^-]+-[^-]+$/.test(value);
+}
+
+function claudeMessageOrigin(
+  message: ProviderAdapter.ProviderAdapterV2TurnMessage,
+): NonNullable<SDKUserMessage["origin"]> {
+  if (message.scheduledTaskId !== undefined)
+    return message.scheduledTaskTrigger === "scheduled" || message.scheduledTaskTrigger === "manual"
+      ? { kind: "task-notification", subkind: "scheduled-trigger" }
+      : { kind: "task-notification" };
+  if (message.notification !== undefined) return { kind: "task-notification" };
+  if (message.senderThreadId !== undefined) return { kind: "peer", from: message.senderThreadId };
+  // Claude's human-approval gates fail closed when an SDK host omits origin.
+  // Classify from persisted T3 provenance; message text cannot establish authorship.
+  if (
+    message.createdBy === "user" &&
+    (message.creationSource === "web" || message.creationSource === "mobile")
+  )
+    return { kind: "human" };
+  return { kind: "unclassified" };
 }
 
 type ClaudeAssistantContentBlock = SDKAssistantMessage["message"]["content"][number];
@@ -7744,7 +7771,9 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
           if (
             isClaudeTaskNotificationOriginResult(message) &&
             !isClaudeProviderContinuationTurn(context.input) &&
-            message.num_turns === 0
+            message.num_turns === 0 &&
+            (context.promptUuid === null ||
+              !claudeEchoedPromptUuids(message).includes(context.promptUuid))
           ) {
             yield* Effect.logDebug("orchestration-v2.claude-task-notification-result-dropped", {
               providerTurnId: context.providerTurnId,
@@ -7918,6 +7947,18 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
           const message = input.message;
           const context = yield* Ref.get(activeTurn);
           const liveQuery = yield* Ref.get(queryContext);
+          if (
+            context !== null &&
+            context.promptUuid !== null &&
+            context.promptEcho === "confirmed" &&
+            liveQuery?.query === input.query &&
+            message.type === "result"
+          ) {
+            // Recovery confirms attachment to the stream; replay can still
+            // contain terminal results belonging to a different prompt.
+            const echoed = claudeEchoedPromptUuids(message);
+            if (echoed.length > 0 && !echoed.includes(context.promptUuid)) return;
+          }
           if (
             context === null ||
             context.promptUuid === null ||
@@ -8739,6 +8780,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
               promptUuid === null
                 ? null
                 : yield* makeClaudeUserMessageWithAttachments({
+                    origin: claudeMessageOrigin(turnInput.message),
                     text: applyClaudePromptEffortPrefix(
                       turnInput.message.text,
                       compileClaudeModelSelection(turnInput.modelSelection).promptEffort,
@@ -8835,6 +8877,18 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
               yield* querySession.query.offer(
                 userMessage,
                 turnInput.providerThread.nativeMetadata?.cloudEventSequence,
+                turnInput.contextText === undefined
+                  ? []
+                  : [
+                      {
+                        ...makeClaudeUserMessage({
+                          text: turnInput.contextText,
+                          origin: { kind: "unclassified" },
+                        }),
+                        isSynthetic: true,
+                        shouldQuery: false,
+                      },
+                    ],
               );
               return;
             }
@@ -9101,6 +9155,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
               });
             }
             const userMessage = yield* makeClaudeUserMessageWithAttachments({
+              origin: claudeMessageOrigin(turnInput.message),
               text: applyClaudePromptEffortPrefix(
                 turnInput.message.text,
                 compileClaudeModelSelection(currentTurn.input.modelSelection).promptEffort,
@@ -9200,6 +9255,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
             resolveClaudeCatalogContextWindowTokens(BUNDLED_CLAUDE_MODEL_CATALOG, selection),
           events: Stream.fromEffectRepeat(Queue.take(events)),
           backgroundTasksEndWithProcess: true,
+          separatePromptContext: true,
           hasPendingBackgroundWork: Effect.gen(function* () {
             for (const roster of (yield* Ref.get(pendingBackgroundTasksByNativeThread)).values()) {
               if (roster.size > 0) {

@@ -379,6 +379,8 @@ it.effect.each(
       const wire = yield* encodeThreadProjection(projection);
       assert.equal(wire.messages[0]?.text, task.prompt);
       assert.equal(wire.messages[0]?.scheduledTaskId, task.id);
+      assert.equal(wire.messages[0]?.scheduledTaskTrigger, "manual");
+      assert.isUndefined(wire.messages[0]?.notification);
       assert.equal(wire.messages[0]?.createdBy, createdBy);
       const turnItem = wire.turnItems.find(
         (item): item is Extract<typeof item, { type: "user_message" }> =>
@@ -386,6 +388,7 @@ it.effect.each(
       );
       assert.equal(turnItem?.text, task.prompt);
       assert.equal(turnItem?.scheduledTaskId, task.id);
+      assert.equal(turnItem?.scheduledTaskTrigger, "manual");
     }).pipe(Effect.provide(Layer.mergeAll(harness.layer, layerScheduledTasks)));
   },
 );
@@ -410,6 +413,7 @@ it.effect("retains automation and sender attribution while a message waits in th
       threadId: launched.threadId,
       messageId: MessageId.make("message:automation:queued"),
       scheduledTaskId,
+      scheduledTaskTrigger: "webhook",
       senderThreadId,
       text: "Run the audit",
       attachments: [],
@@ -421,6 +425,7 @@ it.effect("retains automation and sender attribution while a message waits in th
     const projection = yield* threads.getThreadProjection(launched.threadId);
     const message = projection.messages.find((item) => item.id === queued.message.id);
     assert.equal(message?.scheduledTaskId, scheduledTaskId);
+    assert.equal(message?.scheduledTaskTrigger, "webhook");
     assert.equal(message?.senderThreadId, senderThreadId);
     assert.equal(message?.text, "Run the audit");
   }).pipe(Effect.provide(harness.layer));
