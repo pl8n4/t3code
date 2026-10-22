@@ -62,6 +62,7 @@ function fixture(input?: {
   appliedEffortOverride?: EffortLevel;
   reasoningFails?: boolean;
   promptResponseLost?: boolean;
+  contextResponseLost?: boolean;
   promptRejectStatus?: number;
   requirePersistentProfile?: boolean;
   rejectReusedTab?: boolean;
@@ -71,10 +72,18 @@ function fixture(input?: {
   const workspaceRelease = Promise.withResolvers<void>();
   const recoveryEntered = Promise.withResolvers<void>();
   const recoveryRelease = Promise.withResolvers<void>();
+  const contextPostEntered = Promise.withResolvers<void>();
+  const contextPostRelease = Promise.withResolvers<void>();
   let holdWorkspace = false;
   let holdRecovery = false;
+  let holdContextPost = false;
   let usage: unknown = input?.paid ? { ...funded(), extra_usage: { is_enabled: true } } : funded();
-  const calls: Array<{ path: string; method: string; body?: unknown }> = [];
+  const calls: Array<{
+    path: string;
+    method: string;
+    body?: unknown;
+    headers: Headers;
+  }> = [];
   let sent = false;
   const rpcCalls: Array<Record<string, unknown>> = [];
   const evaluations: string[] = [];
@@ -102,7 +111,7 @@ function fixture(input?: {
   const fetch = async (url: string, init?: RequestInit) => {
     const method = init?.method ?? "GET";
     const body = typeof init?.body === "string" ? decodeJson(init.body) : undefined;
-    calls.push({ path: url, method, body });
+    calls.push({ path: url, method, body, headers: new Headers(init?.headers) });
     if (url.endsWith("/usage"))
       return input?.requirePersistentProfile && openedProfiles.at(-1) !== "default"
         ? Response.json({}, { status: 403 })
@@ -231,8 +240,24 @@ function fixture(input?: {
         }
       }
       if (
-        (body as { events?: { payload: { type: string } }[] })?.events?.some(
-          (e) => e.payload.type === "user",
+        holdContextPost &&
+        (body as { events?: { payload: { shouldQuery?: boolean } }[] })?.events?.some(
+          (e) => e.payload.shouldQuery === false,
+        )
+      ) {
+        contextPostEntered.resolve();
+        await contextPostRelease.promise;
+      }
+      if (
+        input?.contextResponseLost &&
+        (body as { events?: { payload: { type: string; shouldQuery?: boolean } }[] })?.events?.some(
+          (e) => e.payload.type === "user" && e.payload.shouldQuery === false,
+        )
+      )
+        throw new Error("Injected lost context response");
+      if (
+        (body as { events?: { payload: { type: string; shouldQuery?: boolean } }[] })?.events?.some(
+          (e) => e.payload.type === "user" && e.payload.shouldQuery !== false,
         )
       ) {
         if (input?.promptRejectStatus !== undefined)
@@ -465,12 +490,42 @@ function fixture(input?: {
       },
       waitRecovery: Effect.promise(() => recoveryEntered.promise),
       releaseRecovery: () => recoveryRelease.resolve(),
+      holdContextPost: () => {
+        holdContextPost = true;
+      },
+      waitContextPost: Effect.promise(() => contextPostEntered.promise),
+      releaseContextPost: () => contextPostRelease.resolve(),
       runner,
       open,
       calls,
       rpcCalls,
       evaluations,
       readBinding: fs.readFileString(bindingPath).pipe(Effect.map(decodeJson)),
+      saveLegacyContextAcknowledgement: fs.readFileString(bindingPath).pipe(
+        Effect.map(decodeJson),
+        Effect.flatMap((saved) => {
+          const binding = saved as { sequence: string; inbox?: unknown[] };
+          return fs.writeFileString(
+            bindingPath,
+            json({
+              ...binding,
+              inbox: [
+                ...(binding.inbox ?? []),
+                {
+                  event_id: "legacy-context-ack",
+                  sequence_num: binding.sequence,
+                  payload: {
+                    type: "result",
+                    num_turns: 0,
+                    result: "",
+                    origin: { kind: "peer", from: "unknown" },
+                  },
+                },
+              ],
+            }),
+          );
+        }),
+      ),
       toolResponses,
       sentModels,
       driftRuntimeModel: (model: string) => {
@@ -587,6 +642,72 @@ const run = <A, E>(
 ) => effect.pipe(Effect.scoped, Effect.provide(NodeServices.layer));
 
 describe("Claude cloud guarded transport", () => {
+  it.effect("reopens a binding containing only a legacy non-query context acknowledgement", () =>
+    run(
+      Effect.gen(function* () {
+        const f = yield* fixture();
+        const session = yield* f.open();
+        yield* session.close;
+        yield* f.saveLegacyContextAcknowledgement;
+        const resumed = yield* f.open({ resume: true });
+        expect(resumed.pendingCloudTurn).toBeUndefined();
+        expect(yield* f.readBinding).toMatchObject({ inbox: [] });
+        yield* resumed.close;
+      }),
+    ),
+  );
+  it.effect("ignores an idle supporting-context acknowledgement before the next prompt", () =>
+    run(
+      Effect.gen(function* () {
+        const promptUuid = "00000000-0000-4000-8000-000000000802";
+        const f = yield* fixture({
+          events: [
+            {
+              event_id: "current-assistant",
+              sequence_num: "1",
+              payload: {
+                type: "assistant",
+                message: { content: [{ type: "text", text: "Current" }] },
+              },
+            },
+            {
+              event_id: "current-result",
+              sequence_num: "2",
+              payload: {
+                type: "result",
+                subtype: "success",
+                result: "Current",
+                num_turns: 0,
+                user_message_uuid: promptUuid,
+              },
+            },
+          ],
+        });
+        const session = yield* f.open();
+        f.pushEvent({
+          type: "result",
+          subtype: "success",
+          num_turns: 0,
+          result: "",
+          origin: { kind: "peer", from: "unknown" },
+        });
+        yield* session.setModel?.("claude-haiku-5-5");
+        yield* session.offer({
+          type: "user",
+          uuid: promptUuid,
+          parent_tool_use_id: null,
+          origin: { kind: "human" },
+          message: { role: "user", content: "Current task" },
+        });
+        const messages = yield* session.messages.pipe(Stream.take(2), Stream.runCollect);
+        expect(messages.map((message) => message.type)).toEqual(["assistant", "result"]);
+        expect(yield* f.readBinding).toMatchObject({
+          pendingTurn: { promptUuid, resultSequence: session.cloudEventSequence?.(messages[1]!) },
+        });
+        yield* session.close;
+      }),
+    ),
+  );
   it.effect.each([
     { num_turns: 0, user_message_uuid: "another-prompt" },
     { num_turns: 1, user_message_uuids: ["another-prompt"] },
@@ -652,7 +773,7 @@ describe("Claude cloud guarded transport", () => {
       }),
     ),
   );
-  it.effect("posts portable history and the human prompt atomically with distinct authority", () =>
+  it.effect("posts portable history before the human prompt with separate cloud authority", () =>
     run(
       Effect.gen(function* () {
         const f = yield* fixture({ workspace: true });
@@ -677,12 +798,14 @@ describe("Claude cloud guarded transport", () => {
           ],
         );
         const posts = f.calls.filter((c) => c.path.endsWith("/events") && c.method === "POST");
-        expect(posts.at(-1)?.body).toMatchObject({
-          events: [
-            { payload: { origin: { kind: "unclassified" }, shouldQuery: false } },
-            { payload: { origin: { kind: "human" } } },
-          ],
+        expect(posts.at(-2)?.body).toMatchObject({
+          events: [{ payload: { origin: { kind: "unclassified" }, shouldQuery: false } }],
         });
+        expect(posts.at(-2)?.headers.has("anthropic-client-platform")).toBe(false);
+        expect(posts.at(-1)?.body).toMatchObject({
+          events: [{ payload: { origin: { kind: "human" } } }],
+        });
+        expect(posts.at(-1)?.headers.get("anthropic-client-platform")).toBe("web_claude_ai");
         expect(f.sentModels).toHaveLength(1);
         yield* session.close;
       }),
@@ -692,8 +815,10 @@ describe("Claude cloud guarded transport", () => {
     { kind: "human" },
     { kind: "peer", from: "other-thread" },
     { kind: "task-notification", subkind: "scheduled-trigger" },
+    { kind: "task-notification" },
     { kind: "unclassified" },
-  ] as const)("preserves message authority through cloud transport: %j", (origin) =>
+    undefined,
+  ] as const)("uses human cloud transport only for verified human input: %j", (origin) =>
     run(
       Effect.gen(function* () {
         const f = yield* fixture({ workspace: true });
@@ -701,15 +826,91 @@ describe("Claude cloud guarded transport", () => {
         yield* session.offer({
           type: "user",
           parent_tool_use_id: null,
-          origin,
+          ...(origin === undefined ? {} : { origin }),
           message: { role: "user", content: "Check the requested PR." },
         });
-        const sent = f.calls.findLast(
-          (c) => c.path.endsWith("/events") && c.method === "POST",
-        )?.body;
-        expect(sent).toMatchObject({ events: [{ payload: { type: "user", origin } }] });
+        const sent = f.calls.findLast((c) => c.path.endsWith("/events") && c.method === "POST");
+        expect(sent?.body).toMatchObject({ events: [{ payload: { type: "user" } }] });
+        expect(sent?.headers.get("anthropic-client-platform")).toBe(
+          origin?.kind === "human" ? "web_claude_ai" : null,
+        );
+        expect(
+          f.calls
+            .filter((c) => c !== sent)
+            .every((c) => !c.headers.has("anthropic-client-platform")),
+        ).toBe(true);
         expect(f.sentModels).toHaveLength(1);
         yield* session.close;
+      }),
+    ),
+  );
+  it.effect("does not post a human prompt when supporting context delivery fails", () =>
+    run(
+      Effect.gen(function* () {
+        const f = yield* fixture({ contextResponseLost: true });
+        const session = yield* f.open();
+        const result = yield* session
+          .offer(
+            {
+              type: "user",
+              parent_tool_use_id: null,
+              origin: { kind: "human" },
+              message: { role: "user", content: "Continue the review." },
+            },
+            undefined,
+            [
+              {
+                type: "user",
+                parent_tool_use_id: null,
+                origin: { kind: "unclassified" },
+                shouldQuery: false,
+                message: { role: "user", content: "Historical context only." },
+              },
+            ],
+          )
+          .pipe(Effect.exit);
+        expect(result._tag).toBe("Failure");
+        expect(f.calls.every((c) => !c.headers.has("anthropic-client-platform"))).toBe(true);
+        expect(yield* f.readBinding).not.toHaveProperty("pendingTurn");
+        yield* session.close;
+      }),
+    ),
+  );
+  it.effect("does not recover an unsent human prompt after closing during context delivery", () =>
+    run(
+      Effect.gen(function* () {
+        const f = yield* fixture();
+        const session = yield* f.open();
+        f.holdContextPost();
+        const offered = yield* session
+          .offer(
+            {
+              type: "user",
+              parent_tool_use_id: null,
+              origin: { kind: "human" },
+              message: { role: "user", content: "Continue the review." },
+            },
+            undefined,
+            [
+              {
+                type: "user",
+                parent_tool_use_id: null,
+                origin: { kind: "unclassified" },
+                shouldQuery: false,
+                message: { role: "user", content: "Historical context only." },
+              },
+            ],
+          )
+          .pipe(Effect.forkChild);
+        yield* f.waitContextPost;
+        yield* session.close;
+        f.releaseContextPost();
+        expect((yield* Fiber.await(offered))._tag).toBe("Failure");
+        expect(f.calls.every((c) => !c.headers.has("anthropic-client-platform"))).toBe(true);
+        expect(yield* f.readBinding).not.toHaveProperty("pendingTurn");
+        const resumed = yield* f.open({ resume: true, recoverPendingCloudTurn: true });
+        expect(resumed.pendingCloudTurn).toBeUndefined();
+        yield* resumed.close;
       }),
     ),
   );
@@ -1728,6 +1929,7 @@ describe("Claude cloud guarded transport", () => {
           yield* session.close;
           expect(offered._tag).toBe("Failure");
           expect(JSON.stringify(offered)).toContain("delivery_pending");
+          expect(yield* f.readBinding).not.toHaveProperty("pendingTurn");
           expect(subsequent._tag).toBe("Failure");
           expect(JSON.stringify(subsequent)).toContain("delivery_pending");
           expect(
@@ -1742,6 +1944,32 @@ describe("Claude cloud guarded transport", () => {
           ).toHaveLength(0);
         }),
       ),
+  );
+  it.effect("clears an unsent prompt when the session closes during workspace lookup", () =>
+    run(
+      Effect.gen(function* () {
+        const f = yield* fixture({ workspace: true });
+        const session = yield* f.open();
+        f.holdWorkspace();
+        const offered = yield* session
+          .offer({
+            type: "user",
+            parent_tool_use_id: null,
+            origin: { kind: "human" },
+            message: { role: "user", content: "Must not post after closing" },
+          })
+          .pipe(Effect.exit, Effect.forkChild);
+        yield* f.waitWorkspace;
+        yield* session.close;
+        f.releaseWorkspace();
+        expect((yield* Fiber.join(offered))._tag).toBe("Failure");
+        expect(f.sentModels).toEqual([]);
+        expect(yield* f.readBinding).not.toHaveProperty("pendingTurn");
+        const resumed = yield* f.open({ resume: true, recoverPendingCloudTurn: true });
+        expect(resumed.pendingCloudTurn).toBeUndefined();
+        yield* resumed.close;
+      }),
+    ),
   );
   it.effect("stops initialization when a late tool request arrives during MCP setup", () =>
     run(

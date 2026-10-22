@@ -98,6 +98,16 @@ const decodeUnknownRecord = Schema.decodeUnknownEffect(
 const decodeWorkspaceInfo = Schema.decodeUnknownEffect(WorkspaceInfo);
 const HttpFailure = Schema.Struct({ cloudHttpStatus: Schema.Number });
 const isHttpFailure = Schema.is(HttpFailure);
+const isContextAppendAcknowledgement = (payload: Readonly<Record<string, unknown>>) =>
+  payload.type === "result" &&
+  payload.num_turns === 0 &&
+  payload.result === "" &&
+  typeof payload.origin === "object" &&
+  payload.origin !== null &&
+  "kind" in payload.origin &&
+  payload.origin.kind === "peer" &&
+  typeof payload.user_message_uuid !== "string" &&
+  (!Array.isArray(payload.user_message_uuids) || payload.user_message_uuids.length === 0);
 class ClaudeCloudHttpError extends Schema.TaggedError<ClaudeCloudHttpError>()(
   "ClaudeCloudHttpError",
   { status: Schema.Number },
@@ -235,7 +245,12 @@ export const makeClaudeCloudQueryRunner = Effect.fn("makeClaudeCloudQueryRunner"
               timeoutMs: 20_000,
             });
 
-          const requestOnce = (endpoint: string, body?: unknown, afterSequence = 0n) =>
+          const requestOnce = (
+            endpoint: string,
+            body?: unknown,
+            afterSequence = 0n,
+            humanInput = false,
+          ) =>
             Effect.gen(function* () {
               const key = yield* crypto.randomUUIDv4();
               const encoded = body === undefined ? undefined : json(body);
@@ -253,7 +268,7 @@ export const makeClaudeCloudQueryRunner = Effect.fn("makeClaudeCloudQueryRunner"
             let r;
             try {r=await fetch(${json(endpoint)}, {
               method: ${json(body === undefined ? "GET" : "POST")},
-              headers: {'anthropic-version':'2023-06-01','anthropic-organization-id':${json(organizationId)},'content-type':'application/json'},
+              headers: {'anthropic-version':'2023-06-01','anthropic-organization-id':${json(organizationId)},'content-type':'application/json',${humanInput ? "'anthropic-client-platform':'web_claude_ai'," : ""}},
               ${encoded === undefined ? "" : `body:${inlineBody ? json(encoded) : `buffers[${json(key)}].join('')`},`}
               signal: AbortSignal.timeout(15000)
             });}finally{delete buffers[${json(key)}]}
@@ -300,8 +315,13 @@ export const makeClaudeCloudQueryRunner = Effect.fn("makeClaudeCloudQueryRunner"
               }
               return result;
             });
-          const request = (endpoint: string, body?: unknown, afterSequence = 0n) => {
-            const call = requestOnce(endpoint, body, afterSequence);
+          const request = (
+            endpoint: string,
+            body?: unknown,
+            afterSequence = 0n,
+            humanInput = false,
+          ) => {
+            const call = requestOnce(endpoint, body, afterSequence, humanInput);
             let reopenedForRequest = false;
             return body === undefined
               ? call.pipe(
@@ -468,6 +488,15 @@ export const makeClaudeCloudQueryRunner = Effect.fn("makeClaudeCloudQueryRunner"
             });
           };
           yield* acknowledge(input.durableCloudSequence);
+          // Older bindings may already contain non-query context acknowledgements.
+          // They cannot require turn recovery or survive as replayable completions.
+          if (binding.inbox?.some((event) => isContextAppendAcknowledgement(event.payload)))
+            yield* updateBinding((current) => ({
+              ...current,
+              inbox: (current.inbox ?? []).filter(
+                (event) => !isContextAppendAcknowledgement(event.payload),
+              ),
+            }));
 
           const sessionPath = `/v1/code/sessions/${encodeURIComponent(binding.cloudId)}`;
           const checkModel = request(sessionPath).pipe(
@@ -747,8 +776,11 @@ export const makeClaudeCloudQueryRunner = Effect.fn("makeClaudeCloudQueryRunner"
               lastBillingCheck = now;
             }
             const raw = yield* request(`${sessionPath}/events`, undefined, sequence);
-            const fetched = yield* Effect.try(() => orderedClaudeCloudEvents(raw, sequence));
-            const nextSequence = fetched.at(-1)?.sequence;
+            const received = yield* Effect.try(() => orderedClaudeCloudEvents(raw, sequence));
+            const nextSequence = received.at(-1)?.sequence;
+            const fetched = received.filter(
+              (event) => !isContextAppendAcknowledgement(event.payload),
+            );
             if (nextSequence !== undefined)
               yield* updateBinding((current) => ({
                 ...current,
@@ -1168,20 +1200,45 @@ export const makeClaudeCloudQueryRunner = Effect.fn("makeClaudeCloudQueryRunner"
                   ...forwarded,
                   uuid: promptUuid as NonNullable<SDKUserMessage["uuid"]>,
                 };
+                const abandonUnsentPrompt = Effect.gen(function* () {
+                  active = false;
+                  yield* updateBinding((current) => {
+                    const { pendingTurn: _pendingTurn, ...rest } = current;
+                    return rest;
+                  }).pipe(Effect.ensuring(close), Effect.ignore);
+                });
                 yield* updateBinding((current) => ({
                   ...current,
                   pendingTurn: { promptUuid, replayAfterSequence: sequence.toString() },
                 }));
-                if (closed || !usable || recoveryPending)
+                if (closed || !usable || recoveryPending) {
+                  yield* abandonUnsentPrompt;
                   return yield* new ClaudeCloudGuardError({
                     reason: recoveryPending ? "delivery_pending" : "remote_failed",
                   });
+                }
                 active = true;
-                yield* request(`${sessionPath}/events`, {
-                  events: [...contextMessages, forwarded].map((entry) => ({
-                    payload: { ...entry, session_id: binding.cloudId },
-                  })),
-                }).pipe(
+                // Cloud authority comes from the request's browser platform, not the
+                // SDK origin field. Append history without that platform before the
+                // human request so imported messages cannot acquire human authority.
+                if (contextMessages.length > 0)
+                  yield* request(`${sessionPath}/events`, {
+                    events: contextMessages.map((entry) => ({
+                      payload: { ...entry, shouldQuery: false, session_id: binding.cloudId },
+                    })),
+                  }).pipe(Effect.onError(() => abandonUnsentPrompt));
+                if (closed || !usable || recoveryPending) {
+                  yield* abandonUnsentPrompt;
+                  return yield* new ClaudeCloudGuardError({
+                    reason: recoveryPending ? "delivery_pending" : "remote_failed",
+                  });
+                }
+                yield* request(
+                  `${sessionPath}/events`,
+                  { events: [{ payload: { ...forwarded, session_id: binding.cloudId } }] },
+                  0n,
+                  message.origin?.kind === "human",
+                ).pipe(
                   // A failed response does not prove the prompt was rejected. Keep reading
                   // this conversation instead of interrupting it or posting the prompt twice.
                   Effect.catchIf(
